@@ -1,0 +1,19 @@
+# Build output (includes build/acpi: this laptop's ACPI tables)
+build/
+# Build volume, NVIDIA source/driver copies, references, bisect trees (7 GB)
+temp/
+# Test logs; contain local paths
+runs/
+# NVIDIA firmware: fetch from linux-firmware (see README)
+firmware/
+# This laptop's VBIOS: copyrighted, machine-specific
+*.rom
+# macOS / exFAT metadata
+.DS_Store
+._*
+# Python
+__pycache__/
+*.pyc
+# Private development log
+PROGRESS.md
+local.env

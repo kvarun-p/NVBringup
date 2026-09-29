@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>NVBringup</string>
+	<key>CFBundleIdentifier</key>
+	<string>io.github.kvarun-p.nvbringup</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>NVBringup</string>
+	<key>CFBundlePackageType</key>
+	<string>KEXT</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.2.0</string>
+	<key>CFBundleVersion</key>
+	<string>0.2.0</string>
+	<key>IOKitPersonalities</key>
+	<dict>
+		<key>NVBringup</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>io.github.kvarun-p.nvbringup</string>
+			<key>IOClass</key>
+			<string>NVBringup</string>
+			<key>IOProviderClass</key>
+			<string>IOPCIDevice</string>
+			<!-- Take the framebuffer category (above IONDRVFramebuffer's 20000) so macOS does not
+			     attach its generic NDRV framebuffer to this display-less GPU. -->
+			<key>IOMatchCategory</key>
+			<string>IOFramebuffer</string>
+			<key>IOProbeScore</key>
+			<integer>30000</integer>
+			<!-- Opened by tools/nvgsp (root only) to boot GSP-RM. -->
+			<key>IOUserClientClass</key>
+			<string>NVBringupUserClient</string>
+			<!-- Any NVIDIA device... -->
+			<key>IOPCIMatch</key>
+			<string>0x000010de&amp;0x0000ffff</string>
+			<!-- probe() then requires display class (0x03) in config space, skipping the HDMI audio /
+			     USB-C functions. Not IOPCIClassMatch: WhateverGreen's -wegnoegpu hides the GPU from
+			     macOS graphics by rewriting its "class-code" property, which IOPCIClassMatch uses. -->
+		</dict>
+	</dict>
+	<key>OSBundleLibraries</key>
+	<dict>
+		<key>com.apple.iokit.IOACPIFamily</key>
+		<string>1.4</string>
+		<key>com.apple.iokit.IOPCIFamily</key>
+		<string>2.9</string>
+		<key>com.apple.kpi.bsd</key>
+		<string>19.0</string>
+		<key>com.apple.kpi.iokit</key>
+		<string>19.0</string>
+		<key>com.apple.kpi.libkern</key>
+		<string>19.0</string>
+		<key>com.apple.kpi.mach</key>
+		<string>19.0</string>
+	</dict>
+</dict>
+</plist>
