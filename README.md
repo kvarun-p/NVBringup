@@ -81,7 +81,7 @@ paths but have **not been tested**.
 | Computer | Intel x86-64 Mac or hackintosh with an NVIDIA Turing GPU |
 | macOS | Sonoma 14 (developed on 14.8.9). Other versions are untested |
 | Boot loader | OpenCore, to load the kext (Kernel → Add). SIP stays enabled |
-| GPU visibility | The GPU must be powered and on the PCI bus. No SSDT that powers it off (such as `SSDT-Disable_GPU_PEG0`), no `-wegnoegpu`, no `disable-gpu` property |
+| GPU visibility | The GPU must be powered and on the PCI bus. No SSDT that powers it off (the ACPI patches many hackintosh EFIs ship to disable the discrete GPU), no `-wegnoegpu`, no `disable-gpu` property |
 | Firmware | NVIDIA GSP firmware r570.144 from linux-firmware (not included; step 1). The kext is built for exactly this version |
 | Build tools | Xcode or the Command Line Tools (macOS SDK 14 or newer) |
 | For Vulkan | Mesa's build tools, the Khronos Vulkan loader and headers (see nvbringup-mesa), and `glslc` from shaderc for llama.cpp's shaders |
