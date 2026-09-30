@@ -80,7 +80,7 @@ sudo build/nvgsp intr status     # on/off, interrupt count, spurious, storms
 ioreg -r -c NVBringup -d 1 | grep '"NVIntr"'
 ```
 
-Result: speed and CPU time within noise of polling (run 32 vs 33: tg 115.7 vs 117.0 t/s,
+Result: speed and CPU time within noise of polling (run 32 vs 33, before the BAR1 fix: tg 115.7 vs 117.0 t/s,
 0.93 vs 0.95 s system time), because most waits end within the initial spin. They stay on:
 they cost nothing measurable, and a wait that outlasts the spin is woken by the GPU's interrupt,
 with the CPU asleep (a 2 ms backup timeout), instead of polling every 100 µs.

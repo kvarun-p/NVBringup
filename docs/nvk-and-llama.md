@@ -98,7 +98,7 @@ Other variants (rows per workgroup, 32-thread workgroups, fusion off) were all s
 combination hurts 1.5B, so MMVQ stays at its default.
 
 **Change:** on NVK, matrix-vector kernels use 128-thread workgroups for m ≤ 8192 regardless of
-k. Result (run 27): 0.5B generation 87 → 119 t/s (+37 %), 1.5B 62 → 62.9 (unchanged within
+k. Result (run 27, before the BAR1 fix, so absolute speeds are higher than today's default): 0.5B generation 87 → 119 t/s (+37 %), 1.5B 62 → 62.9 (unchanged within
 noise), `MUL_MAT` and `MUL_MAT_ID` tests 2065 passed, 0 failed.
 
 ## Ollama

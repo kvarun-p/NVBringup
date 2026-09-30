@@ -38,7 +38,8 @@ paths but have **not been tested**.
   queues, timeline semaphores, and multiple processes at once, each isolated in its own GPU
   address space.
 - **Local LLMs** with llama.cpp's Vulkan backend. On the GTX 1650: Qwen2.5 0.5B Q4_K_M at about
-  2,200 tokens/s prompt processing and 116 tokens/s generation, Qwen2.5 1.5B at 808 and 63.
+  2,200 tokens/s prompt processing and about 97 tokens/s generation (about 112 with boot-arg
+  `nvkmapvram=1`, see the limitations), Qwen2.5 1.5B at about 800 and 55 (60 with `nvkmapvram=1`).
   llama.cpp's backend tests pass (18,987 of 18,990; the rest are f16 SQRT precision).
 - **Runtime power management:** the GPU is powered off 30 s after the last program closes it
   and powered back on (about 2 s) when a program opens it. On the test laptop this
@@ -174,8 +175,8 @@ It prints `ok:` lines for device creation, a compute dispatch and a buffer copy.
 
 The fork [kvarun-p/llama.cpp](https://github.com/kvarun-p/llama.cpp/tree/nvk-tuning),
 branch `nvk-tuning`, is upstream release `v0.5.0` plus one change: the larger mat-vec workgroup
-on NVK, which speeds up generation on models narrower than 1,024 (Qwen2.5 0.5B: about 87 to 119
-tokens/s). Upstream llama.cpp works too, only slower on those models.
+on NVK, which speeds up generation on models narrower than 1,024 (Qwen2.5 0.5B: 87 to 119
+tokens/s in run 27, measured before the BAR1 fix, see docs/nvk-and-llama.md). Upstream llama.cpp works too, only slower on those models.
 
 ```bash
 git clone -b nvk-tuning https://github.com/kvarun-p/llama.cpp.git && cd llama.cpp
