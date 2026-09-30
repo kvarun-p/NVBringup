@@ -304,7 +304,7 @@ bool NVBringup::powerOn()
     if (!dead && d <= 0)
         return true;
 
-    // Lenovo's switchable-graphics SSDT provides _ON/_OFF on PEGP; _PS0 may not exist.
+    // The test laptop's switchable-graphics SSDT provides _ON/_OFF on PEGP; _PS0 may not exist.
     const char *method = acpiHas("_PS0") ? "_PS0" : acpiHas("_ON") ? "_ON" : nullptr;
     if (method) {
         IOReturn r = acpi_->evaluateObject(method);
@@ -732,7 +732,7 @@ out:
     return ok;
 }
 
-// The ACPI _ROM copy on this Lenovo holds only the PCI-AT and EFI images; the
+// On the test laptop the ACPI _ROM copy holds only the PCI-AT and EFI images; the
 // FWSEC images exist only in the GPU's own flash, read through PROM.
 void NVBringup::readVbios()
 {

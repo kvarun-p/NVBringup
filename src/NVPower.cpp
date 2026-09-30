@@ -5,7 +5,7 @@
 // Auto mode (default, boot-arg nvidle=<seconds>, 30 by default; nvidle=0 keeps it on): once no GPU
 // connection has been open for the idle time, GSP-RM is unloaded the way sleep does it (contexts
 // gone, WPR2 cleared, interrupts off), the PCI state saved and the GPU cut off with ACPI _OFF
-// (on the development laptop, a Lenovo: PEGP._OFF, the method its SSDT-Disable_GPU_PEG0 uses).
+// (on the test laptop, PEGP._OFF, the method its stock EFI's SSDT already uses to disable the GPU).
 // The next GPU open powers it on with _ON (_PS0 as a fallback), restores the PCI state and runs the wake path:
 // FWSEC-FRTS, then GSP-RM boot. The open waits for that. Linux does the same for Optimus GPUs
 // (pci_save_state, D3cold through ACPI; D0, pci_restore_state).
