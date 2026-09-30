@@ -36,7 +36,7 @@ llama-bench -m ~/models/qwen2.5-0.5b-instruct-q4_k_m.gguf -ngl 99 -p 512 -n 128 
 ```
 
 `-ngl 99` puts every layer on the GPU. On the GTX 1650 expect about 2,250 t/s prompt
-processing and 97 t/s generation for this model (about 112–114 with `nvkmapvram=1`). The first run after
+processing and 92–97 t/s generation for this model (about 112–114 with `nvkmapvram=1`). The first run after
 boot can be much slower (once pp512 587 t/s) while shaders compile and clocks ramp up; repeat
 it. On machines with more than one Vulkan
 device, add `GGML_VK_VISIBLE_DEVICES=0` (the index from `llama-server --list-devices`).

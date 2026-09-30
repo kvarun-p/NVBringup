@@ -35,7 +35,7 @@ llama.cpp server that frees its models when idle so the GPU can power off.
 GSP-RM is unloaded before sleep (open programs get device-lost and must reopen) and booted again
 after wake, on a separate thread so wake isn't blocked. The firmware stays in kernel memory from
 boot (about 28.5 MB wired) so no user-space help is needed. Verified (before the BAR1 fix, so generation was faster than today's default of
-about 97 t/s): llama-bench 2273/118.7 t/s after wake, against 2277/118.0 before; `nvtest` 55/55.
+about 92–97 t/s): llama-bench 2273/118.7 t/s after wake, against 2277/118.0 before; `nvtest` 55/55.
 
 ## Shutdown and restart
 

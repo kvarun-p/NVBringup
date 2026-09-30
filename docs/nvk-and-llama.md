@@ -101,6 +101,18 @@ combination hurts 1.5B, so MMVQ stays at its default.
 k. Result (measured before the BAR1 fix, so absolute speeds are higher than today's default): 0.5B generation 87 → 119 t/s (+37 %), 1.5B 62 → 62.9 (unchanged within
 noise), `MUL_MAT` and `MUL_MAT_ID` tests 2065 passed, 0 failed.
 
+**Patched vs upstream, current default settings** (`nvk-tuning` against its base, release `v0.5.0`;
+`llama-bench -ngl 99 -p 512 -n 128`, 5 repetitions, builds alternated, same flags, Vulkan only):
+
+| model | tg128 upstream | tg128 patched |
+|---|---|---|
+| Qwen2.5 0.5B Q4_K_M (k = 896) | 71.6 | 92.1 (+28 %) |
+| Qwen2.5 1.5B Q4_K_M (k = 1536) | 53.9 | 53.8 (unchanged) |
+
+Prompt processing (pp512) is the same. Build both with `-DGGML_METAL=OFF -DGGML_BLAS=OFF`: an
+upstream build left at the defaults has the Metal backend, which ran on the Mac's own GPU and
+hung macOS, and would not have been a comparison.
+
 ## Ollama
 
 Ollama's bundled llama.cpp can load a Vulkan backend module built from the matching llama.cpp tag,
