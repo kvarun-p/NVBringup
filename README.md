@@ -176,7 +176,7 @@ It prints `ok:` lines for device creation, a compute dispatch and a buffer copy.
 The fork [kvarun-p/llama.cpp](https://github.com/kvarun-p/llama.cpp/tree/nvk-tuning),
 branch `nvk-tuning`, is upstream release `v0.5.0` plus one change: the larger mat-vec workgroup
 on NVK, which speeds up generation on models narrower than 1,024 (Qwen2.5 0.5B: 87 to 119
-tokens/s in run 27, measured before the BAR1 fix, see docs/nvk-and-llama.md). Upstream llama.cpp works too, only slower on those models.
+tokens/s, measured before the BAR1 fix, see docs/nvk-and-llama.md). Upstream llama.cpp works too, only slower on those models.
 
 ```bash
 git clone -b nvk-tuning https://github.com/kvarun-p/llama.cpp.git && cd llama.cpp

@@ -556,7 +556,7 @@ static int selftest()
         CHECK(a[4].id8 == nv_libos_id8("RMARGS") && a[4].pa == 0x50000 && a[5].id8 == 0);
     }
 
-    {   // VRAM heap over the usable region GSP-RM reported (run 5): 0xf80000..0xf406ffff
+    {   // VRAM heap over the usable region GSP-RM reported: 0xf80000..0xf406ffff
         static nv_vram_heap h;
         CHECK(nv_vram_init(&h, 0xf80000, 0xf406ffff));
         CHECK(!nv_vram_init(&h, 0, 0xfff) && !nv_vram_init(&h, 0x1800, 0xffff));

@@ -53,7 +53,7 @@ whatever the connection still owns. The full test of the interface is `tools/nvt
 
 `EXEC` writes the GPFIFO entries, updates GPPut and rings the doorbell. User-mode submission
 would need BAR0's doorbell page mapped into every process. A submission costs 11.6 µs per EXEC
-and 20 µs for EXEC plus wait (run 12). In run 24, GPU time accounted for all of the wall time per
+and 20 µs for EXEC plus wait. GPU time accounted for all of the wall time per
 generated token, so submission cost doesn't show in llama.cpp's speed.
 
 ## Syncs are host semaphores
@@ -67,7 +67,7 @@ timeline `vk_sync` type, and emulates binary semaphores on top with Mesa's `vk_s
 ## Waits: polling first, then interrupts
 
 1. **Polling** (initially): spin about 50 µs, then sleep in 100 µs steps.
-2. **Non-stall MSI interrupts** (run 33, on by default; boot-arg `nvintr=0` turns them off).
+2. **Non-stall MSI interrupts** (on by default; boot-arg `nvintr=0` turns them off).
    The CPU services only the non-stall vectors of GR and the copy engines; GSP-RM keeps the stall
    ones. On Turing, the MSI has to be re-armed through a config-space mirror write (NVIDIA's
    `kbifRearmMSI_GM107`); the top-level enable toggle the first attempt used re-arms only on
@@ -80,7 +80,7 @@ sudo build/nvgsp intr status     # on/off, interrupt count, spurious, storms
 ioreg -r -c NVBringup -d 1 | grep '"NVIntr"'
 ```
 
-Result: speed and CPU time within noise of polling (run 32 vs 33, before the BAR1 fix: tg 115.7 vs 117.0 t/s,
+Result: speed and CPU time within noise of polling (polling vs interrupts, measured before the BAR1 fix: tg 115.7 vs 117.0 t/s,
 0.93 vs 0.95 s system time), because most waits end within the initial spin. They stay on:
 they cost nothing measurable, and a wait that outlasts the spin is woken by the GPU's interrupt,
 with the CPU asleep (a 2 ms backup timeout), instead of polling every 100 µs.
@@ -94,7 +94,7 @@ with the CPU asleep (a 2 ms backup timeout), instead of polling every 100 µs.
   buffers) are mapped with privileged PTEs, so user shaders can't reach them.
 - VRAM is scrubbed before hand-out, including each context's kernel push slots.
 - A faulting context is marked lost (`RC_TRIGGERED` from GSP-RM) and reports device-lost; other
-  connections keep working (run 12). Killing a process mid-wait frees its channel and VRAM.
+  connections keep working. Killing a process mid-wait frees its channel and VRAM.
 - CPU mappings of VRAM that outlive a free: see [bar1-cpu-mappings.md](bar1-cpu-mappings.md).
 
 Open: there is no per-connection limit on system memory (GART) yet. It's wired (it can't be

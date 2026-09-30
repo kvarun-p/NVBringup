@@ -45,7 +45,7 @@ the immediate is moved into a register first. iq1_m then passed 28 of 28.
 
 ### Conditional branches need a longer delay
 
-`ARGSORT` failed intermittently (56 of 1960) and never under `NAK_DEBUG=serial`. Runs 17–21
+`ARGSORT` failed intermittently (56 of 1960) and never under `NAK_DEBUG=serial`. Repeated runs
 narrowed down what serial mode changes:
 
 | experiment | failures /1960 |
@@ -81,7 +81,7 @@ Result: llama.cpp's backend tests pass 18,987 of 18,990; the rest are f16 `SQRT`
 
 ## llama.cpp: matrix-vector workgroup size
 
-**Why:** token generation was GPU-bound (run 24: GPU time accounts for all of the wall time) and
+**Why:** token generation was GPU-bound (GPU time accounts for all of the wall time) and
 the small matrix-vector kernels ran far below the memory bandwidth large ones reach (29 GB/s vs
 about 100). llama.cpp's NVIDIA tuning targets the proprietary driver: 128-thread workgroups only
 when k ≥ 1024, but the 0.5B model's hot kernels have k = 896.
@@ -98,7 +98,7 @@ Other variants (rows per workgroup, 32-thread workgroups, fusion off) were all s
 combination hurts 1.5B, so MMVQ stays at its default.
 
 **Change:** on NVK, matrix-vector kernels use 128-thread workgroups for m ≤ 8192 regardless of
-k. Result (run 27, before the BAR1 fix, so absolute speeds are higher than today's default): 0.5B generation 87 → 119 t/s (+37 %), 1.5B 62 → 62.9 (unchanged within
+k. Result (measured before the BAR1 fix, so absolute speeds are higher than today's default): 0.5B generation 87 → 119 t/s (+37 %), 1.5B 62 → 62.9 (unchanged within
 noise), `MUL_MAT` and `MUL_MAT_ID` tests 2065 passed, 0 failed.
 
 ## Ollama

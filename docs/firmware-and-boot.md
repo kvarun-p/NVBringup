@@ -62,7 +62,7 @@ again (`nvgsp unload`, `nvgsp boot`) without rebooting; only a failed boot needs
 
 **Automatic start:** a LaunchDaemon (runs at boot as root) rather than a LaunchAgent (after login,
 as the user; booting needs root). It was added after manual boots had succeeded 9 times in a
-row (runs 2–10), and it does nothing unless boot-args contain `nvgsp=1`.
+row, and it does nothing unless boot-args contain `nvgsp=1`.
 
 ## GSP-RM boot details
 
@@ -96,7 +96,7 @@ Shutdown hooks: `systemWillShutdown()` is only called on drivers in the power pl
 NVBringup never joined, so in the first version the unload at shutdown and restart never ran. The kext's priority sleep/wake
 handler, which `IOPMrootDomain` also notifies on halt and restart, handles power-off and restart
 too. After each teardown the kext writes a marker (reason, result, WPR2) to NVRAM and logs it at
-the next start (`NVLastTeardown`), since the kernel log of a shutdown isn't kept. Run 28 confirmed
+the next start (`NVLastTeardown`), since the kernel log of a shutdown isn't kept. A test confirmed
 "power off: ok, WPR2 hi 0". Check it after a restart, along with the boot result and the log:
 
 ```bash
