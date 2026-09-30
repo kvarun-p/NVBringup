@@ -41,7 +41,7 @@ paths but have **not been tested**.
   2,200 tokens/s prompt processing and 116 tokens/s generation, Qwen2.5 1.5B at 808 and 63.
   llama.cpp's backend tests pass (18,987 of 18,990; the rest are f16 SQRT precision).
 - **Runtime power management:** the GPU is powered off 30 s after the last program closes it
-  and powered back on (about 2 s) when a program opens it. On the development laptop this
+  and powered back on (about 2 s) when a program opens it. On the test laptop this
   saves about 3 W. Needs ACPI power methods on the GPU, which laptops with switchable graphics
   have; see the limitations.
 - **Sleep and wake, restart and shutdown:** GSP-RM is shut down cleanly and brought back.
