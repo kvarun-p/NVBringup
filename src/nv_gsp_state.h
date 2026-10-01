@@ -194,6 +194,7 @@ struct NVBringup::GspState {
     uint32_t nGrGlobal = 0;
     uint64_t grGlobalSpan = 0;
     bool     grReady = false;
+    uint32_t nvdecCtxSize = 0;      // NVDEC0 falcon context buffer per channel; 0 = no NVDEC
     uint16_t tpcCount = 0;
     uint8_t  gpcCount = 0, smPerTpc = 0, maxWarps = 0, sm = 0;
     GpuConn *conns[kMaxConns] = {};

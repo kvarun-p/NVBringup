@@ -159,6 +159,7 @@ private:
     bool     initEngines();
     bool     createUtilChannel();
     bool     initGrGlobal();
+    void     initNvdec();
     void     queryGrInfo();
     void     probeIntr();               // read-only: CPU interrupt table and tree state
     bool     initBar1();

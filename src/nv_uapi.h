@@ -68,12 +68,14 @@ enum {
 
 // NVMAC_CTX_CREATE engines (same bits as nvkmd_engines). COPY alone gets a copy-engine
 // channel; anything with 3D or COMPUTE gets a graphics channel with 3D (subchannel 0),
-// compute (1) and, if asked, copy (4) objects. User push buffers bind subchannels with
-// SET_OBJECT themselves.
+// compute (1) and, if asked, copy (4) objects. VDEC alone (no other engine) gets an NVDEC
+// channel with a video decoder object (class cls_vdec; only if cls_vdec isn't 0). User push
+// buffers bind subchannels with SET_OBJECT themselves.
 enum {
     NVMAC_ENGINE_COPY    = 1u << 0,
     NVMAC_ENGINE_3D      = 1u << 2,
     NVMAC_ENGINE_COMPUTE = 1u << 4,
+    NVMAC_ENGINE_VDEC    = 1u << 6,
 };
 
 struct nvmac_info {
@@ -86,7 +88,8 @@ struct nvmac_info {
     uint16_t tpc_count;
     uint8_t  mp_per_tpc, max_warps_per_mp;
     uint16_t cls_copy, cls_eng3d, cls_compute, cls_gpfifo;
-    uint16_t pad0;
+    uint16_t cls_vdec;              // NVDEC class (0xc4b0 on Turing), 0 = no video decode
+                                    // (was padding: older clients ignore it, ABI unchanged)
     uint64_t vram_size, vram_used;  // host-owned VRAM heap
     uint64_t bar1_size, bar1_used;  // CPU-mappable VRAM window
     uint64_t va_start, va_end;      // user GPU VA range [start, end)

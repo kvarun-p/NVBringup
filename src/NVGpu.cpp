@@ -426,6 +426,81 @@ void NVBringup::queryGrInfo()
         v[0], v[1], v[6]);
 }
 
+// Video decode: NVDEC0 present (engine list), its ENG_DESC (device info table) and the size of
+// its falcon context buffer (constructed falcon info), as nouveau's r570 fifo.c finds them.
+// Read-only queries; any failure leaves nvdecCtxSize 0 (no VDEC contexts, cls_vdec 0).
+void NVBringup::initNvdec()
+{
+    GspState *g = gsp_;
+    uint32_t st = 0;
+    g->nvdecCtxSize = 0;
+    bool present = false;
+    for (uint32_t i = 0; i < g->nEngines; i++)
+        present |= g->engines[i] == NV2080_ENGINE_TYPE_NVDEC0_;
+    if (!present) {
+        LOG("GSP: no NVDEC0: video decode unavailable");
+        return;
+    }
+    uint8_t *t = (uint8_t *)IOMallocZero(NV2080_DEVINFO_SIZE);
+    if (!t)
+        return;
+    uint32_t engDesc = 0;
+    bool found = false, more = true;
+    for (uint32_t base = 0; more && !found && base < 256; base += NV2080_DEVINFO_MAX) {
+        memset(t, 0, NV2080_DEVINFO_SIZE);
+        put32(t, NV2080_DEVINFO_baseIndex, base);
+        if (!gspRmControl(g->hClient, g->hSubdevice, NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE_, t,
+                          NV2080_DEVINFO_SIZE, &st))
+            break;
+        uint32_t n = 0;
+        memcpy(&n, t + NV2080_DEVINFO_numEntries, 4);
+        more = t[NV2080_DEVINFO_bMore] != 0;
+        for (uint32_t i = 0; i < n && i < NV2080_DEVINFO_MAX; i++) {
+            const uint8_t *e = t + NV2080_DEVINFO_entries + i * NV2080_DEVINFO_ENTRY_SIZE;
+            uint32_t rmType = 0;
+            memcpy(&rmType, e + 4 * ENGINE_INFO_TYPE_RM_ENGINE_TYPE_, 4);
+            if (rmType == RM_ENGINE_TYPE_NVDEC0_) {
+                memcpy(&engDesc, e + 4 * ENGINE_INFO_TYPE_ENG_DESC_, 4);
+                found = true;
+                break;
+            }
+        }
+    }
+    IOFree(t, NV2080_DEVINFO_SIZE);
+    if (!found) {
+        LOG("GSP: NVDEC0 not in the device info table: video decode unavailable");
+        return;
+    }
+    uint8_t *f = (uint8_t *)IOMallocZero(NV2080_FALCON_INFO_SIZE);
+    if (!f)
+        return;
+    uint32_t size = 0;
+    if (gspRmControl(g->hClient, g->hSubdevice, NV2080_CTRL_CMD_GPU_GET_CONSTRUCTED_FALCON_INFO_, f,
+                     NV2080_FALCON_INFO_SIZE, &st)) {
+        uint32_t n = 0;
+        memcpy(&n, f + NV2080_FALCON_INFO_count, 4);
+        for (uint32_t i = 0; i < n && i < NV2080_FALCON_INFO_MAX; i++) {
+            const uint8_t *e = f + NV2080_FALCON_INFO_table + i * NV2080_FALCON_ENTRY_SIZE;
+            uint32_t d = 0;
+            memcpy(&d, e + NV2080_FALCON_engDesc, 4);
+            if (d == engDesc) {
+                memcpy(&size, e + NV2080_FALCON_ctxBufferSize, 4);
+                break;
+            }
+        }
+    }
+    IOFree(f, NV2080_FALCON_INFO_SIZE);
+    // A context buffer goes in the context's SLOT_MAIN..SLOT_PATCH range of its VA slot.
+    if (!size || size > SLOT_PATCH - SLOT_MAIN) {
+        LOG("GSP: NVDEC0 (ENG_DESC 0x%x): context buffer size %u unusable: video decode unavailable",
+            engDesc, size);
+        return;
+    }
+    g->nvdecCtxSize = size;
+    LOG("GSP: NVDEC0: ENG_DESC 0x%x, context buffer %u bytes, class 0x%x", engDesc, size,
+        NVC4B0_VIDEO_DECODER_CLASS);
+}
+
 // Item 4 (non-stall interrupts), step 1: read-only probe. Asks GSP-RM which interrupt vectors the
 // CPU services, keeps GR0's and the copy engines' non-stall vectors for intrHwOn, and logs the CPU
 // interrupt tree as GSP-RM left it. No register writes.
@@ -1717,10 +1792,14 @@ IOReturn NVBringup::ctxCreate(GpuConn *c, uint32_t engines, uint32_t *handle)
 {
     GspState *g = gsp_;
     uint32_t st = 0;
-    if (!engines || (engines & ~(uint32_t)(NVMAC_ENGINE_COPY | NVMAC_ENGINE_3D | NVMAC_ENGINE_COMPUTE)))
+    if (!engines ||
+        (engines & ~(uint32_t)(NVMAC_ENGINE_COPY | NVMAC_ENGINE_3D | NVMAC_ENGINE_COMPUTE | NVMAC_ENGINE_VDEC)))
         return kIOReturnBadArgument;
     bool gr = engines & (NVMAC_ENGINE_3D | NVMAC_ENGINE_COMPUTE);
-    if (gr && !g->grReady)
+    bool vdec = engines & NVMAC_ENGINE_VDEC;
+    if (vdec && engines != NVMAC_ENGINE_VDEC)
+        return kIOReturnBadArgument;            // an NVDEC channel carries only the decoder
+    if ((gr && !g->grReady) || (vdec && !g->nvdecCtxSize))
         return kIOReturnUnsupported;
     uint32_t index = kMaxCtx;
     for (uint32_t i = 0; i < kMaxCtx; i++)
@@ -1752,7 +1831,7 @@ IOReturn NVBringup::ctxCreate(GpuConn *c, uint32_t engines, uint32_t *handle)
     x->chid = (uint32_t)chid;
     x->seqSync = (uint32_t)seqSync;
     x->kva = KVA_CTX + index * KVA_CTX_SLOT;
-    x->engineType = gr ? NV2080_ENGINE_TYPE_GR0_ : g->ceEngine;
+    x->engineType = gr ? NV2080_ENGINE_TYPE_GR0_ : vdec ? NV2080_ENGINE_TYPE_NVDEC0_ : g->ceEngine;
     c->ctxs[index] = x;                         // ctxDestroy cleans up from here on
 
     const nv_mmu_ops ops = connOps(c, connMmuAlloc, connMmuRd64, connMmuWr64);
@@ -1769,9 +1848,18 @@ IOReturn NVBringup::ctxCreate(GpuConn *c, uint32_t engines, uint32_t *handle)
         x->main = nv_vram_alloc(g->vram, g->grMainSize, align);
         x->patch = nv_vram_alloc(g->vram, g->grPatchSize, 0x1000);
     }
-    bool ok = x->inst && x->userd && x->mthd && x->ring && x->push && (!gr || (x->main && x->patch));
+    const uint64_t vdecBytes = ((uint64_t)g->nvdecCtxSize + 0xfff) & ~0xfffull;   // whole 4 KiB pages
+    if (vdec)                                   // NVDEC's falcon context buffer, in MAIN's place
+        x->main = nv_vram_alloc(g->vram, vdecBytes, 0x1000);
+    bool ok = x->inst && x->userd && x->mthd && x->ring && x->push && (!gr || (x->main && x->patch)) &&
+              (!vdec || x->main);
     // The push slots are readable by the connection's GPU work: no leftovers of earlier VRAM users.
     if (ok && !scrubVram(x->push, PUSH_SLOTS * PUSH_SLOT_BYTES)) {
+        r = kIOReturnIOError;
+        ok = false;
+    }
+    // The NVDEC context buffer starts zeroed, as nouveau's (nvkm_gpuobj_new with zero).
+    if (ok && vdec && !scrubVram(x->main, vdecBytes)) {
         r = kIOReturnIOError;
         ok = false;
     }
@@ -1786,6 +1874,12 @@ IOReturn NVBringup::ctxCreate(GpuConn *c, uint32_t engines, uint32_t *handle)
             nv_mmu_target patchT = { false, x->patch, nullptr, 0, NV_MMU_PTE_PRIVILEGE, 0 };
             ok = nv_mmu_map(&ops, c->pd3, x->kva + SLOT_MAIN, g->grMainSize, &mainT) &&
                  nv_mmu_map(&ops, c->pd3, x->kva + SLOT_PATCH, g->grPatchSize, &patchT);
+        }
+        if (ok && vdec) {
+            // Not privileged, as nouveau maps it (r535_flcn_ctor). Only this channel's own NVDEC
+            // work could reach it, and the buffer holds only this channel's decoder state.
+            nv_mmu_target ctxT = { false, x->main, nullptr, 0, 0, 0 };
+            ok = nv_mmu_map(&ops, c->pd3, x->kva + SLOT_MAIN, vdecBytes, &ctxT);
         }
     }
     praminRestore();
@@ -1854,6 +1948,28 @@ IOReturn NVBringup::ctxCreate(GpuConn *c, uint32_t engines, uint32_t *handle)
                 goto fail;
         }
         if (!rmScheduleChannel(x->hChannel, x->engineType, &x->token))
+            goto fail;
+    } else if (vdec) {
+        // As nouveau with r570: bind and schedule the channel, promote the falcon context buffer
+        // (the single-buffer form of PROMOTE_CTX), then allocate the decoder (r535_flcn_bind,
+        // r535_nvdec_alloc). No copy object: NVDEC channels have no copy engine.
+        if (!rmScheduleChannel(x->hChannel, x->engineType, &x->token))
+            goto fail;
+        uint8_t pr[NV2080_PROMOTE_SIZE] = {};
+        put32(pr, NV2080_PROMOTE_engineType, NV2080_ENGINE_TYPE_NVDEC0_);
+        put32(pr, NV2080_PROMOTE_hClient, g->hClient);
+        put32(pr, NV2080_PROMOTE_ChID, x->chid);
+        put32(pr, NV2080_PROMOTE_hChanClient, g->hClient);
+        put32(pr, NV2080_PROMOTE_hObject, x->hChannel);
+        put64(pr, NV2080_PROMOTE_virtAddress, x->kva + SLOT_MAIN);
+        put64(pr, NV2080_PROMOTE_size, g->nvdecCtxSize);
+        if (!gspRmControl(g->hClient, g->hSubdevice, NV2080_CTRL_CMD_GPU_PROMOTE_CTX_, pr, sizeof(pr), &st))
+            goto fail;
+        uint8_t bsp[NV_BSP_ALLOC_SIZE] = {};
+        put32(bsp, NV_BSP_size, NV_BSP_ALLOC_SIZE);
+        put32(bsp, NV_BSP_engineInstance, 0);
+        if (!gspRmAlloc(g->hClient, x->hChannel, x->hChannel + 4, NVC4B0_VIDEO_DECODER_CLASS, bsp, sizeof(bsp),
+                        &st))
             goto fail;
     } else {
         if (!rmScheduleChannel(x->hChannel, x->engineType, &x->token))
@@ -2134,6 +2250,7 @@ void NVBringup::fillInfo(nvmac_info *i)
     i->cls_eng3d = TURING_A_CLASS;
     i->cls_compute = TURING_COMPUTE_A_CLASS;
     i->cls_gpfifo = TURING_CHANNEL_GPFIFO_A_CLASS;
+    i->cls_vdec = g->nvdecCtxSize ? NVC4B0_VIDEO_DECODER_CLASS : 0;
     i->vram_size = g->vram->limit - g->vram->base + 1;
     i->vram_used = nv_vram_used(g->vram);
     i->bar1_size = g->bar1Heap ? g->bar1Heap->limit - g->bar1Heap->base + 1 - g->ptPoolSize : 0;
