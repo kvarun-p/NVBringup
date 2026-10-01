@@ -501,6 +501,142 @@ void NVBringup::initNvdec()
         NVC4B0_VIDEO_DECODER_CLASS);
 }
 
+// Display, step B0 (boot-arg nvdisp=1): what GSP-RM knows about the display outputs, read-only.
+// As nouveau's r535_disp_oneinit up to its queries: display instance memory registered with
+// GSP-RM (WRITE_INST_MEM, on the internal client), NV04_DISPLAY_COMMON, then the heads, the
+// supported displays and, per display, its OR (type, protocol), connector, connect state and
+// EDID, and what each head shows. No channels, modesets, backlight state or DP mode changes.
+// Results: the log, NVDisplayProbe (summary) and NVDisplayEDID-<displayId> (raw EDID).
+void NVBringup::probeDisplay()
+{
+    GspState *g = gsp_;
+    uint32_t arm = 0, st = 0;
+    if (!PE_parse_boot_argn("nvdisp", &arm, sizeof(arm)) || arm != 1)
+        return;
+    char sum[512];
+    uint32_t pos = 0;
+#define ADD(...) do { if (pos < sizeof(sum)) pos += (uint32_t)snprintf(sum + pos, sizeof(sum) - pos, __VA_ARGS__); } while (0)
+    sum[0] = 0;
+
+    g->dispInst = nv_vram_alloc(g->vram, 0x10000, 0x10000);
+    if (!g->dispInst) {
+        LOG("GSP: display: no VRAM for instance memory");
+        return;
+    }
+    uint8_t wi[NV2080_DISP_INST_SIZE] = {};
+    put64(wi, NV2080_DISP_INST_physAddr, g->dispInst);
+    put64(wi, NV2080_DISP_INST_size, 0x10000);
+    put32(wi, NV2080_DISP_INST_addrSpace, 2);           // ADDR_FBMEM
+    put32(wi, NV2080_DISP_INST_cacheAttr, 2);           // NV_MEMORY_WRITECOMBINED
+    if (!gspRmControl(g->hIntClient, g->hIntSubdevice, NV2080_CTRL_CMD_INTERNAL_DISPLAY_WRITE_INST_MEM_, wi,
+                      sizeof(wi), &st)) {
+        setProperty("NVDisplayProbe", "WRITE_INST_MEM failed");
+        return;
+    }
+    uint32_t h = g->nextHandle;
+    g->nextHandle += 8;
+    if (!gspRmAlloc(g->hClient, g->hDevice, h, NV04_DISPLAY_COMMON_CLASS, nullptr, 0, &st)) {
+        setProperty("NVDisplayProbe", "NV04_DISPLAY_COMMON allocation failed");
+        return;
+    }
+    g->hDisp = h;
+    auto ctl = [&](uint32_t cmd, void *p, uint32_t size) { return gspRmControl(g->hClient, g->hDisp, cmd, p, size, &st); };
+
+    uint8_t nh[NV0073_NUM_HEADS_SIZE] = {}, hm[NV0073_HEAD_MASK_SIZE] = {}, su[NV0073_SUPPORTED_SIZE] = {};
+    uint32_t heads = 0, headMask = 0, mask = 0, maskDdc = 0;
+    if (ctl(NV0073_CTRL_CMD_SYSTEM_GET_NUM_HEADS_, nh, sizeof(nh)))
+        memcpy(&heads, nh + NV0073_NUM_HEADS_numHeads, 4);
+    if (ctl(NV0073_CTRL_CMD_SPECIFIC_GET_ALL_HEAD_MASK_, hm, sizeof(hm)))
+        memcpy(&headMask, hm + NV0073_HEAD_MASK_headMask, 4);
+    if (ctl(NV0073_CTRL_CMD_SYSTEM_GET_SUPPORTED_, su, sizeof(su))) {
+        memcpy(&mask, su + NV0073_SUPPORTED_displayMask, 4);
+        memcpy(&maskDdc, su + NV0073_SUPPORTED_displayMaskDDC, 4);
+    }
+    LOG("GSP: display: %u heads (mask 0x%x), displays 0x%x (DDC 0x%x)", heads, headMask, mask, maskDdc);
+    ADD("heads %u (0x%x), displays 0x%x;", heads, headMask, mask);
+
+    for (uint32_t bit = 0; bit < 32; bit++) {
+        const uint32_t id = 1u << bit;
+        if (!(mask & id))
+            continue;
+        uint8_t oi[NV0073_OR_INFO_SIZE] = {};
+        put32(oi, NV0073_OR_INFO_displayId, id);
+        uint32_t orIndex = ~0u, orType = 0, proto = 0, loc = 0, dcb = 0;
+        bool lit = false;
+        if (ctl(NV0073_CTRL_CMD_SPECIFIC_OR_GET_INFO_, oi, sizeof(oi))) {
+            memcpy(&orIndex, oi + NV0073_OR_INFO_index, 4);
+            memcpy(&orType, oi + NV0073_OR_INFO_type, 4);
+            memcpy(&proto, oi + NV0073_OR_INFO_protocol, 4);
+            memcpy(&loc, oi + NV0073_OR_INFO_location, 4);
+            memcpy(&dcb, oi + NV0073_OR_INFO_dcbIndex, 4);
+            lit = oi[NV0073_OR_INFO_bIsLitByVbios] != 0;
+        }
+        uint8_t cd[NV0073_CONNECTOR_SIZE] = {};
+        put32(cd, NV0073_CONNECTOR_displayId, id);
+        uint32_t nConn = 0, connType = 0, connIndex = 0, platform = 0;
+        if (ctl(NV0073_CTRL_CMD_SPECIFIC_GET_CONNECTOR_DATA_, cd, sizeof(cd))) {
+            memcpy(&nConn, cd + NV0073_CONNECTOR_count, 4);
+            memcpy(&connIndex, cd + NV0073_CONNECTOR_data, 4);
+            memcpy(&connType, cd + NV0073_CONNECTOR_data + 4, 4);
+            memcpy(&platform, cd + NV0073_CONNECTOR_platform, 4);
+        }
+        uint8_t cs[NV0073_CONNECT_SIZE] = {};
+        put32(cs, NV0073_CONNECT_displayMask, id);
+        uint32_t conn = 0;
+        bool connected = ctl(NV0073_CTRL_CMD_SYSTEM_GET_CONNECT_STATE_, cs, sizeof(cs)) &&
+                         (memcpy(&conn, cs + NV0073_CONNECT_displayMask, 4), (conn & id) != 0);
+        LOG("GSP: display 0x%x: OR type %u index %u protocol %u location %u dcb %u%s; connector type 0x%x "
+            "index %u (%u connectors, platform %u); %s", id, orType, orIndex, proto, loc, dcb,
+            lit ? " lit by VBIOS" : "", connType, connIndex, nConn, platform,
+            connected ? "connected" : "not connected");
+        ADD(" 0x%x: OR %u/%u proto %u conn 0x%x %s", id, orType, orIndex, proto, connType,
+            connected ? "connected" : "-");
+        if (!connected)
+            continue;
+        uint8_t *ed = (uint8_t *)IOMallocZero(NV0073_EDID_SIZE);
+        if (!ed)
+            continue;
+        put32(ed, NV0073_EDID_displayId, id);
+        uint32_t n = 0;
+        if (ctl(NV0073_CTRL_CMD_SPECIFIC_GET_EDID_V2_, ed, NV0073_EDID_SIZE))
+            memcpy(&n, ed + NV0073_EDID_bufferSize, 4);
+        if (n >= 128 && n <= NV0073_EDID_MAX) {
+            const uint8_t *e = ed + NV0073_EDID_buffer;
+            // EDID 1.x: manufacturer (3 letters in 5-bit fields), product code, preferred mode.
+            const uint16_t m = (uint16_t)(e[8] << 8 | e[9]);
+            const char mfg[4] = { (char)('@' + ((m >> 10) & 31)), (char)('@' + ((m >> 5) & 31)),
+                                  (char)('@' + (m & 31)), 0 };
+            const uint32_t hact = (uint32_t)e[56] | (uint32_t)(e[58] & 0xf0) << 4;
+            const uint32_t vact = (uint32_t)e[59] | (uint32_t)(e[61] & 0xf0) << 4;
+            LOG("GSP: display 0x%x: EDID %u bytes, %s %04x, preferred %ux%u", id, n, mfg, e[10] | e[11] << 8,
+                hact, vact);
+            ADD(" EDID %s %ux%u", mfg, hact, vact);
+            char key[32];
+            snprintf(key, sizeof(key), "NVDisplayEDID-%x", id);
+            if (OSData *d = OSData::withBytes(e, n)) {
+                setProperty(key, d);
+                d->release();
+            }
+        } else {
+            LOG("GSP: display 0x%x: no EDID (%u bytes)", id, n);
+        }
+        ADD(";");
+        IOFree(ed, NV0073_EDID_SIZE);
+    }
+    for (uint32_t head = 0; head < heads && head < 8; head++) {
+        uint8_t ac[NV0073_ACTIVE_SIZE] = {};
+        put32(ac, NV0073_ACTIVE_head, head);
+        uint32_t active = 0;
+        if (ctl(NV0073_CTRL_CMD_SYSTEM_GET_ACTIVE_, ac, sizeof(ac)))
+            memcpy(&active, ac + NV0073_ACTIVE_displayId, 4);
+        LOG("GSP: display: head %u shows 0x%x", head, active);
+        if (active)
+            ADD(" head %u: 0x%x", head, active);
+    }
+    setProperty("NVDisplayProbe", sum);
+#undef ADD
+}
+
 // Item 4 (non-stall interrupts), step 1: read-only probe. Asks GSP-RM which interrupt vectors the
 // CPU services, keeps GR0's and the copy engines' non-stall vectors for intrHwOn, and logs the CPU
 // interrupt tree as GSP-RM left it. No register writes.

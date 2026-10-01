@@ -33,6 +33,9 @@
 #include "class/clc597.h"
 #include "ctrl/ctrl2080/ctrl2080fifo.h"
 #include "class/clc4b0.h"
+#include "class/cl0073.h"
+#include "ctrl/ctrl0073/ctrl0073system.h"
+#include "ctrl/ctrl0073/ctrl0073specific.h"
 #include <stdio.h>
 #include <stddef.h>
 #define NVGPU_ENGINE_CAPS_MASK_ARRAY_MAX ((0x54 - 1) / 32 + 1)   // RM_ENGINE_TYPE_LAST = 0x54
@@ -362,6 +365,55 @@ int main(void)
            NV2080_CTRL_CMD_GPU_GET_CONSTRUCTED_FALCON_INFO, sizeof(FI), offsetof(FI, numConstructedFalcons),
            offsetof(FI, constructedFalconsTable), NV2080_CTRL_GPU_MAX_CONSTRUCTED_FALCONS, sizeof(FE),
            offsetof(FE, engDesc), offsetof(FE, ctxBufferSize));
+    printf("\n// Display (B0 probe): display instance memory, NV04_DISPLAY_COMMON and its read-only controls,\n"
+           "// in the order nouveau's r535_disp_oneinit uses them.\n");
+    typedef NV2080_CTRL_INTERNAL_DISPLAY_WRITE_INST_MEM_PARAMS WI;
+    printf("#define NV2080_CTRL_CMD_INTERNAL_DISPLAY_WRITE_INST_MEM_ 0x%x\n#define NV2080_DISP_INST_SIZE %zu\n"
+           "#define NV2080_DISP_INST_physAddr %zu\n#define NV2080_DISP_INST_size %zu\n"
+           "#define NV2080_DISP_INST_addrSpace %zu\n#define NV2080_DISP_INST_cacheAttr %zu\n",
+           NV2080_CTRL_CMD_INTERNAL_DISPLAY_WRITE_INST_MEM, sizeof(WI), offsetof(WI, instMemPhysAddr),
+           offsetof(WI, instMemSize), offsetof(WI, instMemAddrSpace), offsetof(WI, instMemCpuCacheAttr));
+    printf("#define NV04_DISPLAY_COMMON_CLASS 0x%x\n", NV04_DISPLAY_COMMON);
+    typedef NV0073_CTRL_SYSTEM_GET_NUM_HEADS_PARAMS NH;
+    printf("#define NV0073_CTRL_CMD_SYSTEM_GET_NUM_HEADS_ 0x%x\n#define NV0073_NUM_HEADS_SIZE %zu\n"
+           "#define NV0073_NUM_HEADS_numHeads %zu\n",
+           NV0073_CTRL_CMD_SYSTEM_GET_NUM_HEADS, sizeof(NH), offsetof(NH, numHeads));
+    typedef NV0073_CTRL_SPECIFIC_GET_ALL_HEAD_MASK_PARAMS HM;
+    printf("#define NV0073_CTRL_CMD_SPECIFIC_GET_ALL_HEAD_MASK_ 0x%x\n#define NV0073_HEAD_MASK_SIZE %zu\n"
+           "#define NV0073_HEAD_MASK_headMask %zu\n",
+           NV0073_CTRL_CMD_SPECIFIC_GET_ALL_HEAD_MASK, sizeof(HM), offsetof(HM, headMask));
+    typedef NV0073_CTRL_SYSTEM_GET_SUPPORTED_PARAMS SU;
+    printf("#define NV0073_CTRL_CMD_SYSTEM_GET_SUPPORTED_ 0x%x\n#define NV0073_SUPPORTED_SIZE %zu\n"
+           "#define NV0073_SUPPORTED_displayMask %zu\n#define NV0073_SUPPORTED_displayMaskDDC %zu\n",
+           NV0073_CTRL_CMD_SYSTEM_GET_SUPPORTED, sizeof(SU), offsetof(SU, displayMask), offsetof(SU, displayMaskDDC));
+    typedef NV0073_CTRL_SYSTEM_GET_CONNECT_STATE_PARAMS CS;
+    printf("#define NV0073_CTRL_CMD_SYSTEM_GET_CONNECT_STATE_ 0x%x\n#define NV0073_CONNECT_SIZE %zu\n"
+           "#define NV0073_CONNECT_displayMask %zu\n",
+           NV0073_CTRL_CMD_SYSTEM_GET_CONNECT_STATE, sizeof(CS), offsetof(CS, displayMask));
+    typedef NV0073_CTRL_SPECIFIC_OR_GET_INFO_PARAMS OI;
+    printf("#define NV0073_CTRL_CMD_SPECIFIC_OR_GET_INFO_ 0x%x\n#define NV0073_OR_INFO_SIZE %zu\n"
+           "#define NV0073_OR_INFO_displayId %zu\n#define NV0073_OR_INFO_index %zu\n#define NV0073_OR_INFO_type %zu\n"
+           "#define NV0073_OR_INFO_protocol %zu\n#define NV0073_OR_INFO_location %zu\n#define NV0073_OR_INFO_dcbIndex %zu\n"
+           "#define NV0073_OR_INFO_bIsLitByVbios %zu\n",
+           NV0073_CTRL_CMD_SPECIFIC_OR_GET_INFO, sizeof(OI), offsetof(OI, displayId), offsetof(OI, index),
+           offsetof(OI, type), offsetof(OI, protocol), offsetof(OI, location), offsetof(OI, dcbIndex),
+           offsetof(OI, bIsLitByVbios));
+    typedef NV0073_CTRL_SPECIFIC_GET_CONNECTOR_DATA_PARAMS CD;
+    printf("#define NV0073_CTRL_CMD_SPECIFIC_GET_CONNECTOR_DATA_ 0x%x\n#define NV0073_CONNECTOR_SIZE %zu\n"
+           "#define NV0073_CONNECTOR_displayId %zu\n#define NV0073_CONNECTOR_count %zu\n#define NV0073_CONNECTOR_data %zu\n"
+           "#define NV0073_CONNECTOR_ENTRY_SIZE %zu\n#define NV0073_CONNECTOR_MAX %d\n#define NV0073_CONNECTOR_platform %zu\n",
+           NV0073_CTRL_CMD_SPECIFIC_GET_CONNECTOR_DATA, sizeof(CD), offsetof(CD, displayId), offsetof(CD, count),
+           offsetof(CD, data), sizeof(((CD *)0)->data[0]), NV0073_CTRL_MAX_CONNECTORS, offsetof(CD, platform));
+    typedef NV0073_CTRL_SPECIFIC_GET_EDID_V2_PARAMS ED;
+    printf("#define NV0073_CTRL_CMD_SPECIFIC_GET_EDID_V2_ 0x%x\n#define NV0073_EDID_SIZE %zu\n"
+           "#define NV0073_EDID_displayId %zu\n#define NV0073_EDID_bufferSize %zu\n#define NV0073_EDID_buffer %zu\n"
+           "#define NV0073_EDID_MAX %d\n",
+           NV0073_CTRL_CMD_SPECIFIC_GET_EDID_V2, sizeof(ED), offsetof(ED, displayId), offsetof(ED, bufferSize),
+           offsetof(ED, edidBuffer), NV0073_CTRL_SPECIFIC_GET_EDID_MAX_EDID_BYTES);
+    typedef NV0073_CTRL_SYSTEM_GET_ACTIVE_PARAMS AC;
+    printf("#define NV0073_CTRL_CMD_SYSTEM_GET_ACTIVE_ 0x%x\n#define NV0073_ACTIVE_SIZE %zu\n"
+           "#define NV0073_ACTIVE_head %zu\n#define NV0073_ACTIVE_displayId %zu\n",
+           NV0073_CTRL_CMD_SYSTEM_GET_ACTIVE, sizeof(AC), offsetof(AC, head), offsetof(AC, displayId));
     printf("\n// Phase 5: GR unit counts, 3D class, host and copy-engine methods used by the kernel\n");
     printf("#define TURING_A_CLASS 0x%x\n", TURING_A);
     printf("#define NV2080_CTRL_CMD_GR_GET_INFO_V2_ 0x%x\n#define NV2080_GR_INFO_V2_SIZE %zu\n"

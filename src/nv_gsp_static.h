@@ -249,6 +249,56 @@
 #define NV2080_FALCON_engDesc 0
 #define NV2080_FALCON_ctxBufferSize 8
 
+// Display (B0 probe): display instance memory, NV04_DISPLAY_COMMON and its read-only controls,
+// in the order nouveau's r535_disp_oneinit uses them.
+#define NV2080_CTRL_CMD_INTERNAL_DISPLAY_WRITE_INST_MEM_ 0x20800a49
+#define NV2080_DISP_INST_SIZE 24
+#define NV2080_DISP_INST_physAddr 0
+#define NV2080_DISP_INST_size 8
+#define NV2080_DISP_INST_addrSpace 16
+#define NV2080_DISP_INST_cacheAttr 20
+#define NV04_DISPLAY_COMMON_CLASS 0x73
+#define NV0073_CTRL_CMD_SYSTEM_GET_NUM_HEADS_ 0x730102
+#define NV0073_NUM_HEADS_SIZE 12
+#define NV0073_NUM_HEADS_numHeads 8
+#define NV0073_CTRL_CMD_SPECIFIC_GET_ALL_HEAD_MASK_ 0x730287
+#define NV0073_HEAD_MASK_SIZE 8
+#define NV0073_HEAD_MASK_headMask 4
+#define NV0073_CTRL_CMD_SYSTEM_GET_SUPPORTED_ 0x730107
+#define NV0073_SUPPORTED_SIZE 12
+#define NV0073_SUPPORTED_displayMask 4
+#define NV0073_SUPPORTED_displayMaskDDC 8
+#define NV0073_CTRL_CMD_SYSTEM_GET_CONNECT_STATE_ 0x730108
+#define NV0073_CONNECT_SIZE 16
+#define NV0073_CONNECT_displayMask 8
+#define NV0073_CTRL_CMD_SPECIFIC_OR_GET_INFO_ 0x73028b
+#define NV0073_OR_INFO_SIZE 56
+#define NV0073_OR_INFO_displayId 4
+#define NV0073_OR_INFO_index 8
+#define NV0073_OR_INFO_type 12
+#define NV0073_OR_INFO_protocol 16
+#define NV0073_OR_INFO_location 28
+#define NV0073_OR_INFO_dcbIndex 36
+#define NV0073_OR_INFO_bIsLitByVbios 48
+#define NV0073_CTRL_CMD_SPECIFIC_GET_CONNECTOR_DATA_ 0x730250
+#define NV0073_CONNECTOR_SIZE 72
+#define NV0073_CONNECTOR_displayId 4
+#define NV0073_CONNECTOR_count 16
+#define NV0073_CONNECTOR_data 20
+#define NV0073_CONNECTOR_ENTRY_SIZE 12
+#define NV0073_CONNECTOR_MAX 4
+#define NV0073_CONNECTOR_platform 68
+#define NV0073_CTRL_CMD_SPECIFIC_GET_EDID_V2_ 0x730245
+#define NV0073_EDID_SIZE 2064
+#define NV0073_EDID_displayId 4
+#define NV0073_EDID_bufferSize 8
+#define NV0073_EDID_buffer 16
+#define NV0073_EDID_MAX 2048
+#define NV0073_CTRL_CMD_SYSTEM_GET_ACTIVE_ 0x73010c
+#define NV0073_ACTIVE_SIZE 16
+#define NV0073_ACTIVE_head 4
+#define NV0073_ACTIVE_displayId 12
+
 // Phase 5: GR unit counts, 3D class, host and copy-engine methods used by the kernel
 #define TURING_A_CLASS 0xc597
 #define NV2080_CTRL_CMD_GR_GET_INFO_V2_ 0x20801228

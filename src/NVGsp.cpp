@@ -819,6 +819,8 @@ IOReturn NVBringup::unloadGspLocked(const char *why)
     }
     g->utilOk = g->grReady = false;
     g->nvdecCtxSize = 0;
+    g->dispInst = 0;                // the VRAM heap is rebuilt at the next boot
+    g->hDisp = 0;                   // freed with the client
     g->util = TestChan();
     g->nGrGlobal = 0;
     memset(g->chidUsed, 0, sizeof(g->chidUsed));
@@ -1265,6 +1267,7 @@ bool NVBringup::createRmObjects()
             LOG("GSP: GR context buffers unavailable: graphics/compute contexts disabled");
         queryGrInfo();
         initNvdec();
+        probeDisplay();
         probeIntr();
         if (!initBar1())
             LOG("GSP: BAR1 unavailable: CPU-mappable VRAM disabled");
