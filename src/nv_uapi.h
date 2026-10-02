@@ -26,7 +26,17 @@ enum nvmac_control_selector {
                             // else the copy from its last boot (vram_used, bar1_used 0);
                             // kIOReturnNotReady before the first boot, kIOReturnNoDevice when
                             // switched off. Lets Vulkan list the GPU.
+    NVMAC_PERF         = 3, // scalars in: none (query), or boost command (NVMAC_BOOST_*) and seconds;
+                            // scalars out: current P-state (0 = P0, fastest; ~0 unknown), RM status
+                            // of the boost (0 ok), auto-boost seconds (boot-arg nvboost), boosts sent.
+                            // kIOReturnNoDevice while the GPU is off or GSP-RM isn't running.
 };
+// NV2080_CTRL_PERF_BOOST_FLAGS_CMD values. A boost lasts the given seconds (at most 3600) or until
+// cleared; GSP-RM tracks it per RM client, and other limits (power, thermals) still apply.
+#define NVMAC_BOOST_CLEAR           0
+#define NVMAC_BOOST_1LEVEL          1
+#define NVMAC_BOOST_TO_MAX          2
+#define NVMAC_PERF_COUNT            4
 #define NVMAC_POWER_STATE_ON        0
 #define NVMAC_POWER_STATE_OFF       1
 #define NVMAC_POWER_STATE_SWITCHING 2

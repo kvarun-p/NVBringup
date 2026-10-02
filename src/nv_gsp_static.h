@@ -188,6 +188,15 @@
 #define GR_CTXBUF_FECS_EVENT 23
 #define GR_CTXBUF_PRIV_ACCESS_MAP 24
 #define NV2080_CTRL_CMD_GPU_PROMOTE_CTX_ 0x2080012b
+// P-state boost (what CPU-RM's NV2080_CTRL_CMD_PERF_BOOST sends to GSP-RM) and the current P-state
+#define NV2080_CTRL_CMD_INTERNAL_PERF_BOOST_SET_2X_ 0x20800a9a
+struct NV2080_CTRL_INTERNAL_PERF_BOOST_SET_PARAMS_2X_ {
+    uint8_t  flags;         // NvBool in the SDK; carries NV2080_CTRL_PERF_BOOST_FLAGS_CMD
+    uint8_t  pad[3];
+    uint32_t duration;      // seconds, or 0xffffffff until cleared
+};
+static_assert(sizeof(NV2080_CTRL_INTERNAL_PERF_BOOST_SET_PARAMS_2X_) == 8, "PERF_BOOST_SET_2X");
+#define NV2080_CTRL_CMD_PERF_GET_CURRENT_PSTATE_ 0x20802068     // NvU32 currPstate: bit n = Pn
 #define NV2080_PROMOTE_SIZE 560
 #define NV2080_PROMOTE_engineType 0
 #define NV2080_PROMOTE_hChanClient 12

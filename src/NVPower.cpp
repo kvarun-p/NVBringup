@@ -346,6 +346,28 @@ IOReturn NVBringup::powerCall(uint32_t selector, IOExternalMethodArguments *a)
         a->structureOutputSize = sizeof(i);
         return kIOReturnSuccess;
     }
+    if (selector == NVMAC_PERF) {
+        if ((a->scalarInputCount != 0 && a->scalarInputCount != 2) || a->scalarOutputCount != NVMAC_PERF_COUNT ||
+            (a->scalarInputCount == 2 && (a->scalarInput[0] > NVMAC_BOOST_TO_MAX ||
+                                          (a->scalarInput[1] > 3600 && a->scalarInput[1] != 0xffffffffull))))
+            return kIOReturnBadArgument;
+        IOLockLock(gspLock_);
+        if (pwrState_ != kPwrOn || !gsp_ || !gsp_->booted) {
+            IOLockUnlock(gspLock_);
+            return kIOReturnNoDevice;       // asking doesn't power the GPU on
+        }
+        uint32_t st = 0;
+        if (a->scalarInputCount == 2) {
+            perfBoostLocked((uint32_t)a->scalarInput[0], (uint32_t)a->scalarInput[1], &st);
+            LOG("perf: boost %llu for %llu s by user: status 0x%x", a->scalarInput[0], a->scalarInput[1], st);
+        }
+        a->scalarOutput[0] = pstateLocked();
+        a->scalarOutput[1] = st;
+        a->scalarOutput[2] = boostSec_;
+        a->scalarOutput[3] = boostCount_;
+        IOLockUnlock(gspLock_);
+        return kIOReturnSuccess;
+    }
     if (selector == NVMAC_POWER_SET) {
         if (a->scalarInputCount != 1 || a->scalarInput[0] > NVMAC_POWER_MODE_AUTO)
             return kIOReturnBadArgument;

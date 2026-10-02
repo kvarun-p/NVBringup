@@ -208,6 +208,51 @@ static int cmd_power(const char *arg)
     return kr == KERN_SUCCESS ? 0 : 1;
 }
 
+// P-state and boost through the control client: `nvgsp perf` shows the P-state; `nvgsp perf max|1level
+// [seconds]` boosts (default 2 s, "inf" until cleared); `nvgsp perf clear` drops this client's boost.
+static int cmd_perf(int argc, char **argv)
+{
+    uint64_t in[2] = {};
+    uint32_t nin = 0;
+    if (argc >= 1) {
+        in[0] = !strcmp(argv[0], "clear") ? 0 : !strcmp(argv[0], "1level") ? 1 : !strcmp(argv[0], "max") ? 2 : 99;
+        in[1] = argc >= 2 ? (!strcmp(argv[1], "inf") ? 0xffffffffull : strtoull(argv[1], NULL, 0)) : 2;
+        if (in[0] == 99) {
+            fprintf(stderr, "perf: [max|1level|clear [seconds|inf]]\n");
+            return 1;
+        }
+        nin = 2;
+    }
+    io_service_t s = find_driver();
+    io_connect_t c;
+    if (!s)
+        return 1;
+    kern_return_t kr = IOServiceOpen(s, mach_task_self(), 2, &c);
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "IOServiceOpen (control): 0x%x\n", kr);
+        IOObjectRelease(s);
+        return 1;
+    }
+    uint64_t out[4] = {};
+    uint32_t n = 4;
+    kr = IOConnectCallScalarMethod(c, 3, in, nin, out, &n);
+    if (kr != KERN_SUCCESS)
+        fprintf(stderr, "perf call: 0x%x%s\n", kr, kr == kIOReturnNoDevice ? " (GPU off or GSP-RM not running)" : "");
+    else {
+        if (out[0] == 0xffffffffull)
+            printf("P-state unknown");
+        else
+            printf("P%llu", (unsigned long long)out[0]);
+        if (nin)
+            printf(", boost status 0x%llx", (unsigned long long)out[1]);
+        printf("; auto boost %llu s after each EXEC, %llu boosts sent\n", (unsigned long long)out[2],
+               (unsigned long long)out[3]);
+    }
+    IOServiceClose(c);
+    IOObjectRelease(s);
+    return kr == KERN_SUCCESS ? 0 : 1;
+}
+
 static int cmd_intr(const char *arg)
 {
     uint64_t mode = !strcmp(arg, "off") ? 0 : !strcmp(arg, "on") ? 1 : 2;
@@ -487,6 +532,8 @@ int main(int argc, char **argv)
         return cmd_boot(argc == 3 ? argv[2] : "firmware/nvidia");
     if (argc == 2 && !strcmp(argv[1], "unload"))
         return cmd_unload();
+    if (argc >= 2 && !strcmp(argv[1], "perf") && argc <= 4)
+        return cmd_perf(argc - 2, argv + 2);
     if (argc >= 2 && !strcmp(argv[1], "power") && argc <= 3)
         return cmd_power(argc == 3 ? argv[2] : "status");
     if (argc >= 2 && !strcmp(argv[1], "intr") && argc <= 3)
@@ -501,6 +548,6 @@ int main(int argc, char **argv)
         IOObjectRelease(s);
         return 0;
     }
-    fprintf(stderr, "usage: sudo %s boot [fwdir] | sudo %s unload | %s power [on|off|auto|status] | sudo %s intr [on|off|status] | sudo %s logs [outdir] | %s status | %s decode <logdir> [logging-elf]\n", argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
+    fprintf(stderr, "usage: sudo %s boot [fwdir] | sudo %s unload | %s power [on|off|auto|status] | %s perf [max|1level|clear [seconds|inf]] | sudo %s intr [on|off|status] | sudo %s logs [outdir] | %s status | %s decode <logdir> [logging-elf]\n", argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
     return 2;
 }

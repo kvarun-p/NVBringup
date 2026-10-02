@@ -374,6 +374,7 @@ IOReturn NVBringup::bootGsp()
     }
 
     g->booted = true;
+    boostLast_ = 0;         // a new GSP-RM holds no boost
     LOG("GSP: SUCCESS: GSP-RM initialized");
     if (!sleepNotifier_)
         sleepNotifier_ = registerPrioritySleepWakeInterest(&NVBringup::sleepHandler, this);
@@ -1180,7 +1181,7 @@ bool NVBringup::gspRmAlloc(uint32_t hClient, uint32_t hParent, uint32_t hObject,
 
 // GSP_RM_CONTROL: params are sent and the reply's params copied back.
 bool NVBringup::gspRmControl(uint32_t hClient, uint32_t hObject, uint32_t cmd,
-                             void *params, uint32_t size, uint32_t *status)
+                             void *params, uint32_t size, uint32_t *status, bool quiet)
 {
     uint32_t total = (uint32_t)sizeof(rpc_gsp_rm_control_v03_00) + size;
     uint8_t *buf = (uint8_t *)IOMallocZero(total);
@@ -1198,8 +1199,9 @@ bool NVBringup::gspRmControl(uint32_t hClient, uint32_t hObject, uint32_t cmd,
     *status = res ? (st ? st : res) : 0;
     if (ok && res == 0 && size)
         memcpy(params, buf + sizeof(c), size);
-    LOG("GSP: control 0x%08x on 0x%08x: %s, result 0x%x status 0x%x",
-        cmd, hObject, !ok ? "no reply" : res ? "FAILED" : "ok", res, st);
+    if (!quiet || !ok || res)
+        LOG("GSP: control 0x%08x on 0x%08x: %s, result 0x%x status 0x%x",
+            cmd, hObject, !ok ? "no reply" : res ? "FAILED" : "ok", res, st);
     IOFree(buf, total);
     return ok && res == 0;
 }

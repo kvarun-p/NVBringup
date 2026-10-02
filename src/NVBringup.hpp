@@ -125,7 +125,7 @@ private:
     bool gspRmAlloc(uint32_t hClient, uint32_t hParent, uint32_t hObject, uint32_t hClass,
                     void *params, uint32_t size, uint32_t *status);
     bool gspRmControl(uint32_t hClient, uint32_t hObject, uint32_t cmd,
-                      void *params, uint32_t size, uint32_t *status);
+                      void *params, uint32_t size, uint32_t *status, bool quiet = false);
     bool gspRmFree(uint32_t hRoot, uint32_t hParent, uint32_t hObject, uint32_t *status);
     bool createRmObjects();
     // PRAMIN: CPU access to VRAM through BAR0 (Phase 4 step 3)
@@ -250,6 +250,15 @@ private:
     bool      intrESOn_ = false;
     volatile bool intrWanted_ = false;      // the switch (on unless nvintr=0); survives GSP-RM reboots
     volatile bool intrOn_ = false;          // enabled in hardware right now
+    // P-state boost: GSP-RM's own controller takes ~250 ms of load to raise the memory clock from
+    // idle, so EXEC asks for P0 for boostSec_ seconds (boot-arg nvboost, 0 = off), re-asking at
+    // most every boostSec_/2 while work keeps coming. Caller of both holds gspLock_.
+    uint32_t  boostSec_ = 2;
+    uint64_t  boostLast_ = 0;               // mach_absolute_time of the last boost sent
+    uint32_t  boostCount_ = 0;
+    bool      perfBoostLocked(uint32_t cmd, uint32_t sec, uint32_t *status);
+    void      autoBoostLocked();
+    uint32_t  pstateLocked();               // 0 = P0 ... 15, ~0 unknown
     volatile uint32_t intrCount_ = 0, intrSpurious_ = 0, intrStorms_ = 0;
     uint32_t  intrStormsLogged_ = 0;
     uint64_t  intrWinStart_ = 0, intrWinLen_ = 0;

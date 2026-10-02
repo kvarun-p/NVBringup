@@ -2029,6 +2029,54 @@ static uint32_t semOp(uint32_t *w, uint64_t addr, uint64_t value, uint32_t exec)
     return 6;
 }
 
+// ---- P-state boost -----------------------------------------------------------------------
+
+bool NVBringup::perfBoostLocked(uint32_t cmd, uint32_t sec, uint32_t *status)
+{
+    GspState *g = gsp_;
+    *status = 0xffffffff;
+    if (!g || !g->booted || !g->hSubdevice)
+        return false;
+    NV2080_CTRL_INTERNAL_PERF_BOOST_SET_PARAMS_2X_ p = {};
+    p.flags = (uint8_t)cmd;
+    p.duration = sec;
+    bool ok = gspRmControl(g->hClient, g->hSubdevice, NV2080_CTRL_CMD_INTERNAL_PERF_BOOST_SET_2X_,
+                           &p, sizeof(p), status, true);
+    if (ok)
+        boostCount_++;
+    return ok;
+}
+
+uint32_t NVBringup::pstateLocked()
+{
+    GspState *g = gsp_;
+    uint32_t p = 0, st = 0;
+    if (!g || !g->booted || !g->hSubdevice ||
+        !gspRmControl(g->hClient, g->hSubdevice, NV2080_CTRL_CMD_PERF_GET_CURRENT_PSTATE_, &p, sizeof(p), &st, true) ||
+        !p)
+        return ~0u;
+    return (uint32_t)__builtin_ctz(p);
+}
+
+// After an EXEC: P0 for boostSec_ more seconds, asked again once half of it has gone by.
+void NVBringup::autoBoostLocked()
+{
+    if (!boostSec_)
+        return;
+    uint64_t now = mach_absolute_time(), ns = 0;
+    if (boostLast_) {
+        absolutetime_to_nanoseconds(now - boostLast_, &ns);
+        if (ns < (uint64_t)boostSec_ * 500000000ull)
+            return;
+    }
+    boostLast_ = now;
+    uint32_t st = 0;
+    if (!perfBoostLocked(NVMAC_BOOST_TO_MAX, boostSec_, &st)) {
+        LOG("perf: P-state boost refused (status 0x%x); clocks left to GSP-RM", st);
+        boostSec_ = 0;                      // stop asking
+    }
+}
+
 IOReturn NVBringup::exec(GpuConn *c, const uint8_t *buf, uint32_t len, uint64_t *seqOut)
 {
     nvmac_exec_hdr h;
@@ -2139,6 +2187,7 @@ IOReturn NVBringup::exec(GpuConn *c, const uint8_t *buf, uint32_t len, uint64_t 
     praminRestore();
     wr32(NV_VF_DOORBELL, x->token);
     *seqOut = seq;
+    autoBoostLocked();                                       // after the doorbell: work isn't held up
     return kIOReturnSuccess;
 }
 

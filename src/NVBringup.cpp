@@ -60,6 +60,12 @@ bool NVBringup::start(IOService *provider)
     if (!intrWanted_)
         LOG("boot-arg nvintr=0: non-stall interrupts stay off (SYNC_WAIT polls)");
 
+    // P-state boost on EXEC (see boostSec_); nvboost=0 leaves the clocks to GSP-RM.
+    uint32_t boost = 2;
+    if (PE_parse_boot_argn("nvboost", &boost, sizeof(boost)))
+        LOG("boot-arg nvboost=%u: %s", boost, boost ? "seconds of P0 after each EXEC" : "no P-state boost");
+    boostSec_ = boost > 3600 ? 3600 : boost;
+
     findAcpiNode();
     powerProbe();
     logLastTeardown();
