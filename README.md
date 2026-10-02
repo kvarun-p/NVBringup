@@ -292,7 +292,7 @@ pulling changes, rebuild and reinstall everything that changed:
 | `nvgsp=1` | Allow booting GSP-RM (the daemon does it after login) |
 | `nvidle=<s>` | Idle time before power-off, default 30; `0` keeps the GPU on |
 | `nvintr=0` | Keep interrupts off (waits poll) |
-| `nvboost=<s>` | Hold P0 (full clocks) for this many seconds after each submission, default 2; `0` leaves the clocks to GSP-RM, which takes ~250 ms of load to raise the memory clock from idle. `build/nvgsp perf` shows the P-state |
+| `nvboost=<n>` | P-state boost after each submission: `2` adaptive (default: one level up on the first submission after idle, full clocks once the GPU is ≥50 % busy over ~80 ms, cleared after 150 ms idle), `1` fixed (full clocks for 2 s), `0` off (GSP-RM alone takes ~250 ms of load to raise the memory clock). `build/nvgsp perf` shows the P-state; `nvgsp perf policy …` changes the policy and its thresholds at runtime; `nvgsp perf watch` follows the P-state |
 | `nvgpu_users=1` | Let any user open the GPU, not only root and the console user |
 | `nvtest=1` | Run the kext's boot-time self-tests |
 | `nvkmapvram=1` | NVK keeps its push buffers and descriptors in CPU-mapped VRAM: faster generation (+15 % on a 0.5B model, +6 % on 3B), but each program run holds ~2.7 MiB of BAR1 until a restart; after ~42 runs it falls back to system memory (default speed). `desc` / `cmd:<n>` select parts; see [docs/bar1-cpu-mappings.md](docs/bar1-cpu-mappings.md) |

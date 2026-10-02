@@ -17,6 +17,8 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 #include <string>
 #include <vector>
 
@@ -208,48 +210,144 @@ static int cmd_power(const char *arg)
     return kr == KERN_SUCCESS ? 0 : 1;
 }
 
-// P-state and boost through the control client: `nvgsp perf` shows the P-state; `nvgsp perf max|1level
-// [seconds]` boosts (default 2 s, "inf" until cleared); `nvgsp perf clear` drops this client's boost.
+// P-state and boost through the control client (no sudo):
+//   nvgsp perf                          P-state, boost held, policy
+//   nvgsp perf max|1level|clear [s|inf] boost by hand (set the policy off first: the automatic
+//                                       boost shares the RM client and would clear it)
+//   nvgsp perf policy off|fixed|adaptive [seconds=2] [burst=1level|max|none] [busy=50] [idle=150]
+//   nvgsp perf watch [ms] [count]       P-state, level and busy EWMA every ms (default 10 ms, 300)
+static const char *const kBoostNames[] = { "none", "1level", "max" };
+static const char *const kPolicyNames[] = { "off", "fixed", "adaptive" };
+
+static int perf_open(io_connect_t *c)
+{
+    io_service_t s = find_driver();
+    if (!s)
+        return 1;
+    kern_return_t kr = IOServiceOpen(s, mach_task_self(), 2, c);
+    IOObjectRelease(s);
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "IOServiceOpen (control): 0x%x\n", kr);
+        return 1;
+    }
+    return 0;
+}
+
+static kern_return_t perf_policy(io_connect_t c, const uint64_t *in, uint32_t nin, uint64_t out[10])
+{
+    uint32_t n = 10;
+    return IOConnectCallScalarMethod(c, 4, in, nin, out, &n);
+}
+
+static void print_policy(const uint64_t *o)
+{
+    printf("policy %s (fixed: %llu s; adaptive: burst %s, max at %llu%% busy, clear after %llu ms idle); "
+           "holding %s, busy %.1f%%; sent %llu max, %llu 1level, %llu clear\n",
+           kPolicyNames[o[0] % 3], (unsigned long long)o[1], kBoostNames[o[2] % 3], (unsigned long long)o[3],
+           (unsigned long long)o[4], kBoostNames[o[5] % 3], o[6] / 10.0, (unsigned long long)o[7],
+           (unsigned long long)o[8], (unsigned long long)o[9]);
+}
+
 static int cmd_perf(int argc, char **argv)
 {
-    uint64_t in[2] = {};
+    io_connect_t c;
+    uint64_t out[10] = {}, pin[2] = {};
+    kern_return_t kr;
+    if (argc >= 1 && !strcmp(argv[0], "policy")) {
+        if (perf_open(&c))
+            return 1;
+        if ((kr = perf_policy(c, NULL, 0, out)) != KERN_SUCCESS) {
+            fprintf(stderr, "policy call: 0x%x\n", kr);
+            IOServiceClose(c);
+            return 1;
+        }
+        if (argc >= 2) {
+            uint64_t in[5] = { out[0], out[1], out[2], out[3], out[4] };
+            for (int i = 1; i < argc; i++) {
+                const char *a = argv[i];
+                if (!strcmp(a, "off") || !strcmp(a, "fixed") || !strcmp(a, "adaptive"))
+                    in[0] = !strcmp(a, "off") ? 0 : !strcmp(a, "fixed") ? 1 : 2;
+                else if (!strncmp(a, "seconds=", 8))
+                    in[1] = strtoull(a + 8, NULL, 0);
+                else if (!strncmp(a, "burst=", 6))
+                    in[2] = !strcmp(a + 6, "max") ? 2 : !strcmp(a + 6, "1level") ? 1 : 0;
+                else if (!strncmp(a, "busy=", 5))
+                    in[3] = strtoull(a + 5, NULL, 0);
+                else if (!strncmp(a, "idle=", 5))
+                    in[4] = strtoull(a + 5, NULL, 0);
+                else {
+                    fprintf(stderr, "perf policy: off|fixed|adaptive [seconds=N] [burst=1level|max|none] [busy=PCT] [idle=MS]\n");
+                    IOServiceClose(c);
+                    return 1;
+                }
+            }
+            if ((kr = perf_policy(c, in, 5, out)) != KERN_SUCCESS) {
+                fprintf(stderr, "policy call: 0x%x%s\n", kr, kr == kIOReturnBadArgument ?
+                        " (seconds 1-3600, busy 1-100, idle 20-10000)" : "");
+                IOServiceClose(c);
+                return 1;
+            }
+        }
+        print_policy(out);
+        IOServiceClose(c);
+        return 0;
+    }
+    if (argc >= 1 && !strcmp(argv[0], "watch")) {
+        unsigned ms = argc >= 2 ? (unsigned)strtoul(argv[1], NULL, 0) : 10;
+        unsigned count = argc >= 3 ? (unsigned)strtoul(argv[2], NULL, 0) : 300;
+        if (perf_open(&c))
+            return 1;
+        struct timespec t0;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        int last = -2;
+        for (unsigned i = 0; i < count; i++) {
+            uint64_t o[4] = {};
+            uint32_t n = 4;
+            kr = IOConnectCallScalarMethod(c, 3, NULL, 0, o, &n);
+            perf_policy(c, NULL, 0, out);
+            struct timespec t;
+            clock_gettime(CLOCK_MONOTONIC, &t);
+            double at = (t.tv_sec - t0.tv_sec) * 1e3 + (t.tv_nsec - t0.tv_nsec) / 1e6;
+            int p = kr != KERN_SUCCESS ? -1 : o[0] == 0xffffffffull ? 99 : (int)o[0];
+            int key = p * 16 + (int)(out[5] % 3);
+            if (key != last || i == count - 1) {     // print changes only
+                printf("%9.1f ms  P%-2d  holding %-6s  busy %5.1f%%\n", at, p, kBoostNames[out[5] % 3], out[6] / 10.0);
+                last = key;
+            }
+            usleep(ms * 1000);
+        }
+        IOServiceClose(c);
+        return 0;
+    }
     uint32_t nin = 0;
     if (argc >= 1) {
-        in[0] = !strcmp(argv[0], "clear") ? 0 : !strcmp(argv[0], "1level") ? 1 : !strcmp(argv[0], "max") ? 2 : 99;
-        in[1] = argc >= 2 ? (!strcmp(argv[1], "inf") ? 0xffffffffull : strtoull(argv[1], NULL, 0)) : 2;
-        if (in[0] == 99) {
-            fprintf(stderr, "perf: [max|1level|clear [seconds|inf]]\n");
+        pin[0] = !strcmp(argv[0], "clear") ? 0 : !strcmp(argv[0], "1level") ? 1 : !strcmp(argv[0], "max") ? 2 : 99;
+        pin[1] = argc >= 2 ? (!strcmp(argv[1], "inf") ? 0xffffffffull : strtoull(argv[1], NULL, 0)) : 2;
+        if (pin[0] == 99) {
+            fprintf(stderr, "perf: [max|1level|clear [seconds|inf]] | policy ... | watch [ms] [count]\n");
             return 1;
         }
         nin = 2;
     }
-    io_service_t s = find_driver();
-    io_connect_t c;
-    if (!s)
+    if (perf_open(&c))
         return 1;
-    kern_return_t kr = IOServiceOpen(s, mach_task_self(), 2, &c);
-    if (kr != KERN_SUCCESS) {
-        fprintf(stderr, "IOServiceOpen (control): 0x%x\n", kr);
-        IOObjectRelease(s);
-        return 1;
-    }
-    uint64_t out[4] = {};
+    uint64_t o[4] = {};
     uint32_t n = 4;
-    kr = IOConnectCallScalarMethod(c, 3, in, nin, out, &n);
+    kr = IOConnectCallScalarMethod(c, 3, pin, nin, o, &n);
     if (kr != KERN_SUCCESS)
         fprintf(stderr, "perf call: 0x%x%s\n", kr, kr == kIOReturnNoDevice ? " (GPU off or GSP-RM not running)" : "");
     else {
-        if (out[0] == 0xffffffffull)
+        if (o[0] == 0xffffffffull)
             printf("P-state unknown");
         else
-            printf("P%llu", (unsigned long long)out[0]);
+            printf("P%llu", (unsigned long long)o[0]);
         if (nin)
-            printf(", boost status 0x%llx", (unsigned long long)out[1]);
-        printf("; auto boost %llu s after each EXEC, %llu boosts sent\n", (unsigned long long)out[2],
-               (unsigned long long)out[3]);
+            printf(", boost status 0x%llx", (unsigned long long)o[1]);
+        printf("; %llu boost requests accepted\n", (unsigned long long)o[3]);
+        if (perf_policy(c, NULL, 0, out) == KERN_SUCCESS)
+            print_policy(out);
     }
     IOServiceClose(c);
-    IOObjectRelease(s);
     return kr == KERN_SUCCESS ? 0 : 1;
 }
 
@@ -532,7 +630,7 @@ int main(int argc, char **argv)
         return cmd_boot(argc == 3 ? argv[2] : "firmware/nvidia");
     if (argc == 2 && !strcmp(argv[1], "unload"))
         return cmd_unload();
-    if (argc >= 2 && !strcmp(argv[1], "perf") && argc <= 4)
+    if (argc >= 2 && !strcmp(argv[1], "perf"))
         return cmd_perf(argc - 2, argv + 2);
     if (argc >= 2 && !strcmp(argv[1], "power") && argc <= 3)
         return cmd_power(argc == 3 ? argv[2] : "status");
@@ -548,6 +646,6 @@ int main(int argc, char **argv)
         IOObjectRelease(s);
         return 0;
     }
-    fprintf(stderr, "usage: sudo %s boot [fwdir] | sudo %s unload | %s power [on|off|auto|status] | %s perf [max|1level|clear [seconds|inf]] | sudo %s intr [on|off|status] | sudo %s logs [outdir] | %s status | %s decode <logdir> [logging-elf]\n", argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
+    fprintf(stderr, "usage: sudo %s boot [fwdir] | sudo %s unload | %s power [on|off|auto|status] | %s perf [max|1level|clear [s|inf] | policy ... | watch [ms] [n]] | sudo %s intr [on|off|status] | sudo %s logs [outdir] | %s status | %s decode <logdir> [logging-elf]\n", argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
     return 2;
 }

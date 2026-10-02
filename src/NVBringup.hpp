@@ -250,14 +250,25 @@ private:
     bool      intrESOn_ = false;
     volatile bool intrWanted_ = false;      // the switch (on unless nvintr=0); survives GSP-RM reboots
     volatile bool intrOn_ = false;          // enabled in hardware right now
-    // P-state boost: GSP-RM's own controller takes ~250 ms of load to raise the memory clock from
-    // idle, so EXEC asks for P0 for boostSec_ seconds (boot-arg nvboost, 0 = off), re-asking at
-    // most every boostSec_/2 while work keeps coming. Caller of both holds gspLock_.
-    uint32_t  boostSec_ = 2;
-    uint64_t  boostLast_ = 0;               // mach_absolute_time of the last boost sent
-    uint32_t  boostCount_ = 0;
+    // P-state boost (NVMAC_PERF_POLICY_* in nv_uapi.h): GSP-RM's own controller takes ~250 ms of
+    // load to raise the memory clock from idle. Policy from boot-arg nvboost, changed at runtime
+    // with NVMAC_PERF_POLICY. All of it under gspLock_.
+    uint32_t  boostPolicy_ = 2, boostSec_ = 2, boostBurst_ = 1, boostBusyPct_ = 50, boostIdleMs_ = 150;
+    uint32_t  boostLevel_ = 0;              // NVMAC_BOOST_* we hold now (adaptive and fixed)
+    uint64_t  boostLast_ = 0;               // mach_absolute_time of the last boost request
+    uint64_t  boostLastBusy_ = 0;           // of the last busy sample (adaptive)
+    uint32_t  boostEwma_ = 0;               // busy fraction, per mille
+    uint32_t  boostSent_[3] = {};           // CLEAR, 1LEVEL, TO_MAX requests sent
+    uint32_t  boostCount_ = 0;              // accepted requests
+    bool      boostTicking_ = false;        // boostCall_ is armed
+    bool      boostStopping_ = false;       // driver stopping: don't re-arm
+    thread_call_t boostCall_ = nullptr;     // 20 ms sampler while an adaptive boost is held
+    static void boostThunk(thread_call_param_t self, thread_call_param_t);
+    void      boostTickLocked();
+    void      boostArmLocked();
     bool      perfBoostLocked(uint32_t cmd, uint32_t sec, uint32_t *status);
-    void      autoBoostLocked();
+    void      autoBoostLocked(bool backlog);
+    bool      gpuBusyLocked();              // a live context has unreleased EXECs
     uint32_t  pstateLocked();               // 0 = P0 ... 15, ~0 unknown
     volatile uint32_t intrCount_ = 0, intrSpurious_ = 0, intrStorms_ = 0;
     uint32_t  intrStormsLogged_ = 0;

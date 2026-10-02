@@ -2031,15 +2031,23 @@ static uint32_t semOp(uint32_t *w, uint64_t addr, uint64_t value, uint32_t exec)
 
 // ---- P-state boost -----------------------------------------------------------------------
 
+static uint64_t msSince(uint64_t then, uint64_t now)
+{
+    uint64_t ns = 0;
+    absolutetime_to_nanoseconds(now - then, &ns);
+    return ns / 1000000;
+}
+
 bool NVBringup::perfBoostLocked(uint32_t cmd, uint32_t sec, uint32_t *status)
 {
     GspState *g = gsp_;
     *status = 0xffffffff;
-    if (!g || !g->booted || !g->hSubdevice)
+    if (!g || !g->booted || !g->hSubdevice || cmd > NVMAC_BOOST_TO_MAX)
         return false;
     NV2080_CTRL_INTERNAL_PERF_BOOST_SET_PARAMS_2X_ p = {};
     p.flags = (uint8_t)cmd;
     p.duration = sec;
+    boostSent_[cmd]++;
     bool ok = gspRmControl(g->hClient, g->hSubdevice, NV2080_CTRL_CMD_INTERNAL_PERF_BOOST_SET_2X_,
                            &p, sizeof(p), status, true);
     if (ok)
@@ -2058,23 +2066,125 @@ uint32_t NVBringup::pstateLocked()
     return (uint32_t)__builtin_ctz(p);
 }
 
-// After an EXEC: P0 for boostSec_ more seconds, asked again once half of it has gone by.
-void NVBringup::autoBoostLocked()
+bool NVBringup::gpuBusyLocked()
 {
-    if (!boostSec_)
+    GspState *g = gsp_;
+    for (uint32_t i = 0; g && i < kMaxConns; i++) {
+        GpuConn *c = g->conns[i];
+        if (!c || c->dead)
+            continue;
+        for (uint32_t j = 0; j < kMaxCtx; j++) {
+            GpuCtx *x = c->ctxs[j];
+            if (x && !x->lost && *syncSlot(c, x->seqSync) < x->submitted)
+                return true;
+        }
+    }
+    return false;
+}
+
+// Requests are sent with the lock held (GSP-RM RPCs are serialised by it anyway); one costs a
+// GSP round trip, so they only go out when the level changes or a boost is about to run out.
+// A refusal turns the policy off: GSP-RM keeps the clocks, and the log says so once.
+static const uint32_t kBoostTickMs = 20, kBoostHoldSec = 2;
+
+void NVBringup::boostArmLocked()
+{
+    if (boostTicking_ || boostStopping_ || !boostCall_)
         return;
-    uint64_t now = mach_absolute_time(), ns = 0;
-    if (boostLast_) {
-        absolutetime_to_nanoseconds(now - boostLast_, &ns);
-        if (ns < (uint64_t)boostSec_ * 500000000ull)
+    boostTicking_ = true;
+    uint64_t dl = 0;
+    clock_interval_to_deadline(kBoostTickMs, kMillisecondScale, &dl);
+    thread_call_enter_delayed(boostCall_, dl);
+}
+
+void NVBringup::boostThunk(thread_call_param_t self, thread_call_param_t)
+{
+    NVBringup *d = (NVBringup *)self;
+    IOLockLock(d->gspLock_);
+    d->boostTicking_ = false;
+    if (d->gsp_ && d->gsp_->booted)
+        d->boostTickLocked();
+    else
+        d->boostLevel_ = 0;                 // GSP-RM went away, and its boosts with it
+    IOLockUnlock(d->gspLock_);
+}
+
+void NVBringup::autoBoostLocked(bool backlog)
+{
+    uint64_t now = mach_absolute_time();
+    uint32_t st = 0, want;
+    switch (boostPolicy_) {
+    case NVMAC_PERF_POLICY_FIXED:
+        if (boostLevel_ == NVMAC_BOOST_TO_MAX && boostLast_ && msSince(boostLast_, now) < boostSec_ * 500ull)
             return;
+        want = NVMAC_BOOST_TO_MAX;
+        break;
+    case NVMAC_PERF_POLICY_ADAPTIVE:
+        boostLastBusy_ = now;
+        want = backlog ? NVMAC_BOOST_TO_MAX : boostLevel_ ? boostLevel_ : boostBurst_;
+        if (want <= boostLevel_) {          // held already; the sampler renews and clears it
+            boostArmLocked();
+            return;
+        }
+        break;
+    default:
+        return;
     }
     boostLast_ = now;
-    uint32_t st = 0;
-    if (!perfBoostLocked(NVMAC_BOOST_TO_MAX, boostSec_, &st)) {
+    if (want != NVMAC_BOOST_CLEAR &&
+        !perfBoostLocked(want, boostPolicy_ == NVMAC_PERF_POLICY_FIXED ? boostSec_ : kBoostHoldSec, &st)) {
         LOG("perf: P-state boost refused (status 0x%x); clocks left to GSP-RM", st);
-        boostSec_ = 0;                      // stop asking
+        boostPolicy_ = NVMAC_PERF_POLICY_OFF;
+        boostLevel_ = 0;
+        return;
     }
+    boostLevel_ = want;
+    if (boostPolicy_ == NVMAC_PERF_POLICY_ADAPTIVE)
+        boostArmLocked();                   // even with no burst boost: the sampler may escalate
+}
+
+// Every 20 ms while the adaptive policy holds (or watches for) a boost.
+void NVBringup::boostTickLocked()
+{
+    if (boostPolicy_ != NVMAC_PERF_POLICY_ADAPTIVE) {
+        boostEwma_ = 0;
+        return;                             // the policy changed; whatever is held runs out
+    }
+    uint64_t now = mach_absolute_time();
+    bool busy = gpuBusyLocked();
+    boostEwma_ = (3 * boostEwma_ + (busy ? 1000 : 0)) / 4;
+    if (busy)
+        boostLastBusy_ = now;
+    uint32_t st = 0;
+    if (msSince(boostLastBusy_, now) >= boostIdleMs_) {
+        if (boostLevel_ != NVMAC_BOOST_CLEAR)
+            perfBoostLocked(NVMAC_BOOST_CLEAR, 0, &st);
+        boostLevel_ = NVMAC_BOOST_CLEAR;
+        boostEwma_ = 0;
+        return;                             // the next EXEC starts over
+    }
+    uint32_t want = boostLevel_;
+    if (boostEwma_ >= boostBusyPct_ * 10)
+        want = NVMAC_BOOST_TO_MAX;
+    // Renew a TO_MAX before it runs out. A 1LEVEL boost is left to run out instead (whether asking
+    // again stacks a level is GSP-RM's business); the next EXEC after it asks afresh.
+    bool renew = want == boostLevel_ && want == NVMAC_BOOST_TO_MAX && msSince(boostLast_, now) >= 1000;
+    if (boostLevel_ == NVMAC_BOOST_1LEVEL && msSince(boostLast_, now) >= kBoostHoldSec * 1000ull) {
+        boostLevel_ = NVMAC_BOOST_CLEAR;    // ran out: nothing held now
+        if (want == NVMAC_BOOST_1LEVEL)
+            want = NVMAC_BOOST_CLEAR;
+    }
+    if (want != boostLevel_ || renew) {
+        boostLast_ = now;
+        if (!perfBoostLocked(want, kBoostHoldSec, &st)) {
+            LOG("perf: P-state boost refused (status 0x%x); clocks left to GSP-RM", st);
+            boostPolicy_ = NVMAC_PERF_POLICY_OFF;
+            boostLevel_ = 0;
+            return;
+        }
+        boostLevel_ = want;
+    }
+    boostArmLocked();
 }
 
 IOReturn NVBringup::exec(GpuConn *c, const uint8_t *buf, uint32_t len, uint64_t *seqOut)
@@ -2130,6 +2240,7 @@ IOReturn NVBringup::exec(GpuConn *c, const uint8_t *buf, uint32_t len, uint64_t 
             return kIOReturnNoDevice;
     }
 
+    bool backlog = *syncSlot(c, x->seqSync) < x->submitted;  // earlier work still queued
     uint64_t seq = ++x->submitted;
     uint32_t slot = (uint32_t)(seq % PUSH_SLOTS);
     uint64_t pushPa = x->push + slot * PUSH_SLOT_BYTES, pushVa = x->kva + SLOT_PUSH + slot * PUSH_SLOT_BYTES;
@@ -2187,7 +2298,7 @@ IOReturn NVBringup::exec(GpuConn *c, const uint8_t *buf, uint32_t len, uint64_t 
     praminRestore();
     wr32(NV_VF_DOORBELL, x->token);
     *seqOut = seq;
-    autoBoostLocked();                                       // after the doorbell: work isn't held up
+    autoBoostLocked(backlog);                                // after the doorbell: work isn't held up
     return kIOReturnSuccess;
 }
 

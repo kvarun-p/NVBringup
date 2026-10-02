@@ -363,8 +363,45 @@ IOReturn NVBringup::powerCall(uint32_t selector, IOExternalMethodArguments *a)
         }
         a->scalarOutput[0] = pstateLocked();
         a->scalarOutput[1] = st;
-        a->scalarOutput[2] = boostSec_;
+        a->scalarOutput[2] = boostLevel_;
         a->scalarOutput[3] = boostCount_;
+        IOLockUnlock(gspLock_);
+        return kIOReturnSuccess;
+    }
+    if (selector == NVMAC_PERF_POLICY) {
+        const uint64_t *in = a->scalarInput;
+        if ((a->scalarInputCount != 0 && a->scalarInputCount != NVMAC_PERF_POLICY_COUNT) ||
+            a->scalarOutputCount != NVMAC_PERF_POLICY_OUT ||
+            (a->scalarInputCount && (in[0] > NVMAC_PERF_POLICY_ADAPTIVE || !in[1] || in[1] > 3600 ||
+                                     in[2] > NVMAC_BOOST_TO_MAX || !in[3] || in[3] > 100 ||
+                                     in[4] < 20 || in[4] > 10000)))
+            return kIOReturnBadArgument;
+        IOLockLock(gspLock_);
+        if (a->scalarInputCount) {
+            uint32_t st = 0;
+            if (in[0] != boostPolicy_ && boostLevel_ && gsp_ && gsp_->booted)
+                perfBoostLocked(NVMAC_BOOST_CLEAR, 0, &st);     // a new policy starts unboosted
+            if (in[0] != boostPolicy_)
+                boostLevel_ = NVMAC_BOOST_CLEAR;
+            boostPolicy_ = (uint32_t)in[0];
+            boostSec_ = (uint32_t)in[1];
+            boostBurst_ = (uint32_t)in[2];
+            boostBusyPct_ = (uint32_t)in[3];
+            boostIdleMs_ = (uint32_t)in[4];
+            LOG("perf: boost policy %llu (seconds %llu, burst %llu, busy %llu%%, idle %llu ms) by user",
+                in[0], in[1], in[2], in[3], in[4]);
+        }
+        uint64_t *out = a->scalarOutput;
+        out[0] = boostPolicy_;
+        out[1] = boostSec_;
+        out[2] = boostBurst_;
+        out[3] = boostBusyPct_;
+        out[4] = boostIdleMs_;
+        out[5] = boostLevel_;
+        out[6] = boostEwma_;
+        out[7] = boostSent_[NVMAC_BOOST_TO_MAX];
+        out[8] = boostSent_[NVMAC_BOOST_1LEVEL];
+        out[9] = boostSent_[NVMAC_BOOST_CLEAR];
         IOLockUnlock(gspLock_);
         return kIOReturnSuccess;
     }

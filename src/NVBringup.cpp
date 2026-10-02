@@ -1,5 +1,6 @@
 #include "NVBringup.hpp"
 #include "nv_regs.h"
+#include "nv_uapi.h"
 #include "nv_vbios.h"
 #include "nv_fwsec.h"
 #include "gen_bootloader.h"
@@ -60,11 +61,13 @@ bool NVBringup::start(IOService *provider)
     if (!intrWanted_)
         LOG("boot-arg nvintr=0: non-stall interrupts stay off (SYNC_WAIT polls)");
 
-    // P-state boost on EXEC (see boostSec_); nvboost=0 leaves the clocks to GSP-RM.
-    uint32_t boost = 2;
-    if (PE_parse_boot_argn("nvboost", &boost, sizeof(boost)))
-        LOG("boot-arg nvboost=%u: %s", boost, boost ? "seconds of P0 after each EXEC" : "no P-state boost");
-    boostSec_ = boost > 3600 ? 3600 : boost;
+    // P-state boost after EXEC: nvboost=0 off, 1 fixed, 2 adaptive (default); see nv_uapi.h.
+    static const char *const policies[] = { "off", "fixed", "adaptive" };
+    uint32_t boost = NVMAC_PERF_POLICY_ADAPTIVE;
+    if (PE_parse_boot_argn("nvboost", &boost, sizeof(boost)) && boost <= NVMAC_PERF_POLICY_ADAPTIVE)
+        LOG("boot-arg nvboost=%u: P-state boost policy %s", boost, policies[boost]);
+    boostPolicy_ = boost <= NVMAC_PERF_POLICY_ADAPTIVE ? boost : NVMAC_PERF_POLICY_ADAPTIVE;
+    boostCall_ = thread_call_allocate(&NVBringup::boostThunk, this);
 
     findAcpiNode();
     powerProbe();
@@ -112,6 +115,16 @@ void NVBringup::shutdownHw()
         IOLockUnlock(gspLock_);
     }
     intrRelease();
+    if (boostCall_) {
+        if (gspLock_) {
+            IOLockLock(gspLock_);
+            boostStopping_ = true;                  // the sampler doesn't re-arm
+            IOLockUnlock(gspLock_);
+        }
+        thread_call_cancel_wait(boostCall_);
+        thread_call_free(boostCall_);
+        boostCall_ = nullptr;
+    }
     if (resumeCall_) {
         thread_call_cancel_wait(resumeCall_);       // a wake-time GSP boot must not race us
         thread_call_free(resumeCall_);

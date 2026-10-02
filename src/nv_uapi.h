@@ -28,8 +28,11 @@ enum nvmac_control_selector {
                             // switched off. Lets Vulkan list the GPU.
     NVMAC_PERF         = 3, // scalars in: none (query), or boost command (NVMAC_BOOST_*) and seconds;
                             // scalars out: current P-state (0 = P0, fastest; ~0 unknown), RM status
-                            // of the boost (0 ok), auto-boost seconds (boot-arg nvboost), boosts sent.
+                            // of the boost (0 ok), boost level held now (NVMAC_BOOST_*), boosts sent.
                             // kIOReturnNoDevice while the GPU is off or GSP-RM isn't running.
+    NVMAC_PERF_POLICY  = 4, // scalars in: none (query), or the NVMAC_PERF_POLICY_COUNT fields below in
+                            // order; scalars out: those fields, then level held, busy EWMA (per mille),
+                            // and counts of TO_MAX, 1LEVEL and CLEAR requests sent. Works with the GPU off.
 };
 // NV2080_CTRL_PERF_BOOST_FLAGS_CMD values. A boost lasts the given seconds (at most 3600) or until
 // cleared; GSP-RM tracks it per RM client, and other limits (power, thermals) still apply.
@@ -37,6 +40,17 @@ enum nvmac_control_selector {
 #define NVMAC_BOOST_1LEVEL          1
 #define NVMAC_BOOST_TO_MAX          2
 #define NVMAC_PERF_COUNT            4
+// Automatic boost after EXEC (boot-arg nvboost=<policy>, default adaptive):
+//   OFF       clocks are left to GSP-RM's own controller (~250 ms to raise the memory clock)
+//   FIXED     TO_MAX for `seconds` after each EXEC, asked again every seconds/2 while work comes
+//   ADAPTIVE  `burst` (a boost command, or CLEAR for none) on the first EXEC after idle; TO_MAX
+//             once the busy fraction (sampled every 20 ms, ~80 ms EWMA) reaches `busy_pct`, or when
+//             an EXEC finds earlier work still queued; CLEAR once the GPU has been idle `idle_ms`.
+#define NVMAC_PERF_POLICY_OFF       0
+#define NVMAC_PERF_POLICY_FIXED     1
+#define NVMAC_PERF_POLICY_ADAPTIVE  2
+#define NVMAC_PERF_POLICY_COUNT     5   // policy, seconds, burst, busy_pct, idle_ms
+#define NVMAC_PERF_POLICY_OUT       10
 #define NVMAC_POWER_STATE_ON        0
 #define NVMAC_POWER_STATE_OFF       1
 #define NVMAC_POWER_STATE_SWITCHING 2
