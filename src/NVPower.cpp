@@ -363,7 +363,7 @@ IOReturn NVBringup::powerCall(uint32_t selector, IOExternalMethodArguments *a)
         }
         a->scalarOutput[0] = pstateLocked();
         a->scalarOutput[1] = st;
-        a->scalarOutput[2] = boostLevel_;
+        a->scalarOutput[2] = boostHeldLocked();
         a->scalarOutput[3] = boostCount_;
         IOLockUnlock(gspLock_);
         return kIOReturnSuccess;
@@ -397,7 +397,7 @@ IOReturn NVBringup::powerCall(uint32_t selector, IOExternalMethodArguments *a)
         out[2] = boostBurst_;
         out[3] = boostBusyPct_;
         out[4] = boostIdleMs_;
-        out[5] = boostLevel_;
+        out[5] = boostHeldLocked();
         out[6] = boostEwma_;
         out[7] = boostSent_[NVMAC_BOOST_TO_MAX];
         out[8] = boostSent_[NVMAC_BOOST_1LEVEL];

@@ -43,7 +43,7 @@ enum nvmac_control_selector {
 // Automatic boost after EXEC (boot-arg nvboost=<policy>, default adaptive):
 //   OFF       clocks are left to GSP-RM's own controller (~250 ms to raise the memory clock)
 //   FIXED     TO_MAX for `seconds` after each EXEC, asked again every seconds/2 while work comes
-//   ADAPTIVE  `burst` (a boost command, or CLEAR for none) on the first EXEC after idle; TO_MAX
+//   ADAPTIVE  `burst` (a boost command, default TO_MAX; CLEAR for none) on the first EXEC after idle; TO_MAX
 //             once the busy fraction (sampled every 20 ms, ~80 ms EWMA) reaches `busy_pct`, or when
 //             an EXEC finds earlier work still queued; CLEAR once the GPU has been idle `idle_ms`.
 #define NVMAC_PERF_POLICY_OFF       0

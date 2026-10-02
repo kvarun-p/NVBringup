@@ -2087,6 +2087,14 @@ bool NVBringup::gpuBusyLocked()
 // A refusal turns the policy off: GSP-RM keeps the clocks, and the log says so once.
 static const uint32_t kBoostTickMs = 20, kBoostHoldSec = 2;
 
+uint32_t NVBringup::boostHeldLocked()
+{
+    if (boostPolicy_ == NVMAC_PERF_POLICY_FIXED && boostLevel_ && boostLast_ &&
+        msSince(boostLast_, mach_absolute_time()) >= boostSec_ * 1000ull)
+        return NVMAC_BOOST_CLEAR;
+    return boostLevel_;
+}
+
 void NVBringup::boostArmLocked()
 {
     if (boostTicking_ || boostStopping_ || !boostCall_)

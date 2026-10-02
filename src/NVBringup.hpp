@@ -253,8 +253,12 @@ private:
     // P-state boost (NVMAC_PERF_POLICY_* in nv_uapi.h): GSP-RM's own controller takes ~250 ms of
     // load to raise the memory clock from idle. Policy from boot-arg nvboost, changed at runtime
     // with NVMAC_PERF_POLICY. All of it under gspLock_.
-    uint32_t  boostPolicy_ = 2, boostSec_ = 2, boostBurst_ = 1, boostBusyPct_ = 50, boostIdleMs_ = 150;
+    uint32_t  boostPolicy_ = 2, boostSec_ = 2, boostBurst_ = 2, boostBusyPct_ = 50, boostIdleMs_ = 150;
+    // burst TO_MAX by default: measured on TU117, it ends the memory-clock ramp outright and, as the
+    // work then finishes sooner, spends the least time in P0 (0.5 s for one small dispatch, against
+    // 0.8 s with 1LEVEL, which alone leaves the memory clock low, and 3.2 s with fixed 2 s).
     uint32_t  boostLevel_ = 0;              // NVMAC_BOOST_* we hold now (adaptive and fixed)
+    uint32_t  boostHeldLocked();            // boostLevel_, or CLEAR once a fixed boost ran out
     uint64_t  boostLast_ = 0;               // mach_absolute_time of the last boost request
     uint64_t  boostLastBusy_ = 0;           // of the last busy sample (adaptive)
     uint32_t  boostEwma_ = 0;               // busy fraction, per mille
