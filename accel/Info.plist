@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>NVMetalAccel</string>
+	<key>CFBundleIdentifier</key>
+	<string>io.github.kvarun-p.nvmetalaccel</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>NVMetalAccel</string>
+	<key>CFBundlePackageType</key>
+	<string>KEXT</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>0.1.0</string>
+	<key>IOKitPersonalities</key>
+	<dict>
+		<key>NVMetalAccelerator</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>io.github.kvarun-p.nvmetalaccel</string>
+			<key>IOClass</key>
+			<string>NVMetalAccelerator</string>
+			<!-- A second driver on NVBringup's service, in its own category. -->
+			<key>IOProviderClass</key>
+			<string>NVBringup</string>
+			<key>IOMatchCategory</key>
+			<string>IOAccelerator</string>
+			<!-- What Metal.framework loads for this accelerator: NVMetal.bundle, principal class
+			     NVMetalDevice (a subclass of MTLIOAccelDevice). -->
+			<key>MetalPluginName</key>
+			<string>NVMetal</string>
+			<key>MetalPluginClassName</key>
+			<string>NVMetalDevice</string>
+			<key>IOProbeScore</key>
+			<integer>1000</integer>
+		</dict>
+	</dict>
+	<key>OSBundleLibraries</key>
+	<dict>
+		<key>com.apple.iokit.IOAcceleratorFamily2</key>
+		<string>2.0.0</string>
+		<key>com.apple.kpi.iokit</key>
+		<string>19.0</string>
+		<key>com.apple.kpi.libkern</key>
+		<string>19.0</string>
+		<key>com.apple.kpi.mach</key>
+		<string>19.0</string>
+		<key>com.apple.kpi.unsupported</key>
+		<string>19.0</string>
+	</dict>
+</dict>
+</plist>
