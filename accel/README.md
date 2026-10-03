@@ -6,7 +6,7 @@ work itself: it gives IOAcceleratorFamily2 what its `start()` needs, modelled on
 driver (as Navi48-MacOS's Navi48Accel does). The bundle side (NVMetal.bundle, `NVMetalDevice : MTLIOAccelDevice`)
 is not written yet.
 
-- Matches NVBringup's service (category `IOAccelerator`); off unless boot-arg `nvaccel=1`.
+- Attaches to IOResources (category `IOAccelerator`) when NVBringup is present; off unless boot-arg `nvaccel=1`. Not under the GPU's PCI device: WindowServer's GPUWrangler adopts a PCI GPU that has an accelerator as a display GPU, and the screen went black.
 - `src/IOAccelFamily2_decl.h` declares the family's classes in this macOS's vtable order. It is generated
   from the kernel collections (`make decl`, needs `/opt/local/libexec/llvm-20/bin/llvm-mc`) and must be
   regenerated after a macOS update; `probe()` refuses if the family's class sizes changed.

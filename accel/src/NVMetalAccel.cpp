@@ -6,8 +6,11 @@
 // machine, a headless display machine), modelled on Apple's paravirt GPU driver
 // (AppleParavirtAccelerator, read from this Mac's kernel collection), as Navi48-MacOS's Navi48Accel does.
 //
-// Off unless boot-arg nvaccel=1. The family's classes are declared by IOAccelFamily2_decl.h, generated
-// from the kernel collections by tools/gen_decl.py: rebuild it after a macOS update.
+// It sits on IOResources, away from the GPU's PCI device: WindowServer adopts a PCI GPU with an
+// accelerator as a display GPU. Off unless boot-arg nvaccel=1.
+//
+// The family's classes are declared by IOAccelFamily2_decl.h, generated from the kernel collections
+// by tools/gen_decl.py: rebuild it after a macOS update.
 #include "IOAccelFamily2_decl.h"
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
@@ -118,9 +121,21 @@ static bool layout_ok()
 
 // ---- NVMetalAccelerator ---------------------------------------------------------------------------
 
+// Only with NVBringup's GPU present (it's the GPU the NVMetal bundle drives, through NVK).
+static bool have_gpu()
+{
+    OSDictionary *m = IOService::serviceMatching("NVBringup");
+    IOService *s = m ? IOService::copyMatchingService(m) : nullptr;
+    if (m)
+        m->release();
+    if (s)
+        s->release();
+    return s != nullptr;
+}
+
 IOService *NVMetalAccelerator::probe(IOService *provider, SInt32 *score)
 {
-    if (!enabled() || !layout_ok())
+    if (!enabled() || !layout_ok() || !have_gpu())
         return nullptr;
     return IOGraphicsAccelerator2::probe(provider, score);
 }

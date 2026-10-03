@@ -26,9 +26,13 @@
 			<string>io.github.kvarun-p.nvmetalaccel</string>
 			<key>IOClass</key>
 			<string>NVMetalAccelerator</string>
-			<!-- A second driver on NVBringup's service, in its own category. -->
+			<!-- On IOResources, not on NVBringup: an accelerator below the GPU's PCI device makes
+			     WindowServer's GPUWrangler adopt the GPU as a display GPU, which blanks the screen.
+			     probe() requires NVBringup's service. -->
 			<key>IOProviderClass</key>
-			<string>NVBringup</string>
+			<string>IOResources</string>
+			<key>IOResourceMatch</key>
+			<string>IOKit</string>
 			<key>IOMatchCategory</key>
 			<string>IOAccelerator</string>
 			<!-- What Metal.framework loads for this accelerator: NVMetal.bundle, principal class
