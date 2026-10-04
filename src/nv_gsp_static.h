@@ -188,6 +188,15 @@
 #define GR_CTXBUF_FECS_EVENT 23
 #define GR_CTXBUF_PRIV_ACCESS_MAP 24
 #define NV2080_CTRL_CMD_GPU_PROMOTE_CTX_ 0x2080012b
+// P-state boost (what CPU-RM's NV2080_CTRL_CMD_PERF_BOOST sends to GSP-RM) and the current P-state
+#define NV2080_CTRL_CMD_INTERNAL_PERF_BOOST_SET_2X_ 0x20800a9a
+struct NV2080_CTRL_INTERNAL_PERF_BOOST_SET_PARAMS_2X_ {
+    uint8_t  flags;         // NvBool in the SDK; carries NV2080_CTRL_PERF_BOOST_FLAGS_CMD
+    uint8_t  pad[3];
+    uint32_t duration;      // seconds, or 0xffffffff until cleared
+};
+static_assert(sizeof(NV2080_CTRL_INTERNAL_PERF_BOOST_SET_PARAMS_2X_) == 8, "PERF_BOOST_SET_2X");
+#define NV2080_CTRL_CMD_PERF_GET_CURRENT_PSTATE_ 0x20802068     // NvU32 currPstate: bit n = Pn
 #define NV2080_PROMOTE_SIZE 560
 #define NV2080_PROMOTE_engineType 0
 #define NV2080_PROMOTE_hChanClient 12
@@ -212,9 +221,42 @@
 #define PROMOTE_ID_PRIV_ACCESS_MAP 10
 #define PROMOTE_ID_UNRESTRICTED_PRIV_ACCESS_MAP 11
 #define NV2080_CTRL_GPU_INITIALIZE_CTX_VIDMEM_UNCACHED 0x4
+// The single-buffer form of PROMOTE_CTX (falcon engines such as NVDEC: entryCount 0)
+#define NV2080_PROMOTE_hClient 4
+#define NV2080_PROMOTE_ChID 8
+#define NV2080_PROMOTE_virtAddress 24
+#define NV2080_PROMOTE_size 32
 #define NV2080_ENGINE_TYPE_GR0_ 0x1
 #define NVC5C0_SET_REPORT_SEMAPHORE_A_ 0x1b00
 #define NVC5C0_SEMAPHORE_D_RELEASE_ONE_WORD 0x10000000
+
+// Video decode (NVDEC0). Turing's class is NVC4B0 on every chip (g_gpu_class_list.c, r570).
+// The channel's engine context is one falcon buffer, sized by GET_CONSTRUCTED_FALCON_INFO for
+// the engine's ENG_DESC, which comes from the device info table (as nouveau's r570 fifo.c).
+#define NV2080_ENGINE_TYPE_NVDEC0_ 0x13
+#define RM_ENGINE_TYPE_NVDEC0_ 0x1d                     // gpu_engine_type.h (device info table)
+#define NVC4B0_VIDEO_DECODER_CLASS 0xc4b0
+#define NV_BSP_ALLOC_SIZE 12                            // NV_BSP_ALLOCATION_PARAMETERS
+#define NV_BSP_size 0
+#define NV_BSP_engineInstance 8
+#define NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE_ 0x20801112
+#define NV2080_DEVINFO_SIZE 3212
+#define NV2080_DEVINFO_baseIndex 0
+#define NV2080_DEVINFO_numEntries 4
+#define NV2080_DEVINFO_bMore 8
+#define NV2080_DEVINFO_entries 12
+#define NV2080_DEVINFO_MAX 32
+#define NV2080_DEVINFO_ENTRY_SIZE 100                   // engineData[16], pbdma ids, name[16]
+#define ENGINE_INFO_TYPE_ENG_DESC_ 0                    // engineData indices (engine_info.h)
+#define ENGINE_INFO_TYPE_RM_ENGINE_TYPE_ 2
+#define NV2080_CTRL_CMD_GPU_GET_CONSTRUCTED_FALCON_INFO_ 0x208001b0
+#define NV2080_FALCON_INFO_SIZE 1284
+#define NV2080_FALCON_INFO_count 0
+#define NV2080_FALCON_INFO_table 4
+#define NV2080_FALCON_INFO_MAX 64
+#define NV2080_FALCON_ENTRY_SIZE 20
+#define NV2080_FALCON_engDesc 0
+#define NV2080_FALCON_ctxBufferSize 8
 
 // Phase 5: GR unit counts, 3D class, host and copy-engine methods used by the kernel
 #define TURING_A_CLASS 0xc597

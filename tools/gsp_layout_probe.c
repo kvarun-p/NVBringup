@@ -31,6 +31,8 @@
 #include "ctrl/ctrl0080/ctrl0080fifo.h"
 #include "ctrl/ctrl2080/ctrl2080gr.h"
 #include "class/clc597.h"
+#include "ctrl/ctrl2080/ctrl2080fifo.h"
+#include "class/clc4b0.h"
 #include <stdio.h>
 #include <stddef.h>
 #define NVGPU_ENGINE_CAPS_MASK_ARRAY_MAX ((0x54 - 1) / 32 + 1)   // RM_ENGINE_TYPE_LAST = 0x54
@@ -322,10 +324,44 @@ int main(void)
            NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ID_UNRESTRICTED_PRIV_ACCESS_MAP);
     printf("#define NV2080_CTRL_GPU_INITIALIZE_CTX_VIDMEM_UNCACHED 0x%x\n",
            (NV2080_CTRL_GPU_INITIALIZE_CTX_APERTURE_VIDMEM << 0) | (NV2080_CTRL_GPU_INITIALIZE_CTX_GPU_CACHEABLE_NO << 2));
+    printf("// The single-buffer form of PROMOTE_CTX (falcon engines such as NVDEC: entryCount 0)\n"
+           "#define NV2080_PROMOTE_hClient %zu\n#define NV2080_PROMOTE_ChID %zu\n"
+           "#define NV2080_PROMOTE_virtAddress %zu\n#define NV2080_PROMOTE_size %zu\n",
+           offsetof(P, hClient), offsetof(P, ChID), offsetof(P, virtAddress), offsetof(P, size));
     printf("#define NV2080_ENGINE_TYPE_GR0_ 0x%x\n", NV2080_ENGINE_TYPE_GR0);
     printf("#define NVC5C0_SET_REPORT_SEMAPHORE_A_ 0x%x\n#define NVC5C0_SEMAPHORE_D_RELEASE_ONE_WORD 0x%x\n",
            NVC5C0_SET_REPORT_SEMAPHORE_A, (NVC5C0_SET_REPORT_SEMAPHORE_D_OPERATION_RELEASE << 0) |
            (NVC5C0_SET_REPORT_SEMAPHORE_D_STRUCTURE_SIZE_ONE_WORD << 28));
+    printf("\n// Video decode (NVDEC0). Turing's class is NVC4B0 on every chip (g_gpu_class_list.c, r570).\n"
+           "// The channel's engine context is one falcon buffer, sized by GET_CONSTRUCTED_FALCON_INFO for\n"
+           "// the engine's ENG_DESC, which comes from the device info table (as nouveau's r570 fifo.c).\n");
+    printf("#define NV2080_ENGINE_TYPE_NVDEC0_ 0x%x\n", NV2080_ENGINE_TYPE_NVDEC0);
+    // Not in the SDK headers: src/nvidia/inc/kernel/gpu/gpu_engine_type.h and fifo/engine_info.h
+    // (both pinned by gsp_abi_check.c).
+    printf("#define RM_ENGINE_TYPE_NVDEC0_ 0x1d                     // gpu_engine_type.h (device info table)\n");
+    printf("#define NVC4B0_VIDEO_DECODER_CLASS 0x%x\n", NVC4B0_VIDEO_DECODER);
+    printf("#define NV_BSP_ALLOC_SIZE %zu                            // NV_BSP_ALLOCATION_PARAMETERS\n"
+           "#define NV_BSP_size %zu\n#define NV_BSP_engineInstance %zu\n",
+           sizeof(NV_BSP_ALLOCATION_PARAMETERS), offsetof(NV_BSP_ALLOCATION_PARAMETERS, size),
+           offsetof(NV_BSP_ALLOCATION_PARAMETERS, engineInstance));
+    typedef NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_PARAMS DI;
+    printf("#define NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE_ 0x%x\n#define NV2080_DEVINFO_SIZE %zu\n"
+           "#define NV2080_DEVINFO_baseIndex %zu\n#define NV2080_DEVINFO_numEntries %zu\n#define NV2080_DEVINFO_bMore %zu\n"
+           "#define NV2080_DEVINFO_entries %zu\n#define NV2080_DEVINFO_MAX %d\n"
+           "#define NV2080_DEVINFO_ENTRY_SIZE %zu                   // engineData[16], pbdma ids, name[16]\n",
+           NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE, sizeof(DI), offsetof(DI, baseIndex), offsetof(DI, numEntries),
+           offsetof(DI, bMore), offsetof(DI, entries), NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_MAX_ENTRIES,
+           sizeof(NV2080_CTRL_FIFO_DEVICE_ENTRY));
+    printf("#define ENGINE_INFO_TYPE_ENG_DESC_ 0                    // engineData indices (engine_info.h)\n"
+           "#define ENGINE_INFO_TYPE_RM_ENGINE_TYPE_ 2\n");
+    typedef NV2080_CTRL_GPU_GET_CONSTRUCTED_FALCON_INFO_PARAMS FI;
+    typedef NV2080_CTRL_GPU_CONSTRUCTED_FALCON_INFO FE;
+    printf("#define NV2080_CTRL_CMD_GPU_GET_CONSTRUCTED_FALCON_INFO_ 0x%x\n#define NV2080_FALCON_INFO_SIZE %zu\n"
+           "#define NV2080_FALCON_INFO_count %zu\n#define NV2080_FALCON_INFO_table %zu\n#define NV2080_FALCON_INFO_MAX %d\n"
+           "#define NV2080_FALCON_ENTRY_SIZE %zu\n#define NV2080_FALCON_engDesc %zu\n#define NV2080_FALCON_ctxBufferSize %zu\n",
+           NV2080_CTRL_CMD_GPU_GET_CONSTRUCTED_FALCON_INFO, sizeof(FI), offsetof(FI, numConstructedFalcons),
+           offsetof(FI, constructedFalconsTable), NV2080_CTRL_GPU_MAX_CONSTRUCTED_FALCONS, sizeof(FE),
+           offsetof(FE, engDesc), offsetof(FE, ctxBufferSize));
     printf("\n// Phase 5: GR unit counts, 3D class, host and copy-engine methods used by the kernel\n");
     printf("#define TURING_A_CLASS 0x%x\n", TURING_A);
     printf("#define NV2080_CTRL_CMD_GR_GET_INFO_V2_ 0x%x\n#define NV2080_GR_INFO_V2_SIZE %zu\n"

@@ -125,7 +125,7 @@ private:
     bool gspRmAlloc(uint32_t hClient, uint32_t hParent, uint32_t hObject, uint32_t hClass,
                     void *params, uint32_t size, uint32_t *status);
     bool gspRmControl(uint32_t hClient, uint32_t hObject, uint32_t cmd,
-                      void *params, uint32_t size, uint32_t *status);
+                      void *params, uint32_t size, uint32_t *status, bool quiet = false);
     bool gspRmFree(uint32_t hRoot, uint32_t hParent, uint32_t hObject, uint32_t *status);
     bool createRmObjects();
     // PRAMIN: CPU access to VRAM through BAR0 (Phase 4 step 3)
@@ -159,6 +159,7 @@ private:
     bool     initEngines();
     bool     createUtilChannel();
     bool     initGrGlobal();
+    void     initNvdec();
     void     queryGrInfo();
     void     probeIntr();               // read-only: CPU interrupt table and tree state
     bool     initBar1();
@@ -249,6 +250,30 @@ private:
     bool      intrESOn_ = false;
     volatile bool intrWanted_ = false;      // the switch (on unless nvintr=0); survives GSP-RM reboots
     volatile bool intrOn_ = false;          // enabled in hardware right now
+    // P-state boost (NVMAC_PERF_POLICY_* in nv_uapi.h): GSP-RM's own controller takes ~250 ms of
+    // load to raise the memory clock from idle. Policy from boot-arg nvboost, changed at runtime
+    // with NVMAC_PERF_POLICY. All of it under gspLock_.
+    uint32_t  boostPolicy_ = 2, boostSec_ = 2, boostBurst_ = 2, boostBusyPct_ = 50, boostIdleMs_ = 150;
+    // burst TO_MAX by default: measured on TU117, it ends the memory-clock ramp outright and, as the
+    // work then finishes sooner, spends the least time in P0 (0.5 s for one small dispatch, against
+    // 0.8 s with 1LEVEL, which alone leaves the memory clock low, and 3.2 s with fixed 2 s).
+    uint32_t  boostLevel_ = 0;              // NVMAC_BOOST_* we hold now (adaptive and fixed)
+    uint32_t  boostHeldLocked();            // boostLevel_, or CLEAR once a fixed boost ran out
+    uint64_t  boostLast_ = 0;               // mach_absolute_time of the last boost request
+    uint64_t  boostLastBusy_ = 0;           // of the last busy sample (adaptive)
+    uint32_t  boostEwma_ = 0;               // busy fraction, per mille
+    uint32_t  boostSent_[3] = {};           // CLEAR, 1LEVEL, TO_MAX requests sent
+    uint32_t  boostCount_ = 0;              // accepted requests
+    bool      boostTicking_ = false;        // boostCall_ is armed
+    bool      boostStopping_ = false;       // driver stopping: don't re-arm
+    thread_call_t boostCall_ = nullptr;     // 20 ms sampler while an adaptive boost is held
+    static void boostThunk(thread_call_param_t self, thread_call_param_t);
+    void      boostTickLocked();
+    void      boostArmLocked();
+    bool      perfBoostLocked(uint32_t cmd, uint32_t sec, uint32_t *status);
+    void      autoBoostLocked(bool backlog);
+    bool      gpuBusyLocked();              // a live context has unreleased EXECs
+    uint32_t  pstateLocked();               // 0 = P0 ... 15, ~0 unknown
     volatile uint32_t intrCount_ = 0, intrSpurious_ = 0, intrStorms_ = 0;
     uint32_t  intrStormsLogged_ = 0;
     uint64_t  intrWinStart_ = 0, intrWinLen_ = 0;

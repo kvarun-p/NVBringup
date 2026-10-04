@@ -426,6 +426,81 @@ void NVBringup::queryGrInfo()
         v[0], v[1], v[6]);
 }
 
+// Video decode: NVDEC0 present (engine list), its ENG_DESC (device info table) and the size of
+// its falcon context buffer (constructed falcon info), as nouveau's r570 fifo.c finds them.
+// Read-only queries; any failure leaves nvdecCtxSize 0 (no VDEC contexts, cls_vdec 0).
+void NVBringup::initNvdec()
+{
+    GspState *g = gsp_;
+    uint32_t st = 0;
+    g->nvdecCtxSize = 0;
+    bool present = false;
+    for (uint32_t i = 0; i < g->nEngines; i++)
+        present |= g->engines[i] == NV2080_ENGINE_TYPE_NVDEC0_;
+    if (!present) {
+        LOG("GSP: no NVDEC0: video decode unavailable");
+        return;
+    }
+    uint8_t *t = (uint8_t *)IOMallocZero(NV2080_DEVINFO_SIZE);
+    if (!t)
+        return;
+    uint32_t engDesc = 0;
+    bool found = false, more = true;
+    for (uint32_t base = 0; more && !found && base < 256; base += NV2080_DEVINFO_MAX) {
+        memset(t, 0, NV2080_DEVINFO_SIZE);
+        put32(t, NV2080_DEVINFO_baseIndex, base);
+        if (!gspRmControl(g->hClient, g->hSubdevice, NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE_, t,
+                          NV2080_DEVINFO_SIZE, &st))
+            break;
+        uint32_t n = 0;
+        memcpy(&n, t + NV2080_DEVINFO_numEntries, 4);
+        more = t[NV2080_DEVINFO_bMore] != 0;
+        for (uint32_t i = 0; i < n && i < NV2080_DEVINFO_MAX; i++) {
+            const uint8_t *e = t + NV2080_DEVINFO_entries + i * NV2080_DEVINFO_ENTRY_SIZE;
+            uint32_t rmType = 0;
+            memcpy(&rmType, e + 4 * ENGINE_INFO_TYPE_RM_ENGINE_TYPE_, 4);
+            if (rmType == RM_ENGINE_TYPE_NVDEC0_) {
+                memcpy(&engDesc, e + 4 * ENGINE_INFO_TYPE_ENG_DESC_, 4);
+                found = true;
+                break;
+            }
+        }
+    }
+    IOFree(t, NV2080_DEVINFO_SIZE);
+    if (!found) {
+        LOG("GSP: NVDEC0 not in the device info table: video decode unavailable");
+        return;
+    }
+    uint8_t *f = (uint8_t *)IOMallocZero(NV2080_FALCON_INFO_SIZE);
+    if (!f)
+        return;
+    uint32_t size = 0;
+    if (gspRmControl(g->hClient, g->hSubdevice, NV2080_CTRL_CMD_GPU_GET_CONSTRUCTED_FALCON_INFO_, f,
+                     NV2080_FALCON_INFO_SIZE, &st)) {
+        uint32_t n = 0;
+        memcpy(&n, f + NV2080_FALCON_INFO_count, 4);
+        for (uint32_t i = 0; i < n && i < NV2080_FALCON_INFO_MAX; i++) {
+            const uint8_t *e = f + NV2080_FALCON_INFO_table + i * NV2080_FALCON_ENTRY_SIZE;
+            uint32_t d = 0;
+            memcpy(&d, e + NV2080_FALCON_engDesc, 4);
+            if (d == engDesc) {
+                memcpy(&size, e + NV2080_FALCON_ctxBufferSize, 4);
+                break;
+            }
+        }
+    }
+    IOFree(f, NV2080_FALCON_INFO_SIZE);
+    // A context buffer goes in the context's SLOT_MAIN..SLOT_PATCH range of its VA slot.
+    if (!size || size > SLOT_PATCH - SLOT_MAIN) {
+        LOG("GSP: NVDEC0 (ENG_DESC 0x%x): context buffer size %u unusable: video decode unavailable",
+            engDesc, size);
+        return;
+    }
+    g->nvdecCtxSize = size;
+    LOG("GSP: NVDEC0: ENG_DESC 0x%x, context buffer %u bytes, class 0x%x", engDesc, size,
+        NVC4B0_VIDEO_DECODER_CLASS);
+}
+
 // Item 4 (non-stall interrupts), step 1: read-only probe. Asks GSP-RM which interrupt vectors the
 // CPU services, keeps GR0's and the copy engines' non-stall vectors for intrHwOn, and logs the CPU
 // interrupt tree as GSP-RM left it. No register writes.
@@ -1717,10 +1792,14 @@ IOReturn NVBringup::ctxCreate(GpuConn *c, uint32_t engines, uint32_t *handle)
 {
     GspState *g = gsp_;
     uint32_t st = 0;
-    if (!engines || (engines & ~(uint32_t)(NVMAC_ENGINE_COPY | NVMAC_ENGINE_3D | NVMAC_ENGINE_COMPUTE)))
+    if (!engines ||
+        (engines & ~(uint32_t)(NVMAC_ENGINE_COPY | NVMAC_ENGINE_3D | NVMAC_ENGINE_COMPUTE | NVMAC_ENGINE_VDEC)))
         return kIOReturnBadArgument;
     bool gr = engines & (NVMAC_ENGINE_3D | NVMAC_ENGINE_COMPUTE);
-    if (gr && !g->grReady)
+    bool vdec = engines & NVMAC_ENGINE_VDEC;
+    if (vdec && engines != NVMAC_ENGINE_VDEC)
+        return kIOReturnBadArgument;            // an NVDEC channel carries only the decoder
+    if ((gr && !g->grReady) || (vdec && !g->nvdecCtxSize))
         return kIOReturnUnsupported;
     uint32_t index = kMaxCtx;
     for (uint32_t i = 0; i < kMaxCtx; i++)
@@ -1752,7 +1831,7 @@ IOReturn NVBringup::ctxCreate(GpuConn *c, uint32_t engines, uint32_t *handle)
     x->chid = (uint32_t)chid;
     x->seqSync = (uint32_t)seqSync;
     x->kva = KVA_CTX + index * KVA_CTX_SLOT;
-    x->engineType = gr ? NV2080_ENGINE_TYPE_GR0_ : g->ceEngine;
+    x->engineType = gr ? NV2080_ENGINE_TYPE_GR0_ : vdec ? NV2080_ENGINE_TYPE_NVDEC0_ : g->ceEngine;
     c->ctxs[index] = x;                         // ctxDestroy cleans up from here on
 
     const nv_mmu_ops ops = connOps(c, connMmuAlloc, connMmuRd64, connMmuWr64);
@@ -1769,9 +1848,18 @@ IOReturn NVBringup::ctxCreate(GpuConn *c, uint32_t engines, uint32_t *handle)
         x->main = nv_vram_alloc(g->vram, g->grMainSize, align);
         x->patch = nv_vram_alloc(g->vram, g->grPatchSize, 0x1000);
     }
-    bool ok = x->inst && x->userd && x->mthd && x->ring && x->push && (!gr || (x->main && x->patch));
+    const uint64_t vdecBytes = ((uint64_t)g->nvdecCtxSize + 0xfff) & ~0xfffull;   // whole 4 KiB pages
+    if (vdec)                                   // NVDEC's falcon context buffer, in MAIN's place
+        x->main = nv_vram_alloc(g->vram, vdecBytes, 0x1000);
+    bool ok = x->inst && x->userd && x->mthd && x->ring && x->push && (!gr || (x->main && x->patch)) &&
+              (!vdec || x->main);
     // The push slots are readable by the connection's GPU work: no leftovers of earlier VRAM users.
     if (ok && !scrubVram(x->push, PUSH_SLOTS * PUSH_SLOT_BYTES)) {
+        r = kIOReturnIOError;
+        ok = false;
+    }
+    // The NVDEC context buffer starts zeroed, as nouveau's (nvkm_gpuobj_new with zero).
+    if (ok && vdec && !scrubVram(x->main, vdecBytes)) {
         r = kIOReturnIOError;
         ok = false;
     }
@@ -1786,6 +1874,12 @@ IOReturn NVBringup::ctxCreate(GpuConn *c, uint32_t engines, uint32_t *handle)
             nv_mmu_target patchT = { false, x->patch, nullptr, 0, NV_MMU_PTE_PRIVILEGE, 0 };
             ok = nv_mmu_map(&ops, c->pd3, x->kva + SLOT_MAIN, g->grMainSize, &mainT) &&
                  nv_mmu_map(&ops, c->pd3, x->kva + SLOT_PATCH, g->grPatchSize, &patchT);
+        }
+        if (ok && vdec) {
+            // Not privileged, as nouveau maps it (r535_flcn_ctor). Only this channel's own NVDEC
+            // work could reach it, and the buffer holds only this channel's decoder state.
+            nv_mmu_target ctxT = { false, x->main, nullptr, 0, 0, 0 };
+            ok = nv_mmu_map(&ops, c->pd3, x->kva + SLOT_MAIN, vdecBytes, &ctxT);
         }
     }
     praminRestore();
@@ -1855,6 +1949,28 @@ IOReturn NVBringup::ctxCreate(GpuConn *c, uint32_t engines, uint32_t *handle)
         }
         if (!rmScheduleChannel(x->hChannel, x->engineType, &x->token))
             goto fail;
+    } else if (vdec) {
+        // As nouveau with r570: bind and schedule the channel, promote the falcon context buffer
+        // (the single-buffer form of PROMOTE_CTX), then allocate the decoder (r535_flcn_bind,
+        // r535_nvdec_alloc). No copy object: NVDEC channels have no copy engine.
+        if (!rmScheduleChannel(x->hChannel, x->engineType, &x->token))
+            goto fail;
+        uint8_t pr[NV2080_PROMOTE_SIZE] = {};
+        put32(pr, NV2080_PROMOTE_engineType, NV2080_ENGINE_TYPE_NVDEC0_);
+        put32(pr, NV2080_PROMOTE_hClient, g->hClient);
+        put32(pr, NV2080_PROMOTE_ChID, x->chid);
+        put32(pr, NV2080_PROMOTE_hChanClient, g->hClient);
+        put32(pr, NV2080_PROMOTE_hObject, x->hChannel);
+        put64(pr, NV2080_PROMOTE_virtAddress, x->kva + SLOT_MAIN);
+        put64(pr, NV2080_PROMOTE_size, g->nvdecCtxSize);
+        if (!gspRmControl(g->hClient, g->hSubdevice, NV2080_CTRL_CMD_GPU_PROMOTE_CTX_, pr, sizeof(pr), &st))
+            goto fail;
+        uint8_t bsp[NV_BSP_ALLOC_SIZE] = {};
+        put32(bsp, NV_BSP_size, NV_BSP_ALLOC_SIZE);
+        put32(bsp, NV_BSP_engineInstance, 0);
+        if (!gspRmAlloc(g->hClient, x->hChannel, x->hChannel + 4, NVC4B0_VIDEO_DECODER_CLASS, bsp, sizeof(bsp),
+                        &st))
+            goto fail;
     } else {
         if (!rmScheduleChannel(x->hChannel, x->engineType, &x->token))
             goto fail;
@@ -1913,6 +2029,172 @@ static uint32_t semOp(uint32_t *w, uint64_t addr, uint64_t value, uint32_t exec)
     return 6;
 }
 
+// ---- P-state boost -----------------------------------------------------------------------
+
+static uint64_t msSince(uint64_t then, uint64_t now)
+{
+    uint64_t ns = 0;
+    absolutetime_to_nanoseconds(now - then, &ns);
+    return ns / 1000000;
+}
+
+bool NVBringup::perfBoostLocked(uint32_t cmd, uint32_t sec, uint32_t *status)
+{
+    GspState *g = gsp_;
+    *status = 0xffffffff;
+    if (!g || !g->booted || !g->hSubdevice || cmd > NVMAC_BOOST_TO_MAX)
+        return false;
+    NV2080_CTRL_INTERNAL_PERF_BOOST_SET_PARAMS_2X_ p = {};
+    p.flags = (uint8_t)cmd;
+    p.duration = sec;
+    boostSent_[cmd]++;
+    bool ok = gspRmControl(g->hClient, g->hSubdevice, NV2080_CTRL_CMD_INTERNAL_PERF_BOOST_SET_2X_,
+                           &p, sizeof(p), status, true);
+    if (ok)
+        boostCount_++;
+    return ok;
+}
+
+uint32_t NVBringup::pstateLocked()
+{
+    GspState *g = gsp_;
+    uint32_t p = 0, st = 0;
+    if (!g || !g->booted || !g->hSubdevice ||
+        !gspRmControl(g->hClient, g->hSubdevice, NV2080_CTRL_CMD_PERF_GET_CURRENT_PSTATE_, &p, sizeof(p), &st, true) ||
+        !p)
+        return ~0u;
+    return (uint32_t)__builtin_ctz(p);
+}
+
+bool NVBringup::gpuBusyLocked()
+{
+    GspState *g = gsp_;
+    for (uint32_t i = 0; g && i < kMaxConns; i++) {
+        GpuConn *c = g->conns[i];
+        if (!c || c->dead)
+            continue;
+        for (uint32_t j = 0; j < kMaxCtx; j++) {
+            GpuCtx *x = c->ctxs[j];
+            if (x && !x->lost && *syncSlot(c, x->seqSync) < x->submitted)
+                return true;
+        }
+    }
+    return false;
+}
+
+// Requests are sent with the lock held (GSP-RM RPCs are serialised by it anyway); one costs a
+// GSP round trip, so they only go out when the level changes or a boost is about to run out.
+// A refusal turns the policy off: GSP-RM keeps the clocks, and the log says so once.
+static const uint32_t kBoostTickMs = 20, kBoostHoldSec = 2;
+
+uint32_t NVBringup::boostHeldLocked()
+{
+    if (boostPolicy_ == NVMAC_PERF_POLICY_FIXED && boostLevel_ && boostLast_ &&
+        msSince(boostLast_, mach_absolute_time()) >= boostSec_ * 1000ull)
+        return NVMAC_BOOST_CLEAR;
+    return boostLevel_;
+}
+
+void NVBringup::boostArmLocked()
+{
+    if (boostTicking_ || boostStopping_ || !boostCall_)
+        return;
+    boostTicking_ = true;
+    uint64_t dl = 0;
+    clock_interval_to_deadline(kBoostTickMs, kMillisecondScale, &dl);
+    thread_call_enter_delayed(boostCall_, dl);
+}
+
+void NVBringup::boostThunk(thread_call_param_t self, thread_call_param_t)
+{
+    NVBringup *d = (NVBringup *)self;
+    IOLockLock(d->gspLock_);
+    d->boostTicking_ = false;
+    if (d->gsp_ && d->gsp_->booted)
+        d->boostTickLocked();
+    else
+        d->boostLevel_ = 0;                 // GSP-RM went away, and its boosts with it
+    IOLockUnlock(d->gspLock_);
+}
+
+void NVBringup::autoBoostLocked(bool backlog)
+{
+    uint64_t now = mach_absolute_time();
+    uint32_t st = 0, want;
+    switch (boostPolicy_) {
+    case NVMAC_PERF_POLICY_FIXED:
+        if (boostLevel_ == NVMAC_BOOST_TO_MAX && boostLast_ && msSince(boostLast_, now) < boostSec_ * 500ull)
+            return;
+        want = NVMAC_BOOST_TO_MAX;
+        break;
+    case NVMAC_PERF_POLICY_ADAPTIVE:
+        boostLastBusy_ = now;
+        want = backlog ? NVMAC_BOOST_TO_MAX : boostLevel_ ? boostLevel_ : boostBurst_;
+        if (want <= boostLevel_) {          // held already; the sampler renews and clears it
+            boostArmLocked();
+            return;
+        }
+        break;
+    default:
+        return;
+    }
+    boostLast_ = now;
+    if (want != NVMAC_BOOST_CLEAR &&
+        !perfBoostLocked(want, boostPolicy_ == NVMAC_PERF_POLICY_FIXED ? boostSec_ : kBoostHoldSec, &st)) {
+        LOG("perf: P-state boost refused (status 0x%x); clocks left to GSP-RM", st);
+        boostPolicy_ = NVMAC_PERF_POLICY_OFF;
+        boostLevel_ = 0;
+        return;
+    }
+    boostLevel_ = want;
+    if (boostPolicy_ == NVMAC_PERF_POLICY_ADAPTIVE)
+        boostArmLocked();                   // even with no burst boost: the sampler may escalate
+}
+
+// Every 20 ms while the adaptive policy holds (or watches for) a boost.
+void NVBringup::boostTickLocked()
+{
+    if (boostPolicy_ != NVMAC_PERF_POLICY_ADAPTIVE) {
+        boostEwma_ = 0;
+        return;                             // the policy changed; whatever is held runs out
+    }
+    uint64_t now = mach_absolute_time();
+    bool busy = gpuBusyLocked();
+    boostEwma_ = (3 * boostEwma_ + (busy ? 1000 : 0)) / 4;
+    if (busy)
+        boostLastBusy_ = now;
+    uint32_t st = 0;
+    if (msSince(boostLastBusy_, now) >= boostIdleMs_) {
+        if (boostLevel_ != NVMAC_BOOST_CLEAR)
+            perfBoostLocked(NVMAC_BOOST_CLEAR, 0, &st);
+        boostLevel_ = NVMAC_BOOST_CLEAR;
+        boostEwma_ = 0;
+        return;                             // the next EXEC starts over
+    }
+    uint32_t want = boostLevel_;
+    if (boostEwma_ >= boostBusyPct_ * 10)
+        want = NVMAC_BOOST_TO_MAX;
+    // Renew a TO_MAX before it runs out. A 1LEVEL boost is left to run out instead (whether asking
+    // again stacks a level is GSP-RM's business); the next EXEC after it asks afresh.
+    bool renew = want == boostLevel_ && want == NVMAC_BOOST_TO_MAX && msSince(boostLast_, now) >= 1000;
+    if (boostLevel_ == NVMAC_BOOST_1LEVEL && msSince(boostLast_, now) >= kBoostHoldSec * 1000ull) {
+        boostLevel_ = NVMAC_BOOST_CLEAR;    // ran out: nothing held now
+        if (want == NVMAC_BOOST_1LEVEL)
+            want = NVMAC_BOOST_CLEAR;
+    }
+    if (want != boostLevel_ || renew) {
+        boostLast_ = now;
+        if (!perfBoostLocked(want, kBoostHoldSec, &st)) {
+            LOG("perf: P-state boost refused (status 0x%x); clocks left to GSP-RM", st);
+            boostPolicy_ = NVMAC_PERF_POLICY_OFF;
+            boostLevel_ = 0;
+            return;
+        }
+        boostLevel_ = want;
+    }
+    boostArmLocked();
+}
+
 IOReturn NVBringup::exec(GpuConn *c, const uint8_t *buf, uint32_t len, uint64_t *seqOut)
 {
     nvmac_exec_hdr h;
@@ -1966,6 +2248,7 @@ IOReturn NVBringup::exec(GpuConn *c, const uint8_t *buf, uint32_t len, uint64_t 
             return kIOReturnNoDevice;
     }
 
+    bool backlog = *syncSlot(c, x->seqSync) < x->submitted;  // earlier work still queued
     uint64_t seq = ++x->submitted;
     uint32_t slot = (uint32_t)(seq % PUSH_SLOTS);
     uint64_t pushPa = x->push + slot * PUSH_SLOT_BYTES, pushVa = x->kva + SLOT_PUSH + slot * PUSH_SLOT_BYTES;
@@ -2023,6 +2306,7 @@ IOReturn NVBringup::exec(GpuConn *c, const uint8_t *buf, uint32_t len, uint64_t 
     praminRestore();
     wr32(NV_VF_DOORBELL, x->token);
     *seqOut = seq;
+    autoBoostLocked(backlog);                                // after the doorbell: work isn't held up
     return kIOReturnSuccess;
 }
 
@@ -2134,6 +2418,7 @@ void NVBringup::fillInfo(nvmac_info *i)
     i->cls_eng3d = TURING_A_CLASS;
     i->cls_compute = TURING_COMPUTE_A_CLASS;
     i->cls_gpfifo = TURING_CHANNEL_GPFIFO_A_CLASS;
+    i->cls_vdec = g->nvdecCtxSize ? NVC4B0_VIDEO_DECODER_CLASS : 0;
     i->vram_size = g->vram->limit - g->vram->base + 1;
     i->vram_used = nv_vram_used(g->vram);
     i->bar1_size = g->bar1Heap ? g->bar1Heap->limit - g->bar1Heap->base + 1 - g->ptPoolSize : 0;

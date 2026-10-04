@@ -1,7 +1,8 @@
 // nvtest: Phase 5 tests of the GPU interface from user space (libnvmac). Run as root:
 //   sudo build/nvtest            all tests
 //   sudo build/nvtest -v         also print details
-// Groups: 5a memory and bindings, 5b contexts / submission / syncs, 5c robustness.
+// Groups: 5a memory and bindings, 5b contexts / submission / syncs, 5c robustness,
+// 6a video decode (NVDEC) contexts.
 // Push buffers live in system memory (GART) bound into the GPU VA space.
 #include "libnvmac.h"
 
@@ -39,7 +40,7 @@ static double now_us(void)
 
 // ---- Push buffer building (Volta+ incrementing method headers) ----------------------------
 
-enum { SUBC_3D = 0, SUBC_COMPUTE = 1, SUBC_COPY = 4 };
+enum { SUBC_3D = 0, SUBC_COMPUTE = 1, SUBC_COPY = 4, SUBC_VDEC = 4 };   // NVK: SUBC_NVC5B0 = 4
 enum { CLS_3D = 0xc597, CLS_COMPUTE = 0xc5c0, CLS_COPY = 0xc5b5 };
 
 struct pb { uint32_t *p; uint32_t n; };
@@ -138,6 +139,7 @@ static void test_info(struct tdev *t)
     printf("    %s: device %04x chipset 0x%x rev %02x, sm%u, %u GPC / %u TPC / %u SM per TPC, %u warps/SM\n",
            i->name, i->device_id, i->chipset, i->revision, i->sm, i->gpc_count, i->tpc_count, i->mp_per_tpc,
            i->max_warps_per_mp);
+    printf("    video decoder class 0x%x%s\n", i->cls_vdec, i->cls_vdec ? "" : " (none)");
     printf("    VRAM %llu MiB (%llu MiB used), BAR1 window %llu MiB, user VA 0x%llx..0x%llx\n",
            (unsigned long long)(i->vram_size >> 20), (unsigned long long)(i->vram_used >> 20),
            (unsigned long long)(i->bar1_size >> 20), (unsigned long long)i->va_start, (unsigned long long)i->va_end);
@@ -470,8 +472,50 @@ static void test_invalid(struct tdev *t)
     CHECK(nvmac_exec(t->d, ctx, NULL, 0, &p, 1, &seqsig, 1, NULL) == kIOReturnBadArgument,
           "signaling a context's seqno sync");
     CHECK(nvmac_exec(t->d, 77, NULL, 0, &p, 1, NULL, 0, NULL) == kIOReturnBadArgument, "unknown context");
-    CHECK(nvmac_ctx_create(t->d, 1u << 6, &ctx, &ss) == kIOReturnBadArgument, "unknown engine");
+    CHECK(nvmac_ctx_create(t->d, 1u << 7, &ctx, &ss) == kIOReturnBadArgument, "unknown engine");
     nvmac_ctx_destroy(t->d, ctx);
+}
+
+// An NVDEC context: channel on the NVDEC runlist, falcon context buffer promoted, decoder object.
+// The push binds the decoder class to its subchannel (as NVK's video queue does first); the
+// kernel's host semaphore release after it shows the channel ran without an error.
+static void test_vdec_ctx(struct tdev *t)
+{
+    printf("[6a] video decode (NVDEC) context\n");
+    const struct nvmac_info *i = nvmac_info(t->d);
+    uint32_t ctx, ss;
+    if (!i->cls_vdec) {
+        CHECK(nvmac_ctx_create(t->d, NVMAC_ENGINE_VDEC, &ctx, &ss) == kIOReturnUnsupported,
+              "no NVDEC: VDEC context refused");
+        return;
+    }
+    CHECK(i->cls_vdec == 0xc4b0, "decoder class 0x%x (Turing NVC4B0)", i->cls_vdec);
+    CHECK(nvmac_ctx_create(t->d, NVMAC_ENGINE_VDEC | NVMAC_ENGINE_COPY, &ctx, &ss) == kIOReturnBadArgument,
+          "VDEC with another engine refused");
+    CHECK(nvmac_ctx_create(t->d, NVMAC_ENGINE_VDEC | NVMAC_ENGINE_COMPUTE, &ctx, &ss) == kIOReturnBadArgument,
+          "VDEC with a graphics engine refused");
+    TRY(nvmac_ctx_create(t->d, NVMAC_ENGINE_VDEC, &ctx, &ss));
+    uint64_t pva, seq = 0;
+    struct pb b = tdev_pb(t, &pva);
+    mthd(&b, SUBC_VDEC, 0, 1, (uint32_t)i->cls_vdec);       // SET_OBJECT
+    TRY(submit(t, ctx, &b, pva, NULL, 0, NULL, 0, &seq));
+    int r = wait_seq(t, ss, seq, 5000);
+    CHECK(r == 0, "exec on the NVDEC channel completed (0x%x)", r);
+    int lost;
+    uint32_t ex;
+    uint64_t done;
+    TRY(nvmac_ctx_status(t->d, ctx, &lost, &ex, &done));
+    CHECK(!lost && done == seq, "status: not lost (exception 0x%x), seqno %llu completed", ex,
+          (unsigned long long)done);
+    // A second context at once: each channel has its own context buffer.
+    uint32_t ctx2, ss2;
+    TRY(nvmac_ctx_create(t->d, NVMAC_ENGINE_VDEC, &ctx2, &ss2));
+    b = tdev_pb(t, &pva);
+    mthd(&b, SUBC_VDEC, 0, 1, (uint32_t)i->cls_vdec);
+    TRY(submit(t, ctx2, &b, pva, NULL, 0, NULL, 0, &seq));
+    CHECK(wait_seq(t, ss2, seq, 5000) == 0, "second NVDEC context runs too");
+    TRY(nvmac_ctx_destroy(t->d, ctx2));
+    TRY(nvmac_ctx_destroy(t->d, ctx));
 }
 
 // A context that faults (copy to an unbound VA) is lost; its connection reports device lost;
@@ -656,6 +700,7 @@ int main(int argc, char **argv)
     test_ring(&t);
     test_bandwidth(&t);
     test_invalid(&t);
+    test_vdec_ctx(&t);
     test_fault(&t);
     test_kill(&t, argv[0]);
     test_threads();
