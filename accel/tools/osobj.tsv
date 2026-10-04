@@ -1,0 +1,37 @@
+0	U::~U() [complete]
+1	U::~U() [deleting]
+2	void OSObject::release(int) const
+3	int OSObject::getRetainCount() const
+4	void OSObject::retain() const
+5	void OSObject::release() const
+6	bool OSObject::serialize(OSSerialize *) const
+7	const OSMetaClass *U::getMetaClass() const
+8	bool OSMetaClassBase::isEqualTo(const OSMetaClassBase *) const
+9	void OSObject::taggedRetain(const void *) const
+10	void OSObject::taggedRelease(const void *) const
+11	void OSObject::taggedRelease(const void *, const int) const
+12	kern_return_t OSObject::Dispatch(const IORPC)
+13	void OSMetaClassBase::_RESERVEDOSMetaClassBase4()
+14	void OSMetaClassBase::_RESERVEDOSMetaClassBase5()
+15	void OSMetaClassBase::_RESERVEDOSMetaClassBase6()
+16	void OSMetaClassBase::_RESERVEDOSMetaClassBase7()
+17	bool OSObject::init()
+18	void OSObject::free()
+19	void OSObject::_RESERVEDOSObject0()
+20	void OSObject::_RESERVEDOSObject1()
+21	void OSObject::_RESERVEDOSObject2()
+22	void OSObject::_RESERVEDOSObject3()
+23	void OSObject::_RESERVEDOSObject4()
+24	void OSObject::_RESERVEDOSObject5()
+25	void OSObject::_RESERVEDOSObject6()
+26	void OSObject::_RESERVEDOSObject7()
+27	void OSObject::_RESERVEDOSObject8()
+28	void OSObject::_RESERVEDOSObject9()
+29	void OSObject::_RESERVEDOSObject10()
+30	void OSObject::_RESERVEDOSObject11()
+31	void OSObject::_RESERVEDOSObject12()
+32	void OSObject::_RESERVEDOSObject13()
+33	void OSObject::_RESERVEDOSObject14()
+34	void OSObject::_RESERVEDOSObject15()
+35	void U::zz()
+36	vcall_offset (0)

@@ -1,0 +1,268 @@
+0	T::~T() [complete]
+1	T::~T() [deleting]
+2	void OSObject::release(int) const
+3	int OSObject::getRetainCount() const
+4	void OSObject::retain() const
+5	void OSObject::release() const
+6	bool OSObject::serialize(OSSerialize *) const
+7	const OSMetaClass *T::getMetaClass() const
+8	bool OSMetaClassBase::isEqualTo(const OSMetaClassBase *) const
+9	void OSObject::taggedRetain(const void *) const
+10	void OSObject::taggedRelease(const void *) const
+11	void OSObject::taggedRelease(const void *, const int) const
+12	kern_return_t IOService::Dispatch(const IORPC)
+13	void OSMetaClassBase::_RESERVEDOSMetaClassBase4()
+14	void OSMetaClassBase::_RESERVEDOSMetaClassBase5()
+15	void OSMetaClassBase::_RESERVEDOSMetaClassBase6()
+16	void OSMetaClassBase::_RESERVEDOSMetaClassBase7()
+17	bool OSObject::init()
+18	void IOService::free()
+19	void OSObject::_RESERVEDOSObject0()
+20	void OSObject::_RESERVEDOSObject1()
+21	void OSObject::_RESERVEDOSObject2()
+22	void OSObject::_RESERVEDOSObject3()
+23	void OSObject::_RESERVEDOSObject4()
+24	void OSObject::_RESERVEDOSObject5()
+25	void OSObject::_RESERVEDOSObject6()
+26	void OSObject::_RESERVEDOSObject7()
+27	void OSObject::_RESERVEDOSObject8()
+28	void OSObject::_RESERVEDOSObject9()
+29	void OSObject::_RESERVEDOSObject10()
+30	void OSObject::_RESERVEDOSObject11()
+31	void OSObject::_RESERVEDOSObject12()
+32	void OSObject::_RESERVEDOSObject13()
+33	void OSObject::_RESERVEDOSObject14()
+34	void OSObject::_RESERVEDOSObject15()
+35	OSPtr<OSObject> IORegistryEntry::copyProperty(const char *, const IORegistryPlane *, IOOptionBits) const
+36	OSPtr<OSObject> IORegistryEntry::copyProperty(const OSString *, const IORegistryPlane *, IOOptionBits) const
+37	OSPtr<OSObject> IORegistryEntry::copyProperty(const OSSymbol *, const IORegistryPlane *, IOOptionBits) const
+38	OSPtr<IORegistryEntry> IORegistryEntry::copyParentEntry(const IORegistryPlane *) const
+39	OSPtr<IORegistryEntry> IORegistryEntry::copyChildEntry(const IORegistryPlane *) const
+40	IOReturn IORegistryEntry::runPropertyAction(Action, OSObject *, void *, void *, void *, void *)
+41	void IORegistryEntry::_RESERVEDIORegistryEntry0()
+42	void IORegistryEntry::_RESERVEDIORegistryEntry1()
+43	void IORegistryEntry::_RESERVEDIORegistryEntry2()
+44	void IORegistryEntry::_RESERVEDIORegistryEntry3()
+45	void IORegistryEntry::_RESERVEDIORegistryEntry4()
+46	void IORegistryEntry::_RESERVEDIORegistryEntry5()
+47	void IORegistryEntry::_RESERVEDIORegistryEntry6()
+48	void IORegistryEntry::_RESERVEDIORegistryEntry7()
+49	void IORegistryEntry::_RESERVEDIORegistryEntry8()
+50	void IORegistryEntry::_RESERVEDIORegistryEntry9()
+51	void IORegistryEntry::_RESERVEDIORegistryEntry10()
+52	void IORegistryEntry::_RESERVEDIORegistryEntry11()
+53	void IORegistryEntry::_RESERVEDIORegistryEntry12()
+54	void IORegistryEntry::_RESERVEDIORegistryEntry13()
+55	void IORegistryEntry::_RESERVEDIORegistryEntry14()
+56	void IORegistryEntry::_RESERVEDIORegistryEntry15()
+57	void IORegistryEntry::_RESERVEDIORegistryEntry16()
+58	void IORegistryEntry::_RESERVEDIORegistryEntry17()
+59	void IORegistryEntry::_RESERVEDIORegistryEntry18()
+60	void IORegistryEntry::_RESERVEDIORegistryEntry19()
+61	void IORegistryEntry::_RESERVEDIORegistryEntry20()
+62	void IORegistryEntry::_RESERVEDIORegistryEntry21()
+63	void IORegistryEntry::_RESERVEDIORegistryEntry22()
+64	void IORegistryEntry::_RESERVEDIORegistryEntry23()
+65	void IORegistryEntry::_RESERVEDIORegistryEntry24()
+66	void IORegistryEntry::_RESERVEDIORegistryEntry25()
+67	void IORegistryEntry::_RESERVEDIORegistryEntry26()
+68	void IORegistryEntry::_RESERVEDIORegistryEntry27()
+69	void IORegistryEntry::_RESERVEDIORegistryEntry28()
+70	void IORegistryEntry::_RESERVEDIORegistryEntry29()
+71	void IORegistryEntry::_RESERVEDIORegistryEntry30()
+72	void IORegistryEntry::_RESERVEDIORegistryEntry31()
+73	bool IOService::init(OSDictionary *)
+74	void IORegistryEntry::setPropertyTable(OSDictionary *)
+75	bool IORegistryEntry::setProperty(const OSSymbol *, OSObject *)
+76	bool IORegistryEntry::setProperty(const OSString *, OSObject *)
+77	bool IORegistryEntry::setProperty(const char *, OSObject *)
+78	bool IORegistryEntry::setProperty(const char *, const char *)
+79	bool IORegistryEntry::setProperty(const char *, bool)
+80	bool IORegistryEntry::setProperty(const char *, unsigned long long, unsigned int)
+81	bool IORegistryEntry::setProperty(const char *, void *, unsigned int)
+82	void IORegistryEntry::removeProperty(const OSSymbol *)
+83	void IORegistryEntry::removeProperty(const OSString *)
+84	void IORegistryEntry::removeProperty(const char *)
+85	OSObject *IORegistryEntry::getProperty(const OSSymbol *) const
+86	OSObject *IORegistryEntry::getProperty(const OSString *) const
+87	OSObject *IORegistryEntry::getProperty(const char *) const
+88	OSObject *IORegistryEntry::getProperty(const OSSymbol *, const IORegistryPlane *, IOOptionBits) const
+89	OSObject *IORegistryEntry::getProperty(const OSString *, const IORegistryPlane *, IOOptionBits) const
+90	OSObject *IORegistryEntry::getProperty(const char *, const IORegistryPlane *, IOOptionBits) const
+91	OSPtr<OSObject> IORegistryEntry::copyProperty(const OSSymbol *) const
+92	OSPtr<OSObject> IORegistryEntry::copyProperty(const OSString *) const
+93	OSPtr<OSObject> IORegistryEntry::copyProperty(const char *) const
+94	OSPtr<OSDictionary> IORegistryEntry::dictionaryWithProperties() const
+95	bool IOService::serializeProperties(OSSerialize *) const
+96	IOReturn IORegistryEntry::setProperties(OSObject *)
+97	OSPtr<OSIterator> IORegistryEntry::getParentIterator(const IORegistryPlane *) const
+98	void IORegistryEntry::applyToParents(IORegistryEntryApplierFunction, void *, const IORegistryPlane *) const
+99	IORegistryEntry *IORegistryEntry::getParentEntry(const IORegistryPlane *) const
+100	OSPtr<OSIterator> IORegistryEntry::getChildIterator(const IORegistryPlane *) const
+101	void IORegistryEntry::applyToChildren(IORegistryEntryApplierFunction, void *, const IORegistryPlane *) const
+102	IORegistryEntry *IORegistryEntry::getChildEntry(const IORegistryPlane *) const
+103	bool IORegistryEntry::isChild(IORegistryEntry *, const IORegistryPlane *, bool) const
+104	bool IORegistryEntry::isParent(IORegistryEntry *, const IORegistryPlane *, bool) const
+105	bool IORegistryEntry::inPlane(const IORegistryPlane *) const
+106	unsigned int IORegistryEntry::getDepth(const IORegistryPlane *) const
+107	bool IORegistryEntry::attachToParent(IORegistryEntry *, const IORegistryPlane *)
+108	void IORegistryEntry::detachFromParent(IORegistryEntry *, const IORegistryPlane *)
+109	bool IORegistryEntry::attachToChild(IORegistryEntry *, const IORegistryPlane *)
+110	void IORegistryEntry::detachFromChild(IORegistryEntry *, const IORegistryPlane *)
+111	void IORegistryEntry::detachAbove(const IORegistryPlane *)
+112	void IORegistryEntry::detachAll(const IORegistryPlane *)
+113	const char *IORegistryEntry::getName(const IORegistryPlane *) const
+114	OSPtr<const OSSymbol> IORegistryEntry::copyName(const IORegistryPlane *) const
+115	bool IORegistryEntry::compareNames(OSObject *, OSString **) const
+116	bool IORegistryEntry::compareName(OSString *, OSString **) const
+117	void IORegistryEntry::setName(const OSSymbol *, const IORegistryPlane *)
+118	void IORegistryEntry::setName(const char *, const IORegistryPlane *)
+119	const char *IORegistryEntry::getLocation(const IORegistryPlane *) const
+120	OSPtr<const OSSymbol> IORegistryEntry::copyLocation(const IORegistryPlane *) const
+121	void IORegistryEntry::setLocation(const OSSymbol *, const IORegistryPlane *)
+122	void IORegistryEntry::setLocation(const char *, const IORegistryPlane *)
+123	bool IORegistryEntry::getPath(char *, int *, const IORegistryPlane *) const
+124	bool IORegistryEntry::getPathComponent(char *, int *, const IORegistryPlane *) const
+125	OSPtr<IORegistryEntry> IORegistryEntry::childFromPath(const char *, const IORegistryPlane *, char *, int *)
+126	bool IOService::init(IORegistryEntry *, const IORegistryPlane *)
+127	bool IOService::requestTerminate(IOService *, IOOptionBits)
+128	bool IOService::willTerminate(IOService *, IOOptionBits)
+129	bool IOService::didTerminate(IOService *, IOOptionBits, bool *)
+130	SInt32 IOService::nextIdleTimeout(AbsoluteTime, AbsoluteTime, unsigned int)
+131	void IOService::systemWillShutdown(IOOptionBits)
+132	IOService *IOService::copyClientWithCategory(const OSSymbol *)
+133	IOReturn IOService::configureReport(IOReportChannelList *, IOReportConfigureAction, void *, void *)
+134	IOReturn IOService::updateReport(IOReportChannelList *, IOReportUpdateAction, void *, void *)
+135	void IOService::_RESERVEDIOService2()
+136	void IOService::_RESERVEDIOService3()
+137	void IOService::_RESERVEDIOService4()
+138	void IOService::_RESERVEDIOService5()
+139	void IOService::_RESERVEDIOService6()
+140	void IOService::_RESERVEDIOService7()
+141	void IOService::_RESERVEDIOService8()
+142	void IOService::_RESERVEDIOService9()
+143	void IOService::_RESERVEDIOService10()
+144	void IOService::_RESERVEDIOService11()
+145	void IOService::_RESERVEDIOService12()
+146	void IOService::_RESERVEDIOService13()
+147	void IOService::_RESERVEDIOService14()
+148	void IOService::_RESERVEDIOService15()
+149	void IOService::_RESERVEDIOService16()
+150	void IOService::_RESERVEDIOService17()
+151	void IOService::_RESERVEDIOService18()
+152	void IOService::_RESERVEDIOService19()
+153	void IOService::_RESERVEDIOService20()
+154	void IOService::_RESERVEDIOService21()
+155	void IOService::_RESERVEDIOService22()
+156	void IOService::_RESERVEDIOService23()
+157	void IOService::_RESERVEDIOService24()
+158	void IOService::_RESERVEDIOService25()
+159	void IOService::_RESERVEDIOService26()
+160	void IOService::_RESERVEDIOService27()
+161	void IOService::_RESERVEDIOService28()
+162	void IOService::_RESERVEDIOService29()
+163	void IOService::_RESERVEDIOService30()
+164	void IOService::_RESERVEDIOService31()
+165	void IOService::_RESERVEDIOService32()
+166	void IOService::_RESERVEDIOService33()
+167	void IOService::_RESERVEDIOService34()
+168	void IOService::_RESERVEDIOService35()
+169	void IOService::_RESERVEDIOService36()
+170	void IOService::_RESERVEDIOService37()
+171	void IOService::_RESERVEDIOService38()
+172	void IOService::_RESERVEDIOService39()
+173	void IOService::_RESERVEDIOService40()
+174	void IOService::_RESERVEDIOService41()
+175	void IOService::_RESERVEDIOService42()
+176	void IOService::_RESERVEDIOService43()
+177	void IOService::_RESERVEDIOService44()
+178	void IOService::_RESERVEDIOService45()
+179	void IOService::_RESERVEDIOService46()
+180	void IOService::_RESERVEDIOService47()
+181	IOOptionBits IOService::getState() const
+182	void IOService::registerService(IOOptionBits)
+183	IOService *IOService::probe(IOService *, SInt32 *)
+184	bool IOService::start(IOService *)
+185	void IOService::stop(IOService *)
+186	bool IOService::open(IOService *, IOOptionBits, void *)
+187	void IOService::close(IOService *, IOOptionBits)
+188	bool IOService::isOpen(const IOService *) const
+189	bool IOService::handleOpen(IOService *, IOOptionBits, void *)
+190	void IOService::handleClose(IOService *, IOOptionBits)
+191	bool IOService::handleIsOpen(const IOService *) const
+192	bool IOService::terminate(IOOptionBits)
+193	bool IOService::finalize(IOOptionBits)
+194	bool IOService::lockForArbitration(bool)
+195	void IOService::unlockForArbitration()
+196	bool IOService::terminateClient(IOService *, IOOptionBits)
+197	UInt32 IOService::getBusyState()
+198	void IOService::adjustBusy(SInt32)
+199	bool IOService::matchPropertyTable(OSDictionary *, SInt32 *)
+200	bool IOService::matchPropertyTable(OSDictionary *)
+201	IOService *IOService::matchLocation(IOService *)
+202	bool IOService::addNeededResource(const char *)
+203	bool IOService::compareProperty(OSDictionary *, const char *)
+204	bool IOService::compareProperty(OSDictionary *, const OSString *)
+205	bool IOService::compareProperties(OSDictionary *, OSCollection *)
+206	bool IOService::attach(IOService *)
+207	void IOService::detach(IOService *)
+208	IOService *IOService::getProvider() const
+209	IOWorkLoop *IOService::getWorkLoop() const
+210	OSPtr<OSIterator> IOService::getProviderIterator() const
+211	OSPtr<OSIterator> IOService::getOpenProviderIterator() const
+212	IOService *IOService::getClient() const
+213	OSPtr<OSIterator> IOService::getClientIterator() const
+214	OSPtr<OSIterator> IOService::getOpenClientIterator() const
+215	IOReturn IOService::callPlatformFunction(const OSSymbol *, bool, void *, void *, void *, void *)
+216	IOReturn IOService::callPlatformFunction(const char *, bool, void *, void *, void *, void *)
+217	IOReturn IOService::getResources()
+218	IOItemCount IOService::getDeviceMemoryCount()
+219	IODeviceMemory *IOService::getDeviceMemoryWithIndex(unsigned int)
+220	IOMemoryMap *IOService::mapDeviceMemoryWithIndex(unsigned int, IOOptionBits)
+221	OSArray *IOService::getDeviceMemory()
+222	void IOService::setDeviceMemory(OSArray *)
+223	IOReturn IOService::registerInterrupt(int, OSObject *, IOInterruptAction, void *)
+224	IOReturn IOService::unregisterInterrupt(int)
+225	IOReturn IOService::getInterruptType(int, int *)
+226	IOReturn IOService::enableInterrupt(int)
+227	IOReturn IOService::disableInterrupt(int)
+228	IOReturn IOService::causeInterrupt(int)
+229	IOReturn IOService::requestProbe(IOOptionBits)
+230	IOReturn IOService::message(UInt32, IOService *, void *)
+231	IOReturn IOService::messageClient(UInt32, OSObject *, void *, vm_size_t)
+232	IOReturn IOService::messageClients(UInt32, void *, vm_size_t)
+233	OSPtr<IONotifier> IOService::registerInterest(const OSSymbol *, IOServiceInterestHandler, void *, void *)
+234	void IOService::applyToProviders(IOServiceApplierFunction, void *)
+235	void IOService::applyToClients(IOServiceApplierFunction, void *)
+236	void IOService::applyToInterested(const OSSymbol *, OSObjectApplierFunction, void *)
+237	IOReturn IOService::acknowledgeNotification(IONotificationRef, IOOptionBits)
+238	IOReturn IOService::newUserClient(task_t, void *, UInt32, OSDictionary *, IOUserClient **)
+239	IOReturn IOService::newUserClient(task_t, void *, UInt32, IOUserClient **)
+240	const char *IOService::stringFromReturn(IOReturn)
+241	int IOService::errnoFromReturn(IOReturn)
+242	void IOService::PMinit()
+243	void IOService::PMstop()
+244	void IOService::joinPMtree(IOService *)
+245	IOReturn IOService::registerPowerDriver(IOService *, IOPMPowerState *, unsigned long)
+246	IOReturn IOService::requestPowerDomainState(IOPMPowerFlags, IOPowerConnection *, unsigned long)
+247	bool IOService::activityTickle(unsigned long, unsigned long)
+248	IOReturn IOService::setAggressiveness(unsigned long, unsigned long)
+249	IOReturn IOService::getAggressiveness(unsigned long, unsigned long *)
+250	IOReturn IOService::addPowerChild(IOService *)
+251	IOReturn IOService::removePowerChild(IOPowerConnection *)
+252	IOReturn IOService::setIdleTimerPeriod(unsigned long)
+253	IOReturn IOService::setPowerState(unsigned long, IOService *)
+254	unsigned long IOService::maxCapabilityForDomainState(IOPMPowerFlags)
+255	unsigned long IOService::initialPowerStateForDomainState(IOPMPowerFlags)
+256	unsigned long IOService::powerStateForDomainState(IOPMPowerFlags)
+257	IOReturn IOService::powerStateWillChangeTo(IOPMPowerFlags, unsigned long, IOService *)
+258	IOReturn IOService::powerStateDidChangeTo(IOPMPowerFlags, unsigned long, IOService *)
+259	bool IOService::askChangeDown(unsigned long)
+260	bool IOService::tellChangeDown(unsigned long)
+261	void IOService::tellNoChangeDown(unsigned long)
+262	void IOService::tellChangeUp(unsigned long)
+263	IOReturn IOService::allowPowerChange(unsigned long)
+264	IOReturn IOService::cancelPowerChange(unsigned long)
+265	void IOService::powerChangeDone(unsigned long)
+266	void T::zz()
+267	vcall_offset (0)
