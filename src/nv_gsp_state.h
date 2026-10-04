@@ -195,6 +195,8 @@ struct NVBringup::GspState {
     uint64_t grGlobalSpan = 0;
     bool     grReady = false;
     uint32_t nvdecCtxSize = 0;      // NVDEC0 falcon context buffer per channel; 0 = no NVDEC
+    uint64_t dispInst = 0;          // display instance memory (64 KiB VRAM), 0 = display not set up
+    uint32_t hDisp = 0;             // NV04_DISPLAY_COMMON under our device
     uint16_t tpcCount = 0;
     uint8_t  gpcCount = 0, smPerTpc = 0, maxWarps = 0, sm = 0;
     GpuConn *conns[kMaxConns] = {};
