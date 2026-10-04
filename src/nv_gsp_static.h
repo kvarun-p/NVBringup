@@ -175,6 +175,7 @@
 #define NV_INTR_VECTOR_INVALID         0xffffffffu
 #define MC_ENGINE_IDX_CE0_             15       // engine_idx.h: CE0..CE9 = 15..24
 #define MC_ENGINE_IDX_GR0_             84
+#define MC_ENGINE_IDX_NVDEC0_          65       // engine_idx.h: MC_ENGINE_IDX_BSP
 #define NV2080_GR_CTXBUF_INFO_SIZE 1664
 #define NV2080_GR_CTXBUF_ENGINE_COUNT 26
 #define NV2080_GR_CTXBUF_ENTRY_SIZE 8

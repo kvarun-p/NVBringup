@@ -640,7 +640,7 @@ void NVBringup::probeDisplay()
 
 // Item 4 (non-stall interrupts), step 1: read-only probe. Asks GSP-RM which interrupt vectors the
 // CPU services, keeps GR0's and the copy engines' non-stall vectors for intrHwOn, and logs the CPU
-// interrupt tree as GSP-RM left it. No register writes.
+// interrupt tree as GSP-RM left it (and NVDEC0's, where video contexts run). No register writes.
 void NVBringup::probeIntr()
 {
     GspState *g = gsp_;
@@ -664,7 +664,7 @@ void NVBringup::probeIntr()
     if (n > NV2080_INTR_TABLE_MAX)
         n = NV2080_INTR_TABLE_MAX;
     LOG("intr probe: kernel table has %u entries (engine: pmc mask, stall vector, non-stall vector)", n);
-    uint32_t grNs = NV_INTR_VECTOR_INVALID, ceNs[10], nCe = 0;
+    uint32_t grNs = NV_INTR_VECTOR_INVALID, decNs = NV_INTR_VECTOR_INVALID, ceNs[10], nCe = 0;
     char line[256];
     uint32_t len = 0;
     for (uint32_t k = 0; k < n; k++) {
@@ -677,10 +677,14 @@ void NVBringup::probeIntr()
         memcpy(&vn, e + 12, 4);
         if (eng == MC_ENGINE_IDX_GR0_)
             grNs = vn;
+        if (eng == MC_ENGINE_IDX_NVDEC0_)
+            decNs = vn;
         if (eng >= MC_ENGINE_IDX_CE0_ && eng < MC_ENGINE_IDX_CE0_ + 10 && vn != NV_INTR_VECTOR_INVALID && nCe < 10)
             ceNs[nCe++] = (uint32_t)(eng - MC_ENGINE_IDX_CE0_) << 16 | vn;
-        // GR0 and the copy engines are where our channels run: their non-stall vectors are ours.
-        bool ours = eng == MC_ENGINE_IDX_GR0_ || (eng >= MC_ENGINE_IDX_CE0_ && eng < MC_ENGINE_IDX_CE0_ + 10);
+        // GR0, the copy engines and NVDEC0 are where our channels run: their non-stall vectors are
+        // ours (without NVDEC0's, waits on video contexts fell back to the 2 ms deadline).
+        bool ours = eng == MC_ENGINE_IDX_GR0_ || eng == MC_ENGINE_IDX_NVDEC0_ ||
+                    (eng >= MC_ENGINE_IDX_CE0_ && eng < MC_ENGINE_IDX_CE0_ + 10);
         if (ours && vn != NV_INTR_VECTOR_INVALID && vn < 8 * 32) {
             intrLeaf_[vn / 32] |= 1u << (vn % 32);
             intrTop_[vn / 64 / 32] |= 1u << (vn / 64 % 32);
@@ -703,6 +707,8 @@ void NVBringup::probeIntr()
     len = (uint32_t)snprintf(line, sizeof(line), "GR0 %d", grNs == NV_INTR_VECTOR_INVALID ? -1 : (int)grNs);
     for (uint32_t c = 0; c < nCe; c++)
         len += (uint32_t)snprintf(line + len, sizeof(line) - len, ", CE%u %u", ceNs[c] >> 16, ceNs[c] & 0xffff);
+    if (decNs != NV_INTR_VECTOR_INVALID)
+        len += (uint32_t)snprintf(line + len, sizeof(line) - len, ", NVDEC0 %u", decNs);
     LOG("intr probe: non-stall vectors: %s", line);
     setProperty("NVIntrNonStall", line);
 
