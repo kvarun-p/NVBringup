@@ -79,6 +79,10 @@ enum nvmac_selector {
     NVMAC_MAP_SYNC_PAGE,    // scalar out: address, size (read-only; sync values at their offsets)
     NVMAC_GET_TIMESTAMP,    // scalar out: GPU time in ns (PTIMER)
     NVMAC_CTX_STATUS,       // scalar in: ctx; out: state (0 ok, 1 lost), exception type, completed seqno
+    NVMAC_MEM_IMPORT,       // scalars in: user address, size (4 KiB aligned, the caller's own writable
+                            //   memory); out: handle, size. The pages are wired until MEM_FREE (or the
+                            //   connection closes) and bound like GART memory; MEM_MAP is refused (the
+                            //   caller has it mapped). Only if nvmac_info.features has NVMAC_FEATURE_IMPORT.
     NVMAC_SELECTOR_COUNT
 };
 
@@ -102,6 +106,12 @@ enum {
     NVMAC_ENGINE_VDEC    = 1u << 6,
 };
 
+// nvmac_info.features
+enum {
+    NVMAC_FEATURE_IMPORT = 1u << 0,     // NVMAC_MEM_IMPORT
+};
+#define NVMAC_IMPORT_MAX    (1ull << 30)    // bytes per import
+
 struct nvmac_info {
     uint32_t version;               // NVMAC_ABI_VERSION
     uint16_t device_id, chipset;    // PCI device id, NV_PMC_BOOT_0 chipset (0x167 = TU117)
@@ -120,7 +130,7 @@ struct nvmac_info {
     uint32_t bind_align;            // 4096
     uint32_t max_pushes, max_waits, max_signals, max_bind_ops, max_wait_entries;
     uint32_t sync_count;            // sync slots per connection
-    uint32_t pad1;
+    uint32_t features;              // NVMAC_FEATURE_* (was padding: older kexts leave it 0)
     char     name[64];
 };
 

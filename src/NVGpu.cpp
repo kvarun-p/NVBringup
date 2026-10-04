@@ -79,6 +79,7 @@ struct NVBringup::GpuMem {
     uint64_t bar1Size = 0;              // its bar1Heap block: size, or more for a reused slice
     IOMemoryDescriptor *cpuMd = nullptr;
     IOMemoryMap *userMap = nullptr;
+    IOMemoryDescriptor *userMd = nullptr;   // NVMAC_MEM_IMPORT: the caller's pages, prepared (wired)
     uint8_t  kind = 0;
     bool     cpuMapped = false;         // bar1Va may have a CPU duplicate (memMap'd, or a reused held
                                         // slice): memFree holds it, with an entry already promised
@@ -1600,6 +1601,101 @@ static NVBringup::GpuMem *findMem(NVBringup::GpuConn *c, uint64_t handle)
     return handle && handle <= c->memCap ? c->mems[handle - 1] : nullptr;
 }
 
+// A free slot in c->mems (grown if needed), or an error.
+static IOReturn memSlot(NVBringup::GpuConn *c, uint32_t *out)
+{
+    uint32_t slot = c->memCap;
+    for (uint32_t i = 0; i < c->memCap; i++)
+        if (!c->mems[i]) {
+            slot = i;
+            break;
+        }
+    if (slot == c->memCap) {
+        uint32_t nc = c->memCap ? c->memCap * 2 : 256;
+        if (nc > 65536)
+            return kIOReturnNoResources;
+        NVBringup::GpuMem **nm = (NVBringup::GpuMem **)IOMallocZero(nc * sizeof(NVBringup::GpuMem *));
+        if (!nm)
+            return kIOReturnNoMemory;
+        if (c->mems) {
+            memcpy(nm, c->mems, c->memCap * sizeof(NVBringup::GpuMem *));
+            IOFree(c->mems, c->memCap * sizeof(NVBringup::GpuMem *));
+        }
+        c->mems = nm;
+        c->memCap = nc;
+    }
+    *out = slot;
+    return kIOReturnSuccess;
+}
+
+// NVMAC_MEM_IMPORT: the caller's own memory as a GART-like object. The range is wired
+// (prepare) on the caller's task and its pages DMA-mapped; bindings then use them like
+// GART pages. Writable memory only: the GPU may write it.
+IOReturn NVBringup::memImport(GpuConn *c, uint64_t addr, uint64_t size, uint32_t *handle, uint64_t *outSize)
+{
+    if (!size || ((addr | size) & 0xfff) || size > NVMAC_IMPORT_MAX || addr + size < addr)
+        return kIOReturnBadArgument;
+    uint32_t slot;
+    IOReturn r = memSlot(c, &slot);
+    if (r != kIOReturnSuccess)
+        return r;
+    GpuMem *m = new GpuMem;
+    if (!m)
+        return kIOReturnNoMemory;
+    m->flags = NVMAC_MEM_GART;
+    m->size = size;
+    m->userMd = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)addr, (mach_vm_size_t)size,
+                                                     kIODirectionInOut, c->task);
+    r = kIOReturnVMError;
+    if (!m->userMd)
+        goto fail;
+    if ((r = m->userMd->prepare(kIODirectionInOut)) != kIOReturnSuccess) {
+        OSSafeReleaseNULL(m->userMd);       // not prepared: nothing to complete
+        goto fail;
+    }
+    {
+        DmaBuf &d = m->sys;
+        d.size = size;
+        d.npages = size / PAGE_4K;
+        r = kIOReturnNoMemory;
+        d.pages = (uint64_t *)IOMalloc(d.npages * sizeof(uint64_t));
+        if (!d.pages)
+            goto fail;
+        r = kIOReturnVMError;
+        d.dma = IODMACommand::withSpecification(kIODMACommandOutputHost64, 40, 0, IODMACommand::kMapped, 0, PAGE_4K);
+        if (!d.dma || d.dma->setMemoryDescriptor(m->userMd, true) != kIOReturnSuccess)
+            goto fail;
+        uint64_t off = 0, n = 0;
+        while (off < size) {
+            IODMACommand::Segment64 seg[16];
+            UInt32 nseg = 16;
+            if (d.dma->gen64IOVMSegments(&off, seg, &nseg) != kIOReturnSuccess || !nseg)
+                goto fail;
+            for (UInt32 k = 0; k < nseg; k++) {
+                if ((seg[k].fIOVMAddr | seg[k].fLength) & (PAGE_4K - 1))
+                    goto fail;
+                for (uint64_t a = 0; a < seg[k].fLength && n < d.npages; a += PAGE_4K)
+                    d.pages[n++] = seg[k].fIOVMAddr + a;
+            }
+        }
+        if (n != d.npages)
+            goto fail;
+    }
+    m->handle = slot + 1;
+    c->mems[slot] = m;
+    *handle = m->handle;
+    *outSize = size;
+    return kIOReturnSuccess;
+fail:
+    m->sys.free();
+    if (m->userMd) {
+        m->userMd->complete(kIODirectionInOut);
+        OSSafeReleaseNULL(m->userMd);
+    }
+    delete m;
+    return r;
+}
+
 IOReturn NVBringup::memAlloc(GpuConn *c, uint64_t size, uint64_t align, uint32_t flags, uint32_t kind,
                              uint32_t *handle, uint64_t *outSize)
 {
@@ -1614,26 +1710,10 @@ IOReturn NVBringup::memAlloc(GpuConn *c, uint64_t size, uint64_t align, uint32_t
     if (vram && size >= 0x10000 && align < 0x10000)
         align = 0x10000;                        // lets VM_BIND use 64 KiB pages
 
-    uint32_t slot = c->memCap;
-    for (uint32_t i = 0; i < c->memCap; i++)
-        if (!c->mems[i]) {
-            slot = i;
-            break;
-        }
-    if (slot == c->memCap) {
-        uint32_t nc = c->memCap ? c->memCap * 2 : 256;
-        if (nc > 65536)
-            return kIOReturnNoResources;
-        GpuMem **nm = (GpuMem **)IOMallocZero(nc * sizeof(GpuMem *));
-        if (!nm)
-            return kIOReturnNoMemory;
-        if (c->mems) {
-            memcpy(nm, c->mems, c->memCap * sizeof(GpuMem *));
-            IOFree(c->mems, c->memCap * sizeof(GpuMem *));
-        }
-        c->mems = nm;
-        c->memCap = nc;
-    }
+    uint32_t slot;
+    IOReturn sr = memSlot(c, &slot);
+    if (sr != kIOReturnSuccess)
+        return sr;
 
     GpuMem *m = new GpuMem;
     if (!m)
@@ -1723,6 +1803,10 @@ void NVBringup::memFree(GpuConn *c, GpuMem *m, bool unbind)
     if (m->vram)
         nv_vram_free(g->vram, m->vram);
     m->sys.free();
+    if (m->userMd) {                    // unwire the caller's pages (after the DMA mapping is gone)
+        m->userMd->complete(kIODirectionInOut);
+        OSSafeReleaseNULL(m->userMd);
+    }
     if (m->handle && m->handle <= c->memCap && c->mems[m->handle - 1] == m)
         c->mems[m->handle - 1] = nullptr;
     delete m;
@@ -2539,6 +2623,7 @@ void NVBringup::fillInfo(nvmac_info *i)
     GspState *g = gsp_;
     *i = {};
     i->version = NVMAC_ABI_VERSION;
+    i->features = NVMAC_FEATURE_IMPORT;
     i->device_id = pci_->configRead16(kIOPCIConfigDeviceID);
     i->chipset = (uint16_t)chipset_;
     i->pci_bus = pci_->getBusNumber();
@@ -2634,6 +2719,18 @@ IOReturn NVBringup::gpuCall(GpuConn *c, uint32_t selector, IOExternalMethodArgum
         uint64_t size = 0;
         r = memAlloc(c, a->scalarInput[0], a->scalarInput[1], (uint32_t)a->scalarInput[2],
                      (uint32_t)a->scalarInput[3], &h, &size);
+        a->scalarOutput[0] = h;
+        a->scalarOutput[1] = size;
+        break;
+    }
+    case NVMAC_MEM_IMPORT: {
+        if (a->scalarInputCount != 2 || a->scalarOutputCount != 2) {
+            r = kIOReturnBadArgument;
+            break;
+        }
+        uint32_t h = 0;
+        uint64_t size = 0;
+        r = memImport(c, a->scalarInput[0], a->scalarInput[1], &h, &size);
         a->scalarOutput[0] = h;
         a->scalarOutput[1] = size;
         break;

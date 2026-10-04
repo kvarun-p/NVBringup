@@ -207,6 +207,7 @@ private:
     IOReturn memAlloc(GpuConn *c, uint64_t size, uint64_t align, uint32_t flags, uint32_t kind,
                       uint32_t *handle, uint64_t *outSize);
     void     memFree(GpuConn *c, GpuMem *m, bool unbind);
+    IOReturn memImport(GpuConn *c, uint64_t addr, uint64_t size, uint32_t *handle, uint64_t *outSize);
     IOReturn memMap(GpuConn *c, GpuMem *m, uint64_t *addr);
     IOReturn vmBind(GpuConn *c, const uint8_t *buf, uint32_t len);
     IOReturn unbindRange(GpuConn *c, uint64_t va, uint64_t size, GpuMem *only);
