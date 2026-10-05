@@ -23,6 +23,7 @@ const char *nvmac_strerror(int err);
 int nvmac_mem_alloc(nvmac_dev *d, uint64_t size, uint64_t align, uint32_t flags, uint8_t kind,
                     uint32_t *mem, uint64_t *size_out);
 int nvmac_mem_free(nvmac_dev *d, uint32_t mem);
+int nvmac_mem_import(nvmac_dev *d, void *ptr, uint64_t size, uint32_t *mem, uint64_t *size_out);
 int nvmac_mem_map(nvmac_dev *d, uint32_t mem, void **ptr, uint64_t *size);
 int nvmac_mem_unmap(nvmac_dev *d, uint32_t mem);
 

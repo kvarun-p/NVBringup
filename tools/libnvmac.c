@@ -133,6 +133,18 @@ int nvmac_mem_alloc(nvmac_dev *d, uint64_t size, uint64_t align, uint32_t flags,
     return r;
 }
 
+int nvmac_mem_import(nvmac_dev *d, void *ptr, uint64_t size, uint32_t *mem, uint64_t *size_out)
+{
+    uint64_t in[2] = { (uint64_t)(uintptr_t)ptr, size }, out[2] = {0};
+    int r = scalar(d, NVMAC_MEM_IMPORT, in, 2, out, 2);
+    if (!r) {
+        *mem = (uint32_t)out[0];
+        if (size_out)
+            *size_out = out[1];
+    }
+    return r;
+}
+
 int nvmac_mem_free(nvmac_dev *d, uint32_t mem)
 {
     uint64_t in = mem;

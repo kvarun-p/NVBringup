@@ -3,7 +3,8 @@
 NVBringup is a macOS kernel extension that brings an NVIDIA Turing GPU up on an Intel Mac or
 hackintosh. It boots NVIDIA's GSP-RM firmware and gives user space a GPU interface. Together
 with a macOS port of Mesa's open-source Vulkan driver (NVK), it lets Vulkan compute programs,
-such as llama.cpp for local LLMs, run on the NVIDIA GPU.
+such as llama.cpp for local LLMs, run on the NVIDIA GPU. Optionally, a Metal driver built on NVK
+(nvmetal) lets Metal apps that opt in use the GPU too.
 
 > **Status: research prototype.** This is a proof of concept, published so the approach and the
 > measurements can be read and reproduced. It is not a supported product or a community project:
@@ -27,7 +28,9 @@ paths but have **not been tested**.
 |---|---|---|
 | Kernel | `NVBringup.kext`: runs FWSEC at boot, boots GSP-RM, manages memory, channels, interrupts and power | this repository, loaded by OpenCore |
 | Boot | LaunchDaemon that hands the GSP-RM firmware (27 MB) to the kext after boot | this repository (`tools/install_daemon.sh`) |
-| Driver | NVK, Mesa's Vulkan driver, with a macOS backend that talks to the kext through `libnvmac` | [nvbringup-mesa](https://github.com/kvarun-p/nvbringup-mesa) |
+| Driver | NVK, Mesa's Vulkan driver, with a macOS backend that talks to the kext through `libnvmac` | [nvbringup-mesa](https://github.com/kvarun-p/nvbringup-mesa), branch `main` |
+| Metal (optional) | nvmetal: a Metal driver on NVK, loaded by Metal.framework as `NVMetal.bundle`; it translates Metal shaders (AIR) for NVK's compiler | nvbringup-mesa, branch `main` |
+| Metal (optional) | `NVMetalAccel.kext`: an IOAccelerator that makes Metal.framework list the GPU and load `NVMetal.bundle` | this repository (`accel/`) |
 | Loader | Khronos Vulkan loader, which finds NVK through an ICD manifest | built from Khronos sources |
 | Apps | Any Vulkan compute program, for example llama.cpp | [llama.cpp fork](https://github.com/kvarun-p/llama.cpp/tree/nvk-tuning) (optional) |
 | UI | GPU Monitor: menu bar app and widget | this repository (`monitor/`) |
@@ -49,16 +52,25 @@ paths but have **not been tested**.
 - **Interrupt-driven waits:** MSI non-stall interrupts wake waiting programs instead of polling.
 - **Without root:** once installed, the user logged in at the console can use the GPU.
 - **GPU Monitor**, a menu bar app and widget: usage, temperature, VRAM, and a power switch.
+- **Metal (optional, opt-in per app):** compute (llama.cpp's Metal backend passes all of ggml's
+  per-op tests) and graphics: render pipelines, textures, argument buffers and heaps, MSAA,
+  tessellation, framebuffer fetch, layered rendering, IOSurfaces, and windows through
+  CAMetalLayer, which WindowServer composites on the Intel GPU (unmodified wgpu and MoltenVK
+  apps run, for example vkcube). Only apps listed in an allow file get the GPU.
+- **H.264 video decode** through Vulkan Video (`NVK_EXPERIMENTAL=video`), on NVDEC.
 
 ## What it can't do
 
 - **No display output.** NVBringup drives no monitors. A display must come from another GPU,
   such as the Intel iGPU on a laptop, the path the internal panel uses on Optimus laptops.
-- **No Metal, OpenGL, OpenCL or CUDA.** macOS apps that use Metal (almost all of them) won't see
-  the GPU. Only programs that use Vulkan through the Khronos loader and NVK can.
-- **No window presentation.** NVK is built without window-system support, so it is for compute
-  and offscreen work. Graphics pipelines are untested.
-- **No video encode or decode**, and no copy-only transfer queue.
+- **No OpenGL, OpenCL or CUDA.** Metal only with the optional Metal step, and only for apps
+  that opt in: macOS itself (WindowServer, system apps) keeps using the Intel GPU. Metal
+  features Turing or NVK lack aren't there: mesh and object shaders, ray tracing, imageblocks and
+  tile shaders, stencil export. Metal needs SIP partly off (see Requirements).
+- **No Vulkan window presentation.** NVK is built without a window system; windows work only
+  through Metal (CAMetalLayer).
+- **No video encode**, decode only H.264 and only through Vulkan Video (not VideoToolbox, so
+  QuickTime and Safari don't use it), and no copy-only transfer queue.
 - **Only Turing.** Pascal and older have no GSP. Ampere and newer need different firmware and code
   paths.
 - **Intel x86-64 only**, with OpenCore loading the kext. Apple Silicon can't use it.
@@ -81,13 +93,15 @@ paths but have **not been tested**.
 |---|---|
 | Computer | Intel x86-64 Mac or hackintosh with an NVIDIA Turing GPU |
 | macOS | Sonoma 14 (developed on 14.8.9). Other versions are untested |
-| Boot loader | OpenCore, to load the kext (Kernel → Add). SIP stays enabled |
+| Boot loader | OpenCore, to load the kext (Kernel → Add). SIP stays enabled, except for the optional Metal step: `csr-active-config` `0x803` (kext signing, filesystem protection and authenticated root off) and FileVault off |
 | GPU visibility | The GPU must be powered and on the PCI bus. No SSDT that powers it off (the ACPI patches many hackintosh EFIs ship to disable the discrete GPU), no `-wegnoegpu`, no `disable-gpu` property |
 | Firmware | NVIDIA GSP firmware r570.144 from linux-firmware (not included; step 1). The kext is built for exactly this version |
 | Build tools | Xcode or the Command Line Tools (macOS SDK 14 or newer) |
 | For Vulkan | Mesa's build tools, the Khronos Vulkan loader and headers (see nvbringup-mesa), and `glslc` from shaderc for llama.cpp's shaders |
+| For Metal | LLVM 20 or newer (`sudo port install llvm-20`), to build and run nvmetal |
 
-Root is needed once, to install the boot daemon. Everything else runs as the console user.
+Root is needed once, to install the boot daemon (and for the Metal step, to install its kext and
+bundle). Everything else runs as the console user.
 
 ## Installation
 
@@ -157,10 +171,12 @@ ioreg -r -c NVBringup -d 1 | grep NVGspResult   # "running", or "powered off (id
 
 ### 5. Build NVK (Mesa)
 
-Follow the [nvbringup-mesa](https://github.com/kvarun-p/nvbringup-mesa) README: it
-clones Mesa 26.2.3, applies the six patches (the macOS backend `nvkmd/macos` and two NAK
-compiler fixes for Turing), builds NVK, installs the Khronos Vulkan loader (macOS has none),
-and registers NVK in `~/.config/vulkan/icd.d/nouveau_icd.x86_64.json`.
+Follow the README of [nvbringup-mesa](https://github.com/kvarun-p/nvbringup-mesa), branch
+`main`: it fetches Mesa at the commit the patches are for, applies the 70 patches (the macOS
+backend `nvkmd/macos`, NAK compiler fixes for Turing, video decode, and nvmetal), builds NVK and
+`NVMetal.bundle`, installs the Khronos Vulkan loader (macOS has none), and registers NVK in
+`~/.config/vulkan/icd.d/nouveau_icd.x86_64.json`. (Branch `26.2` has only the first 7 patches,
+on Mesa 26.2.3: Vulkan compute, no Metal or video.)
 
 Then run the Vulkan compute test against your NVK build:
 
@@ -192,7 +208,50 @@ runs the model on the Mac's own GPU instead, which can hang macOS (a GPU reset, 
 WindowServer watchdog reboot); the BLAS module also shows up as a zero-memory device numbered
 first. `--list-devices` should list only the NVK GPU.
 
-### 7. GPU Monitor (optional)
+### 7. Metal acceleration (optional)
+
+Lets Metal apps you choose use the GPU. It changes the system volume, needs SIP partly off and
+is the least tested part: skip it if Vulkan is enough. Needs `NVMetal.bundle` from step 5.
+
+1. In `config.plist`: `csr-active-config` `03080000` (0x803) under NVRAM → Add →
+   `7C436110-AB2A-4BBB-A880-FE41995C9F82`, and add `nvaccel=1` to the boot-args. Turn FileVault
+   off. Reboot.
+2. Build and install the accelerator kext (it can't go on the EFI: it links against a family
+   in the system kernel collection, so it goes in the auxiliary one):
+
+   ```bash
+   make -C accel
+   sudo cp -R accel/build/NVMetalAccel.kext /Library/Extensions/
+   sudo chown -R root:wheel /Library/Extensions/NVMetalAccel.kext
+   sudo kmutil load -p /Library/Extensions/NVMetalAccel.kext   # approve in System Settings → Privacy & Security
+   ```
+
+   Reboot, then `kmutil showloaded | grep nvmetalaccel` should list it.
+3. Install `NVMetal.bundle` into `/System/Library/Extensions` (it mounts the system volume and
+   blesses a new snapshot, as OpenCore Legacy Patcher does), then reboot:
+
+   ```bash
+   sudo accel/tools/nvmetal_root_install.sh install /path/to/mesa/build/src/nouveau/air/NVMetal.bundle
+   ```
+
+   `remove` takes it out again; `revert` boots Apple's last sealed snapshot (undoes every root
+   change). Keep the Mesa build directory: the bundle loads NVK from there.
+4. Let apps in: list their executable names or paths, one per line, in
+   `/Library/Preferences/io.github.kvarun-p.nvmetal.allow` (root-owned), or run a program with
+   `NVMETAL_ALLOW=1`. Apps that are let in see the GPU as their default Metal device. System
+   executables (in `/System`, `/usr`, ...) and system users are let in only with
+   `NVMETAL_ALLOW=1`, never through the file. `sudo touch /Library/Preferences/io.github.kvarun-p.nvmetal.disabled`
+   turns it off, without a reboot, for every process started after that.
+
+```bash
+echo llama-server | sudo tee -a /Library/Preferences/io.github.kvarun-p.nvmetal.allow
+```
+
+Without installing anything, `DYLD_INSERT_LIBRARIES=/path/to/mesa/build/src/nouveau/air/libnvmetal.dylib
+NVMETAL_DEFAULT=1 program` runs one program (not a SIP-protected one) on nvmetal. That also
+works with SIP fully on.
+
+### 8. GPU Monitor (optional)
 
 ```bash
 monitor/build.sh     # builds and installs ~/Applications/GPU Monitor.app
@@ -277,9 +336,12 @@ pulling changes, rebuild and reinstall everything that changed:
 | `src/` | `make`, copy `build/NVBringup.kext` to `EFI/OC/Kexts/`, reboot |
 | `tools/nvgsp.cpp` or `tools/daemon/` | `make`, then `sudo tools/install_daemon.sh` |
 | `src/nv_uapi.h` or `tools/libnvmac.*` | also rebuild NVK with matching copies (nvbringup-mesa) |
+| `accel/` | `make -C accel`, copy the kext to `/Library/Extensions` (step 7), reboot |
+| the Mesa build (NVMetal.bundle) | `sudo accel/tools/nvmetal_root_install.sh install <bundle>`, reboot |
 | `monitor/` | `monitor/build.sh` |
 
-`tools/verify_install.sh` reports a kext on the EFI or a daemon that differs from the build.
+`tools/verify_install.sh` reports a kext on the EFI, a daemon, or an installed NVMetal.bundle
+that differs from the build.
 
 ## Uninstall
 
@@ -288,6 +350,9 @@ pulling changes, rebuild and reinstall everything that changed:
 2. `sudo tools/uninstall_daemon.sh` (logs stay in `/Library/Logs/NVBringup/`).
 3. Delete `~/.config/vulkan/icd.d/nouveau_icd.x86_64.json` and your Mesa build.
 4. Quit GPU Monitor, turn off "Launch at login", and delete `~/Applications/GPU Monitor.app`.
+5. Metal step: `sudo accel/tools/nvmetal_root_install.sh remove` (or `revert`), reboot; delete
+   `/Library/Extensions/NVMetalAccel.kext` and the files in `/Library/Preferences/` named
+   `io.github.kvarun-p.nvmetal.*`; remove `nvaccel=1` and restore `csr-active-config`.
 
 ## Boot-args
 
@@ -300,6 +365,7 @@ pulling changes, rebuild and reinstall everything that changed:
 | `nvboost=<n>` | P-state boost after each submission: `2` adaptive (default: full clocks on the first submission after idle and while the GPU stays busy, cleared after 150 ms idle; `nvgsp perf policy adaptive burst=1level` starts one level up instead and goes to full clocks at ≥50 % busy over ~80 ms), `1` fixed (full clocks for 2 s), `0` off (GSP-RM alone takes ~250 ms of load to raise the memory clock). `build/nvgsp perf` shows the P-state; `nvgsp perf policy …` changes the policy and its thresholds at runtime; `nvgsp perf watch` follows the P-state |
 | `nvgpu_users=1` | Let any user open the GPU, not only root and the console user |
 | `nvtest=1` | Run the kext's boot-time self-tests |
+| `nvaccel=1` | Start NVMetalAccel, so Metal.framework lists the GPU (Metal step) |
 | `nvkmapvram=1` | NVK keeps its push buffers and descriptors in CPU-mapped VRAM: faster generation (+15 % on a 0.5B model, +6 % on 3B), but each program run holds ~2.7 MiB of BAR1 until a restart; after ~42 runs it falls back to system memory (default speed). `desc` / `cmd:<n>` select parts; see [docs/bar1-cpu-mappings.md](docs/bar1-cpu-mappings.md) |
 
 ## Troubleshooting
@@ -317,6 +383,10 @@ pulling changes, rebuild and reinstall everything that changed:
 - **"NVBringup: open failed" (unsupported):** NVK and the kext were built from different
   `nv_uapi.h` versions. Rebuild the older one (see Update after changes).
 - **Brightness control stops working on a laptop:** use the `class-code` property from step 3.
+- **A Metal app doesn't get the GPU:** it must be in the allow file (or run with
+  `NVMETAL_ALLOW=1`), and not be a system executable. `log show --last 5m --predicate
+  'eventMessage CONTAINS "NVMetal"'` says why a process was refused. If the screen or an app
+  misbehaves, the kill file (step 7) turns nvmetal off at once.
 - **Known issue:** a debug-optimized NVK build can end a program with
   `Assertion failed: (cache->object_cache->entries == 0), function vk_pipeline_cache_destroy`.
   It happens at teardown, after the work is done, and doesn't affect results.
@@ -327,6 +397,7 @@ pulling changes, rebuild and reinstall everything that changed:
 |---|---|
 | `src/` | The kext: GSP-RM boot (`NVGsp.cpp`), GPU interface (`NVGpu.cpp`), runtime power (`NVPower.cpp`), MMU, VRAM heap, VBIOS/FWSEC/GSP firmware parsers, r570 structures (`nv_gsp_rm`), user-space ABI (`nv_uapi.h`) |
 | `tools/` | `nvgsp`, `nvtest`, `vktest`, `libnvmac` (C library over `nv_uapi.h`), `vbios_tool`, the boot daemon (`daemon/`, `install_daemon.sh`), `verify_install.sh`, `run-llama.sh`, `gsp_test.sh` |
+| `accel/` | NVMetalAccel, the IOAccelerator kext for Metal, and `tools/nvmetal_root_install.sh` |
 | `monitor/` | GPU Monitor (SwiftUI menu bar app and WidgetKit widget) |
 | `docs/` | Task recipes ([howto](docs/howto.md)) and design decisions: what was chosen, the alternatives, and the measurements behind them ([index](docs/README.md)) |
 

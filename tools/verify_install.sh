@@ -231,7 +231,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------------------------
-step "7. Metal acceleration (optional: accel/README.md)"
+step "7. Metal acceleration (optional, README step 7)"
 ACCEL_ID=io.github.kvarun-p.nvmetalaccel
 SYS_BUNDLE=/System/Library/Extensions/NVMetal.bundle
 KILL_FILE=/Library/Preferences/io.github.kvarun-p.nvmetal.disabled
@@ -245,7 +245,7 @@ if [[ -z $nvb ]]; then
     done
 fi
 if [[ "$BA" != *" nvaccel=1 "* && ! -d $SYS_BUNDLE && ! -d /Library/Extensions/NVMetalAccel.kext ]]; then
-    warn "not set up (optional): Metal apps don't see the GPU" "accel/README.md"
+    warn "not set up (optional): Metal apps don't see the GPU" "README, step 7"
 else
     [[ "$BA" == *" nvaccel=1 "* ]] && pass "boot-arg nvaccel=1" || fail "boot-arg nvaccel=1 missing: NVMetalAccel stays off" "add it to boot-args"
     accel_uuid=$(kmutil showloaded --bundle-identifier $ACCEL_ID 2>/dev/null | awk 'NR>1{for(i=1;i<=NF;i++) if($i ~ /^[0-9A-F-]{36}$/) print $i}')
