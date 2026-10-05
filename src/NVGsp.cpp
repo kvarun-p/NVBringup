@@ -117,8 +117,7 @@ IOReturn NVBringup::bootGsp()
     IOLockLock(gspLock_);
     IOReturn r = kIOReturnError;
     GspState *g = gsp_;
-    uint8_t *tmp = nullptr, *booter = nullptr;   // tmp: g->msgBuf, kept for the poller
-    uint32_t booterSize = 0;
+    uint8_t *tmp = nullptr;     // g->msgBuf, kept for the poller
 
     // ---- Gates: explicit opt-in, a fresh FRTS from this boot, nothing tried yet.
     uint32_t arm = 0;
@@ -131,8 +130,8 @@ IOReturn NVBringup::bootGsp()
         why = "GSP-RM already running";
     else if (g->touched)
         why = "an earlier attempt ran this boot; shut down fully before retrying";
-    else if (!nv_is_turing(chipset_))
-        why = "chip is not Turing (TU102/104/106/116/117)";
+    else if (const char *c = chipRefusal())
+        why = c;
     else if (!frtsOk_)
         why = "FRTS did not succeed this boot";
     else if (nv_wpr2_addr(rd32(NV_PFB_PRI_MMU_WPR2_ADDR_LO)) != frtsAddr_)
@@ -151,11 +150,10 @@ IOReturn NVBringup::bootGsp()
     uint64_t imgOff, imgSize, sigOff, sigSize;
     const char *sigName;
     nv_gspbl gbl;
-    nv_booter bt;
     nv_wpr2_layout lay;
     nv_radix3_sizes rs;
-    // One ELF for all Turing; the signature for the GSP's boot ROM differs between TU10x and TU11x.
-    sigName = nv_is_tu11x(chipset_) ? NV_GSP_ELF_SIG_TU11X : NV_GSP_ELF_SIG_TU10X;
+    // One ELF per firmware family; the signature for the GSP's boot ROM differs per chip group.
+    sigName = chip_->elf_sig;
     if (!nv_elf64_section(elfFile, elfLen, NV_GSP_ELF_IMAGE, &imgOff, &imgSize) ||
         !nv_elf64_section(elfFile, elfLen, sigName, &sigOff, &sigSize)) {
         LOG("GSP: ELF lacks .fwimage or %s", sigName);
@@ -166,12 +164,7 @@ IOReturn NVBringup::bootGsp()
         LOG("GSP: %s", gbl.err);
         goto fail;
     }
-    if (!nv_booter_parse((const uint8_t *)g->fw[kFwBooterLoad]->getBytesNoCopy(),
-                         (uint32_t)g->fw[kFwBooterLoad]->getLength(), &bt)) {
-        LOG("GSP: %s", bt.err);
-        goto fail;
-    }
-    if (!nv_wpr2_layout_tu1xx(vramSize_, vgaAddr_, imgSize, gbl.size, sizeof(GspFwWprMeta), &lay) ||
+    if (!chip_->arch->wpr2_layout(vramSize_, vgaAddr_, imgSize, gbl.size, sizeof(GspFwWprMeta), &lay) ||
         lay.frts_addr != frtsAddr_) {
         LOG("GSP: WPR2 layout inconsistent with FRTS at 0x%llx", (unsigned long long)frtsAddr_);
         goto fail;
@@ -288,14 +281,6 @@ IOReturn NVBringup::bootGsp()
             (unsigned long long)pi.bar0_pa, pi.bus, pi.dev, pi.fn, regLen);
     }
 
-    // Copy of booter with its signature patched into DMEM.
-    booterSize = bt.img_size;
-    booter = (uint8_t *)IOMalloc(booterSize);
-    if (!booter)
-        goto fail;
-    memcpy(booter, bt.img, booterSize);
-    nv_booter_patch(&bt, booter);
-
     // GSP-RM raises interrupts we don't service yet; keep legacy INTx from firing
     // on a shared line. Messages are polled instead.
     pci_->configWrite16(kIOPCIConfigCommand, pci_->configRead16(kIOPCIConfigCommand) | 0x0400);
@@ -304,55 +289,10 @@ IOReturn NVBringup::bootGsp()
     OSSynchronizeIO();
     wr32(NV_PGSP_QUEUE_HEAD(0), 0);     // doorbell, as NVIDIA does after each push
 
-    // ---- 3. GSP falcon: reset (on Turing it comes out of reset ready for RISC-V)
+    // ---- 3-5. Start GSP-RM (HAL; on Turing booter_load on SEC2 starts the GSP's RISC-V core)
     g->touched = true;
-    if (!falconReset(NV_PGSP_BASE))
+    if (!(this->*hal_->gspStart)(gbl.app_version))
         goto fail;
-    gwr(NV_FALCON_MAILBOX0, (uint32_t)g->args.iova());
-    gwr(NV_FALCON_MAILBOX1, (uint32_t)(g->args.iova() >> 32));
-
-    // ---- 4. booter_load on SEC2 (kgspExecuteHsFalcon_TU102, direct boot)
-    if (!falconReset(NV_PSEC_BASE))
-        goto fail;
-    gwr(NV_FALCON_FBIF_CTL, grd(NV_FALCON_FBIF_CTL, NV_PSEC_BASE) | 0x80, NV_PSEC_BASE);
-    gwr(NV_FALCON_DMACTL, 0, NV_PSEC_BASE);
-    falconPioImem(booter + bt.nsec_img, bt.nsec_size, bt.nsec_imem, bt.nsec_tag >> 8, false, NV_PSEC_BASE);
-    falconPioImem(booter + bt.sec_img, bt.sec_size, bt.sec_imem, bt.sec_tag >> 8, true, NV_PSEC_BASE);
-    falconPioDmem(booter + bt.dmem_img, bt.dmem_size, 0, NV_PSEC_BASE);
-    gwr(NV_FALCON_BOOTVEC, bt.boot_vector, NV_PSEC_BASE);
-    gwr(NV_FALCON_MAILBOX0, (uint32_t)g->meta.iova(), NV_PSEC_BASE);
-    gwr(NV_FALCON_MAILBOX1, (uint32_t)(g->meta.iova() >> 32), NV_PSEC_BASE);
-    LOG("GSP: starting booter_load on SEC2");
-    falconStart(NV_PSEC_BASE);
-    if (!falconWaitHalted(10000, NV_PSEC_BASE)) {
-        LOG("GSP: booter_load did not halt within 10 s (SEC2 CPUCTL 0x%08x)", grd(NV_FALCON_CPUCTL, NV_PSEC_BASE));
-        goto fail;
-    }
-    {
-        uint32_t m0 = grd(NV_FALCON_MAILBOX0, NV_PSEC_BASE), m1 = grd(NV_FALCON_MAILBOX1, NV_PSEC_BASE);
-        LOG("GSP: booter_load halted: mailbox0 0x%x mailbox1 0x%x", m0, m1);
-        if (m0 != 0) {
-            LOG("GSP: FAILED: booter_load error 0x%x", m0);
-            goto fail;
-        }
-    }
-
-    // ---- 5. App version, RISC-V running?
-    gwr(NV_FALCON_OS, gbl.app_version);
-    {
-        bool active = false;
-        for (int i = 0; i < 100 && !active; i++) {
-            active = rd32(NV_PRISCV_GSP_BASE + NV_PRISCV_CORE_SWITCH_RISCV_STATUS) & 1;
-            if (!active)
-                IOSleep(1);
-        }
-        if (!active) {
-            LOG("GSP: FAILED: RISC-V core not active (GSP mailbox0 0x%x mailbox1 0x%x)",
-                grd(NV_FALCON_MAILBOX0), grd(NV_FALCON_MAILBOX1));
-            goto fail;
-        }
-        LOG("GSP: RISC-V active, waiting for GSP-RM");
-    }
 
     // ---- 6. Status queue until GSP_INIT_DONE
     {
@@ -403,8 +343,6 @@ fail:
     setProperty("NVGspResult", "failed");
 
 out:
-    if (booter)
-        IOFree(booter, booterSize);
     IOLockUnlock(gspLock_);
     return r;
 }
@@ -699,36 +637,11 @@ bool NVBringup::runSequencer(const uint8_t *p, uint32_t len)
                 return false;
             }
             break;
-        case GSP_SEQ_BUF_OPCODE_CORE_RESUME: {
-            // GSP-RM sends this on every Turing boot, after running a small falcon
-            // program on the GSP (kgspExecuteSequencerCommand_TU102, r570): reset the
-            // GSP into RISC-V, LibOS args -> its mailboxes, restart SEC2 (booter is
-            // still loaded), wait for its stage-3 handoff, then check both.
+        case GSP_SEQ_BUF_OPCODE_CORE_RESUME:
             flushWrites(&run);
-            LOG("GSP: seq: core resume (restart via SEC2)");
-            if (!falconReset(NV_PGSP_BASE))
+            if (!(this->*hal_->gspResume)())
                 return false;
-            gwr(NV_FALCON_MAILBOX0, (uint32_t)gsp_->args.iova());
-            gwr(NV_FALCON_MAILBOX1, (uint32_t)(gsp_->args.iova() >> 32));
-            falconStart(NV_PSEC_BASE);
-            uint32_t ms = 0;
-            while (!(rd32(NV_PGC6_BSI_SECURE_SCRATCH_14) & NV_BSI_SCRATCH_14_BOOT_STAGE_3_HANDOFF) && ms < 10000) {
-                IOSleep(1);
-                ms++;
-            }
-            uint32_t m0 = grd(NV_FALCON_MAILBOX0, NV_PSEC_BASE);
-            if (ms >= 10000 || m0 != 0) {
-                LOG("GSP: seq: SEC2 did not resume GSP-RM (%s, SEC2 mailbox0 0x%x)",
-                    ms >= 10000 ? "timeout" : "error", m0);
-                return false;
-            }
-            if (!(rd32(NV_PRISCV_GSP_BASE + NV_PRISCV_CORE_SWITCH_RISCV_STATUS) & 1)) {
-                LOG("GSP: seq: RISC-V not active after resume");
-                return false;
-            }
-            LOG("GSP: seq: resumed after %u ms, RISC-V active", ms);
             break;
-        }
         default:
             LOG("GSP: sequencer: %s not supported", nv_gsp_seq_name(op.opcode));
             return false;
@@ -855,52 +768,9 @@ IOReturn NVBringup::unloadGspLocked(const char *why)
     }
     g->booted = false;
 
-    // 2. FWSEC-SB on the GSP falcon (from the VBIOS read at boot).
-    falconReset(NV_PGSP_BASE);
-    {
-        OSData *rom = OSDynamicCast(OSData, getProperty("NVVBIOS"));
-        nv_vbios v;
-        nv_fwsec f;
-        uint32_t need;
-        if (!rom || nv_vbios_scan((const uint8_t *)rom->getBytesNoCopy(), rom->getLength(), &v, &need) != NV_SCAN_OK ||
-            !nv_vbios_find_fwsec(&v) || !nv_fwsec_parse(&v, &f)) {
-            LOG("GSP: unload: VBIOS/FWSEC unavailable, skipping FWSEC-SB");
-            ok = false;
-        } else if (!runFwsec((const uint8_t *)rom->getBytesNoCopy(), f, NV_DMEMMAPPER_CMD_SB, 0)) {
-            ok = false;
-        }
-    }
-
-    // 3. booter_unload on SEC2, only while WPR2 is up (kgspExecuteBooterUnloadIfNeeded_TU102).
-    if (rd32(NV_PFB_PRI_MMU_WPR2_ADDR_HI) >> 4) {
-        nv_booter bu;
-        uint8_t *img = nullptr;
-        if (!nv_booter_parse((const uint8_t *)g->fw[kFwBooterUnload]->getBytesNoCopy(),
-                             (uint32_t)g->fw[kFwBooterUnload]->getLength(), &bu) ||
-            !(img = (uint8_t *)IOMalloc(bu.img_size))) {
-            LOG("GSP: unload: booter_unload unusable: %s", bu.err ? bu.err : "no memory");
-            ok = false;
-        } else {
-            memcpy(img, bu.img, bu.img_size);
-            nv_booter_patch(&bu, img);
-            falconReset(NV_PSEC_BASE);
-            gwr(NV_FALCON_FBIF_CTL, grd(NV_FALCON_FBIF_CTL, NV_PSEC_BASE) | 0x80, NV_PSEC_BASE);
-            gwr(NV_FALCON_DMACTL, 0, NV_PSEC_BASE);
-            falconPioImem(img + bu.nsec_img, bu.nsec_size, bu.nsec_imem, bu.nsec_tag >> 8, false, NV_PSEC_BASE);
-            falconPioImem(img + bu.sec_img, bu.sec_size, bu.sec_imem, bu.sec_tag >> 8, true, NV_PSEC_BASE);
-            falconPioDmem(img + bu.dmem_img, bu.dmem_size, 0, NV_PSEC_BASE);
-            gwr(NV_FALCON_BOOTVEC, bu.boot_vector, NV_PSEC_BASE);
-            gwr(NV_FALCON_MAILBOX0, 0xff, NV_PSEC_BASE);
-            gwr(NV_FALCON_MAILBOX1, 0xff, NV_PSEC_BASE);
-            falconStart(NV_PSEC_BASE);
-            bool halted = falconWaitHalted(10000, NV_PSEC_BASE);
-            uint32_t m0 = grd(NV_FALCON_MAILBOX0, NV_PSEC_BASE);
-            LOG("GSP: booter_unload %s: mailbox0 0x%x", halted ? "halted" : "TIMED OUT", m0);
-            if (!halted || m0 != 0)
-                ok = false;
-            IOFree(img, bu.img_size);
-        }
-    }
+    // 2-3. Hand the GPU back to the VBIOS and clear WPR2 (HAL; on Turing FWSEC-SB, booter_unload).
+    if (!(this->*hal_->gspTeardown)())
+        ok = false;
     uint32_t hi = rd32(NV_PFB_PRI_MMU_WPR2_ADDR_HI);
     LOG("GSP: after unload WPR2 hi 0x%08x (%s)", hi, (hi >> 4) ? "STILL SET" : "cleared");
     if (hi >> 4)
@@ -1594,7 +1464,7 @@ bool NVBringup::testCopyEngine()
 
     TestChan &c = g->util;
     const uint32_t push[] = {
-        pbHeader(subch, 0x000, 1), TURING_DMA_COPY_A_CLASS,                 // SET_OBJECT
+        pbHeader(subch, 0x000, 1), chip_->arch->cls.copy,                 // SET_OBJECT
         pbHeader(subch, 0x400, 4), (uint32_t)(vaSrc >> 32), (uint32_t)vaSrc, // OFFSET_IN_UPPER/LOWER
                                    (uint32_t)(vaDst >> 32), (uint32_t)vaDst, // OFFSET_OUT_UPPER/LOWER
         pbHeader(subch, 0x418, 2), copyBytes, 1,                            // LINE_LENGTH_IN, LINE_COUNT
@@ -1755,14 +1625,14 @@ bool NVBringup::testCompute()
     LOG("GSP: promoted %u GR context buffers for channel 0x%x", n, c.handle);
 
     // 4. The compute object (GSP-RM builds the golden context on the first GR object).
-    if (!gspRmAlloc(g->hClient, c.handle, 0xc5c00001, TURING_COMPUTE_A_CLASS, nullptr, 0, &st))
+    if (!gspRmAlloc(g->hClient, c.handle, 0xc5c00001, chip_->arch->cls.compute, nullptr, 0, &st))
         return fail("TURING_COMPUTE_A alloc");
     if (!scheduleChannel(c))
         return fail("bind/schedule/token");
 
     // 5. The graphics engine releases a semaphore through the compute class.
     const uint32_t push[] = {
-        pbHeader(subch, 0x000, 1), TURING_COMPUTE_A_CLASS,                  // SET_OBJECT
+        pbHeader(subch, 0x000, 1), chip_->arch->cls.compute,                  // SET_OBJECT
         pbHeader(subch, NVC5C0_SET_REPORT_SEMAPHORE_A_, 4),                  // SET_REPORT_SEMAPHORE_A..D
             (uint32_t)(c.vaSem >> 32), (uint32_t)c.vaSem, semPayload, NVC5C0_SEMAPHORE_D_RELEASE_ONE_WORD,
     };

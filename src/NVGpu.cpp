@@ -244,7 +244,7 @@ bool NVBringup::createUtilChannel()
     if (!scheduleChannel(c))
         return false;
     uint32_t ceAlloc[NVB0B5_ALLOC_SIZE / 4] = { NVB0B5_ALLOC_VERSION_1, g->ceEngine };
-    if (!gspRmAlloc(g->hClient, c.handle, 0xc5b50001, TURING_DMA_COPY_A_CLASS, ceAlloc, sizeof(ceAlloc), &st))
+    if (!gspRmAlloc(g->hClient, c.handle, 0xc5b50001, chip_->arch->cls.copy, ceAlloc, sizeof(ceAlloc), &st))
         return false;
     g->utilOk = true;
     LOG("GSP: utility copy channel ready (chid 1, engine 0x%x)", g->ceEngine);
@@ -265,7 +265,7 @@ bool NVBringup::scrubVram(uint64_t pa, uint64_t size)
         uint64_t dst = pa + off;
         uint32_t payload = 0x5c000000u | (++g->utilSeq & 0xffffff);
         const uint32_t push[] = {
-            pbHeader(subch, 0x000, 1), TURING_DMA_COPY_A_CLASS,
+            pbHeader(subch, 0x000, 1), chip_->arch->cls.copy,
             pbHeader(subch, NVC5B5_SET_DST_PHYS_MODE_, 1), 0,                          // LOCAL_FB
             pbHeader(subch, 0x408, 2), (uint32_t)(dst >> 32), (uint32_t)dst,           // OFFSET_OUT
             pbHeader(subch, NVC5B5_SET_REMAP_CONST_A_, 1), 0,
@@ -419,9 +419,9 @@ void NVBringup::queryGrInfo()
     g->tpcCount = (uint16_t)(tpcs ? tpcs : v[0]);
     g->smPerTpc = (uint8_t)(v[5] ? v[5] : 2);
     g->maxWarps = (uint8_t)(v[3] ? v[3] : 32);
-    // RM reports the SM hardware revision (TU117: 0x703); compilers want the ISA level, which
-    // is 7.5 for every Turing chip (chipset 0x16x), as nouveau/NVK derive it from the chipset.
-    g->sm = (chipset_ & 0xff0) == 0x160 ? 75 : v[2] ? (uint8_t)((v[2] >> 8) * 10 + (v[2] & 0xff)) : 75;
+    // RM reports the SM hardware revision (TU117: 0x703); compilers want the ISA level, one per
+    // architecture (nv_hal.cpp: 7.5 for Turing), as nouveau/NVK derive it from the chipset.
+    g->sm = chip_ ? chip_->arch->sm : v[2] ? (uint8_t)((v[2] >> 8) * 10 + (v[2] & 0xff)) : 75;
     LOG("GSP: GR units: GPC mask 0x%x (%u GPCs), %u TPCs, %u SM/TPC, %u warps/SM, SM version 0x%x (sm%u), "
         "shader pipes %u/%u, %u cores", gpcMask, g->gpcCount, g->tpcCount, g->smPerTpc, g->maxWarps, v[2], g->sm,
         v[0], v[1], v[6]);
@@ -499,7 +499,7 @@ void NVBringup::initNvdec()
     }
     g->nvdecCtxSize = size;
     LOG("GSP: NVDEC0: ENG_DESC 0x%x, context buffer %u bytes, class 0x%x", engDesc, size,
-        NVC4B0_VIDEO_DECODER_CLASS);
+        chip_->arch->cls.vdec);
 }
 
 // Display, step B0 (boot-arg nvdisp=1): what GSP-RM knows about the display outputs, read-only.
@@ -1363,7 +1363,7 @@ bool NVBringup::rmAllocChannel(uint32_t handle, uint32_t chid, uint32_t engine, 
     put32(ch, NV_CHAN_internalFlags, (kernel ? 1u : 0u) |   // PRIVILEGE ADMIN / USER
                                      (1u << 2) |            // ERROR_NOTIFIER_TYPE NONE
                                      (1u << 4));            // ECC_ERROR_NOTIFIER_TYPE NONE
-    return gspRmAlloc(g->hClient, g->hDevice, handle, TURING_CHANNEL_GPFIFO_A_CLASS, ch, sizeof(ch), &st);
+    return gspRmAlloc(g->hClient, g->hDevice, handle, chip_->arch->cls.gpfifo, ch, sizeof(ch), &st);
 }
 
 bool NVBringup::rmScheduleChannel(uint32_t handle, uint32_t engine, uint32_t *token)
@@ -2149,10 +2149,10 @@ IOReturn NVBringup::ctxCreate(GpuConn *c, uint32_t engines, uint32_t *handle)
         if (!gspRmControl(g->hClient, g->hSubdevice, NV2080_CTRL_CMD_GPU_PROMOTE_CTX_, pr, sizeof(pr), &st))
             goto fail;
         if ((engines & NVMAC_ENGINE_3D) &&
-            !gspRmAlloc(g->hClient, x->hChannel, x->hChannel + 1, TURING_A_CLASS, nullptr, 0, &st))
+            !gspRmAlloc(g->hClient, x->hChannel, x->hChannel + 1, chip_->arch->cls.eng3d, nullptr, 0, &st))
             goto fail;
         if ((engines & NVMAC_ENGINE_COMPUTE) &&
-            !gspRmAlloc(g->hClient, x->hChannel, x->hChannel + 2, TURING_COMPUTE_A_CLASS, nullptr, 0, &st))
+            !gspRmAlloc(g->hClient, x->hChannel, x->hChannel + 2, chip_->arch->cls.compute, nullptr, 0, &st))
             goto fail;
         if (engines & NVMAC_ENGINE_COPY) {
             // A copy object on a graphics channel needs a copy engine on the graphics runlist
@@ -2163,7 +2163,7 @@ IOReturn NVBringup::ctxCreate(GpuConn *c, uint32_t engines, uint32_t *handle)
                 if (!t || !isCopyEngine(t) || (i && t == g->grCeEngine))
                     continue;
                 uint32_t ceAlloc[NVB0B5_ALLOC_SIZE / 4] = { NVB0B5_ALLOC_VERSION_1, t };
-                got = gspRmAlloc(g->hClient, x->hChannel, x->hChannel + 3, TURING_DMA_COPY_A_CLASS,
+                got = gspRmAlloc(g->hClient, x->hChannel, x->hChannel + 3, chip_->arch->cls.copy,
                                  ceAlloc, sizeof(ceAlloc), &st);
                 if (got && g->grCeEngine != t) {
                     g->grCeEngine = t;
@@ -2194,14 +2194,14 @@ IOReturn NVBringup::ctxCreate(GpuConn *c, uint32_t engines, uint32_t *handle)
         uint8_t bsp[NV_BSP_ALLOC_SIZE] = {};
         put32(bsp, NV_BSP_size, NV_BSP_ALLOC_SIZE);
         put32(bsp, NV_BSP_engineInstance, 0);
-        if (!gspRmAlloc(g->hClient, x->hChannel, x->hChannel + 4, NVC4B0_VIDEO_DECODER_CLASS, bsp, sizeof(bsp),
+        if (!gspRmAlloc(g->hClient, x->hChannel, x->hChannel + 4, chip_->arch->cls.vdec, bsp, sizeof(bsp),
                         &st))
             goto fail;
     } else {
         if (!rmScheduleChannel(x->hChannel, x->engineType, &x->token))
             goto fail;
         uint32_t ceAlloc[NVB0B5_ALLOC_SIZE / 4] = { NVB0B5_ALLOC_VERSION_1, g->ceEngine };
-        if (!gspRmAlloc(g->hClient, x->hChannel, x->hChannel + 3, TURING_DMA_COPY_A_CLASS, ceAlloc,
+        if (!gspRmAlloc(g->hClient, x->hChannel, x->hChannel + 3, chip_->arch->cls.copy, ceAlloc,
                         sizeof(ceAlloc), &st))
             goto fail;
     }
@@ -2641,11 +2641,11 @@ void NVBringup::fillInfo(nvmac_info *i)
     i->tpc_count = g->tpcCount;
     i->mp_per_tpc = g->smPerTpc;
     i->max_warps_per_mp = g->maxWarps;
-    i->cls_copy = TURING_DMA_COPY_A_CLASS;
-    i->cls_eng3d = TURING_A_CLASS;
-    i->cls_compute = TURING_COMPUTE_A_CLASS;
-    i->cls_gpfifo = TURING_CHANNEL_GPFIFO_A_CLASS;
-    i->cls_vdec = g->nvdecCtxSize ? NVC4B0_VIDEO_DECODER_CLASS : 0;
+    i->cls_copy = chip_->arch->cls.copy;
+    i->cls_eng3d = chip_->arch->cls.eng3d;
+    i->cls_compute = chip_->arch->cls.compute;
+    i->cls_gpfifo = chip_->arch->cls.gpfifo;
+    i->cls_vdec = g->nvdecCtxSize ? chip_->arch->cls.vdec : 0;
     i->vram_size = g->vram->limit - g->vram->base + 1;
     i->vram_used = nv_vram_used(g->vram);
     i->bar1_size = g->bar1Heap ? g->bar1Heap->limit - g->bar1Heap->base + 1 - g->ptPoolSize : 0;

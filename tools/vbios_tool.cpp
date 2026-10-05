@@ -5,10 +5,10 @@
 //                           prepare the FWSEC FRTS command (VRAM default 4096 MiB)
 //   vbios_tool --selftest   parse a synthetic ROM with a known layout
 //   vbios_tool --synthetic <file.rom>   write that synthetic ROM (fuzzing seed)
-//   vbios_tool --gsp <fwdir> [vram_mib] [tu10x|tu11x]
+//   vbios_tool --gsp <fwdir> [vram_mib] [chip]
 //                           parse the r570 GSP firmware under <fwdir> (linux-firmware
-//                           nvidia/ layout) for TU102/104/106 (tu10x) or TU116/117 (tu11x,
-//                           default) and print the WPR2 layout
+//                           nvidia/ layout) for a chip (TU117 default; tu10x = TU102, tu11x =
+//                           TU117) and print the WPR2 layout
 
 #include "../src/nv_vbios.h"
 #include "../src/nv_fwsec.h"
@@ -17,6 +17,7 @@
 #include "../src/nv_gsp_rm.h"
 #include "../src/nv_vram.h"
 #include "../src/nv_mmu.h"
+#include "../src/nv_hal.h"
 #include <map>
 
 #include <stdio.h>
@@ -153,13 +154,15 @@ static bool booter_report(const char *name, const std::vector<uint8_t> &bin)
     return true;
 }
 
-static int gsp_report(const char *dir, uint64_t vram, bool tu11x)
+static int gsp_report(const char *dir, uint64_t vram, const nv_chip *chip)
 {
-    std::string d(dir), booter = d + (tu11x ? "/tu116/gsp/" : "/tu102/gsp/");
-    const char *sig_name = tu11x ? NV_GSP_ELF_SIG_TU11X : NV_GSP_ELF_SIG_TU10X;
+    std::string d(dir), booter = d + "/" + chip->booter_dir + "/gsp/", gsp = d + "/" + chip->arch->gsp_dir + "/gsp/";
+    const char *sig_name = chip->elf_sig;
     std::vector<uint8_t> elf, bl, bload, bunload;
-    if (!read_file((d + "/tu102/gsp/gsp-570.144.bin").c_str(), elf) ||
-        !read_file((d + "/tu102/gsp/bootloader-570.144.bin").c_str(), bl) ||
+    printf("%s (%s): booters from %s, GSP-RM from %s\n", chip->name, chip->arch->name, chip->booter_dir,
+           chip->arch->gsp_dir);
+    if (!read_file((gsp + "gsp-570.144.bin").c_str(), elf) ||
+        !read_file((gsp + "bootloader-570.144.bin").c_str(), bl) ||
         !read_file((booter + "booter_load-570.144.bin").c_str(), bload) ||
         !read_file((booter + "booter_unload-570.144.bin").c_str(), bunload))
         return 1;
@@ -188,7 +191,7 @@ static int gsp_report(const char *dir, uint64_t vram, bool tu11x)
     // VGA workspace: this card reports none, so the top 1 MiB (see nv_vga_workspace).
     uint64_t vga = nv_vga_workspace(vram, false, 0);
     nv_wpr2_layout l;
-    if (!nv_wpr2_layout_tu1xx(vram, vga, img_size, g.size, 256, &l)) {
+    if (!chip->arch->wpr2_layout(vram, vga, img_size, g.size, 256, &l)) {
         printf("WPR2 layout: inconsistent\n");
         return 1;
     }
@@ -197,7 +200,7 @@ static int gsp_report(const char *dir, uint64_t vram, bool tu11x)
                (unsigned long long)(a + s), s / 1048576.0);
     };
     printf("WPR2 layout for %llu MiB VRAM (GSP heap %llu MiB):\n",
-           (unsigned long long)(vram >> 20), (unsigned long long)(nv_gsp_heap_size_tu1xx(vram) >> 20));
+           (unsigned long long)(vram >> 20), (unsigned long long)(chip->arch->gsp_heap_size(vram) >> 20));
     row("VGA workspace", l.vga_addr, l.vga_size);
     row("FRTS", l.frts_addr, l.frts_size);
     row("GSP bootloader", l.boot_addr, l.boot_size);
@@ -748,9 +751,15 @@ int main(int argc, char **argv)
         fclose(f);
         return 0;
     }
-    if (argc >= 3 && argc <= 5 && strcmp(argv[1], "--gsp") == 0)
-        return gsp_report(argv[2], (argc >= 4 ? strtoull(argv[3], nullptr, 0) : 4096) << 20,
-                          argc < 5 || strcmp(argv[4], "tu10x") != 0);
+    if (argc >= 3 && argc <= 5 && strcmp(argv[1], "--gsp") == 0) {
+        const char *name = argc < 5 ? "TU117" : !strcmp(argv[4], "tu10x") ? "TU102" : !strcmp(argv[4], "tu11x") ? "TU117" : argv[4];
+        const nv_chip *chip = nv_chip_find_name(name);
+        if (!chip) {
+            fprintf(stderr, "unknown chip %s\n", name);
+            return 2;
+        }
+        return gsp_report(argv[2], (argc >= 4 ? strtoull(argv[3], nullptr, 0) : 4096) << 20, chip);
+    }
     if (argc != 2 && argc != 3) {
         fprintf(stderr, "usage: %s <vbios.rom> [vram_mib] | --selftest | --synthetic <out.rom>\n", argv[0]);
         return 2;

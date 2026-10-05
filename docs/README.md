@@ -11,7 +11,7 @@ Installation and everyday use are in the top-level [README](../README.md). Here:
 |---|---|
 | [howto.md](howto.md) | Task recipes: check and test the install, benchmark and profile llama.cpp, `nvkmapvram`, power, logs, device-lost, using `libnvmac` from C |
 | [approach.md](approach.md) | Kext plus NVK instead of VMs or CUDA; kext vs DriverKit; loading with OpenCore; how the code is tested |
-| [firmware-and-boot.md](firmware-and-boot.md) | Firmware version, FWSEC-FRTS, GSP-RM boot and teardown, where structure layouts come from, the boot daemon |
+| [firmware-and-boot.md](firmware-and-boot.md) | Firmware version, FWSEC-FRTS, GSP-RM boot and teardown, where structure layouts come from, the boot daemon, the per-architecture HAL |
 | [memory-and-mmu.md](memory-and-mmu.md) | Host-owned VRAM, split VA spaces, BAR1, 64 KiB pages, the page-table pool |
 | [gpu-interface.md](gpu-interface.md) | The user-space interface: shape, submission, syncs, interrupts, isolation, access |
 | [bar1-cpu-mappings.md](bar1-cpu-mappings.md) | CPU mappings of VRAM that outlive a free: the kext fix, and where NVK puts CPU-mapped memory (`nvkmapvram`) |

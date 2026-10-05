@@ -386,6 +386,7 @@ firmware and your Mesa and llama.cpp builds. By hand:
 | `nvboost=<n>` | P-state boost after each submission: `2` adaptive (default: full clocks on the first submission after idle and while the GPU stays busy, cleared after 150 ms idle; `nvgsp perf policy adaptive burst=1level` starts one level up instead and goes to full clocks at ≥50 % busy over ~80 ms), `1` fixed (full clocks for 2 s), `0` off (GSP-RM alone takes ~250 ms of load to raise the memory clock). `build/nvgsp perf` shows the P-state; `nvgsp perf policy …` changes the policy and its thresholds at runtime; `nvgsp perf watch` follows the P-state |
 | `nvgpu_users=1` | Let any user open the GPU, not only root and the console user |
 | `nvtest=1` | Run the kext's boot-time self-tests |
+| `nvexperimental=1` | Let chips whose support is marked experimental run FWSEC and GSP-RM (none yet; see docs/firmware-and-boot.md) |
 | `nvaccel=1` | Start NVMetalAccel, so Metal.framework lists the GPU (Metal step) |
 | `nvkmapvram=1` | NVK keeps its push buffers and descriptors in CPU-mapped VRAM: faster generation (+15 % on a 0.5B model, +6 % on 3B), but each program run holds ~2.7 MiB of BAR1 until a restart; after ~42 runs it falls back to system memory (default speed). `desc` / `cmd:<n>` select parts; see [docs/bar1-cpu-mappings.md](docs/bar1-cpu-mappings.md) |
 
@@ -416,7 +417,7 @@ firmware and your Mesa and llama.cpp builds. By hand:
 
 | Path | Contents |
 |---|---|
-| `src/` | The kext: GSP-RM boot (`NVGsp.cpp`), GPU interface (`NVGpu.cpp`), runtime power (`NVPower.cpp`), MMU, VRAM heap, VBIOS/FWSEC/GSP firmware parsers, r570 structures (`nv_gsp_rm`), user-space ABI (`nv_uapi.h`) |
+| `src/` | The kext: chips and the per-architecture HAL (`nv_hal.*`, `hal_tu1xx.cpp` for Turing), GSP-RM boot (`NVGsp.cpp`), GPU interface (`NVGpu.cpp`), runtime power (`NVPower.cpp`), MMU, VRAM heap, VBIOS/FWSEC/GSP firmware parsers, r570 structures (`nv_gsp_rm`), user-space ABI (`nv_uapi.h`) |
 | `tools/` | `nvgsp`, `nvtest`, `vktest`, `libnvmac` (C library over `nv_uapi.h`), `vbios_tool`, the boot daemon (`daemon/`, `install_daemon.sh`), `install.sh`, `uninstall.sh`, `verify_install.sh`, `run-llama.sh`, `gsp_test.sh` |
 | `accel/` | NVMetalAccel, the IOAccelerator kext for Metal, and `tools/nvmetal_root_install.sh` |
 | `monitor/` | GPU Monitor (SwiftUI menu bar app and WidgetKit widget) |

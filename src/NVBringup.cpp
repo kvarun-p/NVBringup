@@ -3,11 +3,8 @@
 #include "nv_uapi.h"
 #include "nv_vbios.h"
 #include "nv_fwsec.h"
-#include "gen_bootloader.h"
 
 #include <IOKit/IOLib.h>
-#include <IOKit/IOBufferMemoryDescriptor.h>
-#include <IOKit/IODMACommand.h>
 #include <pexpert/pexpert.h>
 #include <stdarg.h>
 #include <string.h>
@@ -247,6 +244,17 @@ void NVBringup::logBars()
     }
 }
 
+// Why GSP-RM can't run on this chip, or nullptr (FRTS and the GSP-RM boot both check it).
+const char *NVBringup::chipRefusal() const
+{
+    if (!chip_ || !hal_)
+        return "chip not supported (Turing: TU102/104/106/116/117)";
+    uint32_t exp = 0;
+    if (chip_->experimental && (!PE_parse_boot_argn("nvexperimental", &exp, sizeof(exp)) || exp != 1))
+        return "support for this chip is experimental (boot-arg nvexperimental=1)";
+    return nullptr;
+}
+
 bool NVBringup::identifyChip()
 {
     uint32_t boot0 = rd32(NV_PMC_BOOT_0);
@@ -259,15 +267,24 @@ bool NVBringup::identifyChip()
     uint32_t arch    = nv_boot0_arch(boot0);
     uint32_t boot42  = rd32(NV_PMC_BOOT_42);
     chipset_ = chipset;
+    chip_    = nv_chip_find(chipset);
+    if (chip_) {
+        switch (chip_->arch->id) {
+        case NV_ARCH_TU1XX: hal_ = &halTu1xx; break;
+        }
+    }
+    const char *name = chip_ ? chip_->name : "unknown";
 
     LOG("NV_PMC_BOOT_0 = 0x%08x -> chipset 0x%03x (%s), arch %s, rev 0x%02x; BOOT_42 = 0x%08x",
-        boot0, chipset, nv_chip_name(chipset), nv_arch_name(arch), nv_boot0_rev(boot0), boot42);
+        boot0, chipset, name, nv_arch_name(arch), nv_boot0_rev(boot0), boot42);
+    if (chip_)
+        LOG("HAL: %s%s", chip_->arch->name, chip_->experimental ? " (experimental: boot-arg nvexperimental=1)" : "");
 
     // Visible with: ioreg -l -c NVBringup
     setProperty("NVBoot0", boot0, 32);
     setProperty("NVBoot42", boot42, 32);
     setProperty("NVChipset", chipset, 32);
-    setProperty("NVChipName", nv_chip_name(chipset));
+    setProperty("NVChipName", name);
     setProperty("NVArch", nv_arch_name(arch));
     return true;
 }
@@ -519,8 +536,8 @@ void NVBringup::prepareFwsec(const uint8_t *buf, uint32_t len)
         return;
     }
     const char *why = nullptr;
-    if (!nv_is_turing(chipset_))
-        why = "chip is not Turing (TU102/104/106/116/117)";
+    if (const char *c = chipRefusal())
+        why = c;
     else if (hi >> 4)
         why = "WPR2 already set up; shut down fully to reset the GPU";
     else if (!vram)
@@ -544,26 +561,6 @@ void NVBringup::wr32(uint32_t offset, uint32_t value)
 {
     volatile uint32_t *base = (volatile uint32_t *)bar0_->getVirtualAddress();
     base[offset / 4] = value;
-}
-
-// Engine reset, then wait for IMEM/DMEM scrubbing (nova-core falcon/hal/tu102.rs;
-// r570 kgspResetHw_TU102 / ksec2ResetHw_TU102 use the same ENGINE register).
-bool NVBringup::falconReset(uint32_t base)
-{
-    uint32_t e = grd(NV_FALCON_ENGINE, base);
-    gwr(NV_FALCON_ENGINE, e | 1, base);
-    IODelay(10);
-    gwr(NV_FALCON_ENGINE, e & ~1u, base);
-
-    for (uint32_t us = 0; us < 10000; us += 100) {
-        if (!(grd(NV_FALCON_DMACTL, base) & 0x6)) {
-            gwr(NV_FALCON_RM, rd32(NV_PMC_BOOT_0), base);
-            return true;
-        }
-        IODelay(100);
-    }
-    LOG("falcon 0x%x: memory scrubbing did not finish (DMACTL 0x%08x)", base, grd(NV_FALCON_DMACTL, base));
-    return false;
 }
 
 bool NVBringup::falconWaitHalted(uint32_t ms, uint32_t base)
@@ -606,149 +603,6 @@ void NVBringup::falconPioDmem(const uint8_t *data, uint32_t len, uint32_t dst, u
         memcpy(&w, data + off, 4);
         gwr(NV_FALCON_DMEMD0, w, base);
     }
-}
-
-// The bootloader is PIO-loaded; it DMA-reads FWSEC from a buffer mapped through
-// the IOMMU, then runs it. The GPU only reads that buffer; FRTS writes go to VRAM.
-bool NVBringup::runFwsec(const uint8_t *rom, const nv_fwsec &f, uint32_t cmd, uint64_t frts)
-{
-    const bool sb = cmd == NV_DMEMMAPPER_CMD_SB;
-    const char *tag = sb ? "FWSEC-SB" : "FRTS";
-    nv_genbl bl;
-    if (!nv_genbl_parse(nv_gen_bootloader, sizeof(nv_gen_bootloader), &bl)) {
-        LOG("%s: bootloader: %s", tag, bl.err);
-        return false;
-    }
-
-    const uint32_t pad    = nv_fwsec_dma_padding(&f);
-    const uint32_t size   = ((pad + f.stored_size + 0xfff) & ~0xfffu) + 0x1000;  // slack for 256 B DMA chunks
-    const uint32_t blSize = (bl.code_size + 0xff) & ~0xffu;
-
-    IOBufferMemoryDescriptor *buf = nullptr;
-    IODMACommand *dma = nullptr;
-    uint8_t *blCode = nullptr;
-    bool lead = false, leadSet = false, started = false, ok = false;
-    uint64_t dmaBase = 0;
-    uint8_t desc[NV_BL_DMEM_DESC_SIZE];
-
-    buf = IOBufferMemoryDescriptor::withOptions(kIODirectionOut | kIOMemoryPhysicallyContiguous, size, 0x1000);
-    blCode = (uint8_t *)IOMalloc(blSize);
-    if (!buf || !blCode) {
-        LOG("%s: out of memory", tag);
-        goto out;
-    }
-    {
-        uint8_t *p = (uint8_t *)buf->getBytesNoCopy();
-        memset(p, 0, size);
-        memcpy(p + pad, rom + f.image_rom, f.stored_size);
-        if (sb ? !nv_fwsec_patch_sb(&f, p + pad + f.dmem_img)
-               : !nv_fwsec_patch_frts(&f, p + pad + f.dmem_img, frts, NV_FRTS_SIZE)) {
-            LOG("%s: patching the FWSEC command failed", tag);
-            goto out;
-        }
-        memset(blCode, 0, blSize);
-        memcpy(blCode, bl.code, bl.code_size);
-    }
-
-    // Map through the system IOMMU (VT-d is active); the GPU sees only this buffer.
-    dma = IODMACommand::withSpecification(kIODMACommandOutputHost64, 40, 0,
-                                          IODMACommand::kMapped, 0, 256);
-    if (!dma || dma->setMemoryDescriptor(buf, true) != kIOReturnSuccess) {
-        LOG("%s: DMA mapping failed", tag);
-        goto out;
-    }
-    {
-        UInt64 offset = 0;
-        IODMACommand::Segment64 seg;
-        UInt32 nseg = 1;
-        if (dma->gen64IOVMSegments(&offset, &seg, &nseg) != kIOReturnSuccess || nseg != 1 ||
-            seg.fLength < size || (seg.fIOVMAddr & 0xff)) {
-            LOG("%s: DMA buffer is not one aligned segment", tag);
-            goto out;
-        }
-        dmaBase = seg.fIOVMAddr;
-    }
-    if (!nv_fwsec_bl_desc(&f, dmaBase, desc)) {
-        LOG("%s: FWSEC layout not usable with the bootloader", tag);
-        goto out;
-    }
-    LOG("%s: DMA buffer 0x%x bytes at device address 0x%llx", tag, size, (unsigned long long)dmaBase);
-
-    lead = pci_->setBusLeadEnable(true);
-    leadSet = true;
-
-    if (!falconReset())
-        goto out;
-    gwr(NV_FALCON_FBIF_CTL, grd(NV_FALCON_FBIF_CTL) | 0x80);
-    gwr(NV_FALCON_DMACTL, 0);
-    falconPioImem(blCode, blSize, bl.start_tag << 8, bl.start_tag);
-    falconPioDmem(desc, NV_BL_DMEM_DESC_SIZE, bl.dmem_load_off);
-    gwr(NV_FALCON_BOOTVEC, bl.start_tag << 8);
-    gwr(NV_FALCON_FBIF_TRANSCFG(NV_FALCON_DMAIDX_PHYS_SYS_NCOH),
-        (grd(NV_FALCON_FBIF_TRANSCFG(NV_FALCON_DMAIDX_PHYS_SYS_NCOH)) & ~7u) |
-        NV_FBIF_TARGET_COHERENT_SYSMEM | NV_FBIF_MEM_TYPE_PHYSICAL);
-    gwr(NV_FALCON_MAILBOX0, 0);
-    gwr(NV_FALCON_MAILBOX1, 0);
-
-    LOG("%s: starting GSP falcon (bootloader 0x%x bytes at IMEM 0x%x)", tag, blSize, bl.start_tag << 8);
-    falconStart();
-    started = true;
-
-    if (!falconWaitHalted(2000)) {
-        LOG("%s: falcon did not halt within 2 s (CPUCTL 0x%08x); resetting it", tag, grd(NV_FALCON_CPUCTL));
-        falconReset();   // stops the falcon and its DMA before the buffer is unmapped
-        goto out;
-    }
-    if (sb) {
-        // kgspExecuteFwsec_TU102, SB branch: GFW privilege mask lowered, GFW boot
-        // completed, and no SB error in VBIOS scratch 0x15.
-        uint32_t mbox0 = grd(NV_FALCON_MAILBOX0);
-        uint32_t plm   = rd32(NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK);
-        uint32_t gfw   = rd32(NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_0_GFW_BOOT);
-        uint32_t err   = rd32(NV_PBUS_VBIOS_SCRATCH_15) & 0xffff;
-        LOG("%s: halted; mailbox0 0x%x, PLM 0x%x, GFW boot 0x%x, SB error 0x%x", tag, mbox0, plm, gfw, err);
-        ok = mbox0 == 0 && (plm & 1) && (gfw & 0xff) == 0xff && err == 0;
-        LOG("%s: %s", tag, ok ? "SUCCESS" : "FAILED");
-    } else {
-        {
-            uint32_t mbox0 = grd(NV_FALCON_MAILBOX0), mbox1 = grd(NV_FALCON_MAILBOX1);
-            uint32_t err   = rd32(NV_PBUS_SW_SCRATCH_0E) >> 16;
-            uint32_t wlo_r = rd32(NV_PFB_PRI_MMU_WPR2_ADDR_LO), whi_r = rd32(NV_PFB_PRI_MMU_WPR2_ADDR_HI);
-            uint64_t wlo   = nv_wpr2_addr(wlo_r), whi = nv_wpr2_addr(whi_r);
-            LOG("%s: halted; mailbox0 0x%x mailbox1 0x%x, FRTS error 0x%x, WPR2 0x%llx..0x%llx", tag,
-                mbox0, mbox1, err, (unsigned long long)wlo, (unsigned long long)whi);
-            setProperty("NVWpr2Lo", wlo_r, 32);
-            setProperty("NVWpr2Hi", whi_r, 32);
-            if (mbox0 != 0)
-                LOG("%s: FAILED: FWSEC returned error 0x%x", tag, mbox0);
-            else if (err != 0)
-                LOG("%s: FAILED: FRTS error code 0x%x", tag, err);
-            else if (!(whi_r >> 4))
-                LOG("%s: FAILED: WPR2 was not created", tag);
-            else if (wlo != frts)
-                LOG("%s: FAILED: WPR2 starts at 0x%llx, expected 0x%llx", tag,
-                    (unsigned long long)wlo, (unsigned long long)frts);
-            else {
-                LOG("%s: SUCCESS: WPR2 created at 0x%llx..0x%llx", tag,
-                    (unsigned long long)wlo, (unsigned long long)whi);
-                ok = true;
-            }
-        }
-    }
-
-out:
-    if (leadSet)
-        pci_->setBusLeadEnable(lead);
-    if (dma) {
-        dma->clearMemoryDescriptor(true);
-        dma->release();
-    }
-    OSSafeReleaseNULL(buf);
-    if (blCode)
-        IOFree(blCode, blSize);
-    if (!started)
-        LOG("%s: aborted before starting the falcon", tag);
-    return ok;
 }
 
 // On the test laptop the ACPI _ROM copy holds only the PCI-AT and EFI images; the

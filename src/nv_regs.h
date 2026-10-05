@@ -118,27 +118,3 @@ static inline const char *nv_arch_name(uint32_t arch)
     default:    return "unknown";
     }
 }
-
-// The Turing chips GSP-RM r570 supports: TU102/TU104/TU106 (TU10x: RTX 20, Quadro RTX, Titan RTX)
-// and TU116/TU117 (TU11x: GTX 16). Signed firmware differs between the two groups.
-static inline bool nv_is_turing(uint32_t chipset)
-{
-    return chipset == 0x162 || chipset == 0x164 || chipset == 0x166 || chipset == 0x167 || chipset == 0x168;
-}
-
-static inline bool nv_is_tu11x(uint32_t chipset)
-{
-    return chipset == 0x167 || chipset == 0x168;
-}
-
-static inline const char *nv_chip_name(uint32_t chipset)
-{
-    switch (chipset) {
-    case 0x162: return "TU102";
-    case 0x164: return "TU104";
-    case 0x166: return "TU106";
-    case 0x167: return "TU117";
-    case 0x168: return "TU116";
-    default:    return "unknown";
-    }
-}

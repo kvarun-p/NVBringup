@@ -20,7 +20,7 @@ CFLAGS    := $(KFLAGS) -std=gnu11
 LDFLAGS   := $(ARCHFLAGS) -nostdlib -Xlinker -kext -Xlinker -export_dynamic \
              -lkmodc++ -lkmod -lcc_kext
 
-OBJS := $(BUILD)/NVBringup.o $(BUILD)/nv_vbios.o $(BUILD)/nv_fwsec.o $(BUILD)/nv_gsp.o $(BUILD)/nv_gsp_rm.o $(BUILD)/nv_vram.o $(BUILD)/nv_mmu.o $(BUILD)/NVGsp.o $(BUILD)/NVBringupUserClient.o $(BUILD)/NVGpu.o $(BUILD)/NVGpuUserClient.o $(BUILD)/NVPower.o $(BUILD)/kmod_info.o
+OBJS := $(BUILD)/NVBringup.o $(BUILD)/nv_hal.o $(BUILD)/hal_tu1xx.o $(BUILD)/nv_vbios.o $(BUILD)/nv_fwsec.o $(BUILD)/nv_gsp.o $(BUILD)/nv_gsp_rm.o $(BUILD)/nv_vram.o $(BUILD)/nv_mmu.o $(BUILD)/NVGsp.o $(BUILD)/NVBringupUserClient.o $(BUILD)/NVGpu.o $(BUILD)/NVGpuUserClient.o $(BUILD)/NVPower.o $(BUILD)/kmod_info.o
 TOOL := $(BUILD)/vbios_tool
 NVGSP := $(BUILD)/nvgsp
 NVTEST := $(BUILD)/nvtest
@@ -59,13 +59,13 @@ check: $(KEXT)
 	kmutil libraries -p $(KEXT) --undef-symbols
 
 # Host build of the VBIOS parser, with sanitizers.
-$(TOOL): tools/vbios_tool.cpp src/nv_vbios.cpp src/nv_fwsec.cpp src/nv_gsp.cpp src/nv_gsp_rm.cpp src/nv_vram.cpp src/nv_mmu.cpp src/*.h $(GENBL_H) | $(BUILD)
+$(TOOL): tools/vbios_tool.cpp src/nv_vbios.cpp src/nv_fwsec.cpp src/nv_gsp.cpp src/nv_gsp_rm.cpp src/nv_vram.cpp src/nv_mmu.cpp src/nv_hal.cpp src/*.h $(GENBL_H) | $(BUILD)
 	clang++ -std=c++17 -O1 -g -Wall -Wextra -fsanitize=address,undefined -I$(BUILD) \
-		tools/vbios_tool.cpp src/nv_vbios.cpp src/nv_fwsec.cpp src/nv_gsp.cpp src/nv_gsp_rm.cpp src/nv_vram.cpp src/nv_mmu.cpp -o $@
+		tools/vbios_tool.cpp src/nv_vbios.cpp src/nv_fwsec.cpp src/nv_gsp.cpp src/nv_gsp_rm.cpp src/nv_vram.cpp src/nv_mmu.cpp src/nv_hal.cpp -o $@
 
 # User-space tool that boots GSP-RM through the kext's user client.
-$(NVGSP): tools/nvgsp.cpp | $(BUILD)
-	clang++ -std=c++17 -O2 -Wall -Wextra tools/nvgsp.cpp -framework IOKit -framework CoreFoundation -o $@
+$(NVGSP): tools/nvgsp.cpp src/nv_hal.cpp src/nv_gsp.cpp src/nv_hal.h src/nv_gsp.h | $(BUILD)
+	clang++ -std=c++17 -O2 -Wall -Wextra tools/nvgsp.cpp src/nv_hal.cpp src/nv_gsp.cpp -framework IOKit -framework CoreFoundation -o $@
 
 $(NVTEST): tools/nvtest.c tools/libnvmac.c tools/libnvmac.h src/nv_uapi.h | $(BUILD)
 	clang -std=c11 -O2 -Wall -Wextra -Isrc tools/nvtest.c tools/libnvmac.c -framework IOKit -framework CoreFoundation -o $@

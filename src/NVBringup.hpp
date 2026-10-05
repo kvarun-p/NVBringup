@@ -15,6 +15,7 @@
 #include <IOKit/IOUserClient.h>
 
 #include "nv_fwsec.h"
+#include "nv_hal.h"
 
 class NVBringup : public IOService {
     OSDeclareDefaultStructors(NVBringup)
@@ -33,6 +34,26 @@ private:
     bool opened_        = false;
     bool memWasEnabled_ = false;
     uint32_t chipset_   = 0;
+    const nv_chip *chip_ = nullptr;     // nullptr: not a supported chip (nv_hal.h)
+
+    // HAL: the sequences that differ per architecture, chosen in identifyChip from chip_->arch
+    // (hal_tu1xx.cpp for Turing). Named after NVIDIA's per-chip HAL functions they follow.
+    struct Hal {
+        // kflcnReset: reset a falcon (GSP or SEC2), wait for its memory scrubbing
+        bool (NVBringup::*falconReset)(uint32_t base);
+        // kgspExecuteFwsec: FWSEC from the VBIOS, FRTS (cmd NV_DMEMMAPPER_CMD_FRTS, at boot) or SB (unload)
+        bool (NVBringup::*runFwsec)(const uint8_t *rom, const nv_fwsec &f, uint32_t cmd, uint64_t frts);
+        // kgspBootstrap, after the sysmem structures and init messages are in place: start GSP-RM
+        // (LibOS args at gsp_->args, WPR meta at gsp_->meta) until its RISC-V core runs
+        bool (NVBringup::*gspStart)(uint32_t appVersion);
+        // the sequencer's CORE_RESUME (kgspExecuteSequencerCommand)
+        bool (NVBringup::*gspResume)();
+        // kgspTeardown, once GSP-RM has suspended: hand the GPU back to the VBIOS and clear WPR2
+        bool (NVBringup::*gspTeardown)();
+    };
+    const Hal *hal_ = nullptr;
+    static const Hal halTu1xx;
+    const char *chipRefusal() const;    // why GSP-RM can't run on this chip, or nullptr
 
     // Boot-time IOLog output is lost before logd starts, so every log line is
     // also kept here and published as the NVLog property (ioreg, no root needed).
@@ -73,7 +94,7 @@ private:
     void wr32(uint32_t offset, uint32_t value);
     uint32_t grd(uint32_t off, uint32_t base = NV_PGSP_BASE) const { return rd32(base + off); }
     void gwr(uint32_t off, uint32_t value, uint32_t base = NV_PGSP_BASE) { wr32(base + off, value); }
-    bool falconReset(uint32_t base = NV_PGSP_BASE);
+    bool falconReset(uint32_t base = NV_PGSP_BASE) { return hal_ && (this->*hal_->falconReset)(base); }
     bool falconWaitHalted(uint32_t ms, uint32_t base = NV_PGSP_BASE);
     void falconStart(uint32_t base = NV_PGSP_BASE);
     // tag is in 256-byte units (IMEM block tags)
@@ -81,7 +102,15 @@ private:
                        bool secure = false, uint32_t base = NV_PGSP_BASE);
     void falconPioDmem(const uint8_t *data, uint32_t len, uint32_t dst, uint32_t base = NV_PGSP_BASE);
     // cmd: NV_DMEMMAPPER_CMD_FRTS (boot, needs frts) or NV_DMEMMAPPER_CMD_SB (unload)
-    bool runFwsec(const uint8_t *rom, const nv_fwsec &f, uint32_t cmd, uint64_t frts);
+    bool runFwsec(const uint8_t *rom, const nv_fwsec &f, uint32_t cmd, uint64_t frts)
+        { return hal_ && (this->*hal_->runFwsec)(rom, f, cmd, frts); }
+    // Turing (hal_tu1xx.cpp)
+    bool tu1xxFalconReset(uint32_t base);
+    bool tu1xxRunFwsec(const uint8_t *rom, const nv_fwsec &f, uint32_t cmd, uint64_t frts);
+    bool tu1xxRunBooter(uint32_t kind, uint32_t mbox0, uint32_t mbox1);
+    bool tu1xxGspStart(uint32_t appVersion);
+    bool tu1xxGspResume();
+    bool tu1xxGspTeardown();
     bool frtsOk_ = false;       // FRTS succeeded this boot; GSP-RM boot requires it
     uint64_t frtsAddr_ = 0, vgaAddr_ = 0, vramSize_ = 0;
 

@@ -106,6 +106,34 @@ ioreg -a -r -c NVBringup -d 1 | plutil -extract 0.NVLog raw -o - - | tail -40
 
 ## All Turing chips
 
-Nothing assumes TU117 or 4 GiB: the gates check for any Turing chip, the heap and WPR2 layout
+Nothing assumes TU117 or 4 GiB: the gates check for any supported chip, the heap and WPR2 layout
 scale with VRAM, and the firmware signature and booters are chosen per chip (TU102/104/106 vs
 TU116/117). Only TU117 has been tested.
+
+## Per-architecture code: a HAL inside the kext
+
+What differs between GPU architectures is small next to what GSP-RM does for every one of them,
+so it lives in one kext behind a table, as in NVIDIA's own driver (its `_TU102`, `_GA102`
+function variants), nouveau and nova-core:
+
+| Part | Where | Turing |
+|---|---|---|
+| Chips: name, firmware folders, ELF signature section, experimental flag | `nv_chips` in `src/nv_hal.cpp` | TU102/104/106 (booters `tu102`), TU116/117 (`tu116`) |
+| Architecture data: engine classes, SM level, GSP-RM heap and WPR2 layout | `nv_arch` in `src/nv_hal.cpp` | `TURING_*` classes, sm 7.5, `nv_wpr2_layout_tu1xx` |
+| Boot sequences: falcon reset, FWSEC, GSP-RM start, sequencer CORE_RESUME, teardown | `NVBringup::Hal`, `src/hal_tu1xx.cpp` | generic bootloader + FWSEC v2; booter_load/unload on SEC2 |
+
+Everything else (GSP-RM messages and RPCs, channels, memory, the user-space interface, power) is
+shared. The host tools use the same table: `nvgsp boot` picks the firmware files from it, and
+`vbios_tool --gsp <dir> <vram> <chip>` checks the firmware and WPR2 layout for any listed chip.
+
+Separate kexts per architecture were considered and rejected: the per-architecture code is a few
+hundred lines, while a C++ interface between separately built kexts is fragile, and every extra
+kext is another file OpenCore must load in order at boot.
+
+Adding an architecture (Ampere/Ada next: the same r570 firmware, `gsp_ga10x`): its `nv_arch` and
+chips, with `experimental` set until it has run on hardware (boot-arg `nvexperimental=1` lets it
+boot); a `Hal` with NVIDIA's `_GA102` sequences (FWSEC v3 without the generic bootloader, the
+GA102 falcon reset, the scrubber on Ada); the v3 descriptor in `nv_fwsec.cpp`; and the firmware
+folders in `install_daemon.sh`, `install.sh` and `verify_install.sh`. Check also the GFW-boot
+wait (`NVPower.cpp`, `kgspWaitForGfwBootOk_TU102`), the interrupt tree and the page-table
+kinds against r570.

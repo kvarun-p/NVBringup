@@ -87,7 +87,8 @@ same_bundle() {
     u=$(uuid "$1/Contents/MacOS/$exe")
     [[ -n $u && $u == $(uuid "$2/Contents/MacOS/$exe") ]]
 }
-# the boot daemon matches this checkout (install_daemon.sh's files)
+# the boot daemon matches this checkout (install_daemon.sh's files; the firmware copies are
+# root-only, so compared through sudo: in a dry run without cached sudo they count as different)
 DAEMON_DIR="/Library/Application Support/NVBringup"
 daemon_current() {
     cmp -s build/nvgsp "$DAEMON_DIR/nvgsp" && cmp -s tools/daemon/gsp_boot.sh "$DAEMON_DIR/gsp_boot.sh" &&
@@ -95,7 +96,7 @@ daemon_current() {
     local f
     for f in $FW/{tu102,tu116}/gsp/*-570.144.bin(N); do
         [[ $f == *gen_bootloader* ]] && continue
-        cmp -s $f "$DAEMON_DIR/firmware/${f#$FW/}" || return 1
+        sudo -n cmp -s $f "$DAEMON_DIR/firmware/${f#$FW/}" 2>/dev/null || return 1
     done
 }
 

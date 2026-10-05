@@ -12,6 +12,7 @@
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
+#include "../src/nv_hal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -92,21 +93,21 @@ static int cmd_boot(const std::string &dir)
     io_service_t s = find_driver();
     if (!s)
         return 1;
-    // GSP-RM and its bootloader are shared by all Turing chips (linux-firmware nvidia/tu102); the
-    // booters are signed per group: TU102/TU104/TU106 use tu102's, TU116/TU117 tu116's.
-    uint32_t chip = driver_chipset(s);
-    bool tu11x = chip == 0x167 || chip == 0x168;
-    bool tu10x = chip == 0x162 || chip == 0x164 || chip == 0x166;
-    if (!tu11x && !tu10x) {
-        fprintf(stderr, "chipset 0x%x is not a Turing chip GSP-RM r570 supports here\n", chip);
+    // GSP-RM and its bootloader are shared per architecture (Turing: linux-firmware nvidia/tu102);
+    // the booters are signed per chip group (TU102/TU104/TU106: tu102, TU116/TU117: tu116). nv_hal.cpp.
+    uint32_t chipset = driver_chipset(s);
+    const nv_chip *chip = nv_chip_find(chipset);
+    if (!chip) {
+        fprintf(stderr, "chipset 0x%x is not a chip GSP-RM r570 supports here\n", chipset);
         IOObjectRelease(s);
         return 1;
     }
-    std::string booter = tu11x ? "/tu116/gsp/" : "/tu102/gsp/";
+    std::string booter = std::string("/") + chip->booter_dir + "/gsp/", gsp = std::string("/") + chip->arch->gsp_dir + "/gsp/";
+    std::string elf = gsp + "gsp-570.144.bin", bl = gsp + "bootloader-570.144.bin";
     std::string bload = booter + "booter_load-570.144.bin", bunload = booter + "booter_unload-570.144.bin";
     const struct { uint64_t kind; const char *path; } files[] = {
-        { kFwGspElf,        "/tu102/gsp/gsp-570.144.bin" },
-        { kFwGspBootloader, "/tu102/gsp/bootloader-570.144.bin" },
+        { kFwGspElf,        elf.c_str() },
+        { kFwGspBootloader, bl.c_str() },
         { kFwBooterLoad,    bload.c_str() },
         { kFwBooterUnload,  bunload.c_str() },
     };
