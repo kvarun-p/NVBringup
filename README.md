@@ -105,6 +105,21 @@ bundle). Everything else runs as the console user.
 
 ## Installation
 
+`tools/install.sh` does the macOS side of steps 1–4, 7 and 8 for you, once the GPU is visible
+and Mesa is built (step 5). It downloads the missing firmware, runs `make`, backs up the EFI and
+copies the kext into `EFI/OC/Kexts`, installs the boot daemon, and, if you've set up the Metal
+step, NVMetalAccel and `NVMetal.bundle`. It skips anything already current, so the same command
+updates an installation. It never edits `config.plist`: it prints the entries and boot-args you
+still need to add. Run it as yourself (it asks for sudo where needed), with `-n` first to see what
+it would do:
+
+```bash
+tools/install.sh -n          # dry run: print the commands
+tools/install.sh             # every component that applies; or name some: firmware build efi daemon accel bundle monitor
+```
+
+The steps below are what it does, and what you do by hand on a first install.
+
 ### 1. Firmware
 
 Download the GSP-RM r570.144 files from
@@ -329,7 +344,8 @@ control).
 ## Update after changes
 
 The kext, `nvgsp` and NVK share one interface (`src/nv_uapi.h`, `NVMAC_ABI_VERSION`). After
-pulling changes, rebuild and reinstall everything that changed:
+pulling changes, run `tools/install.sh`: it rebuilds and reinstalls whatever differs from the
+build. By hand:
 
 | Changed | Do |
 |---|---|
@@ -344,6 +360,11 @@ pulling changes, rebuild and reinstall everything that changed:
 that differs from the build.
 
 ## Uninstall
+
+`tools/uninstall.sh` (`-n` for a dry run) removes NVMetal.bundle, NVMetalAccel, the Metal allow
+list and kill switch, the boot daemon, your NVK Vulkan manifest and GPU Monitor, then lists the
+EFI changes to undo by hand (step 1 below, and `csr-active-config`). It keeps the logs, the
+firmware and your Mesa and llama.cpp builds. By hand:
 
 1. Remove `NVBringup.kext` from `EFI/OC/Kexts/`, its Kernel → Add entry, and the `nv*`
    boot-args from `config.plist`.
@@ -396,7 +417,7 @@ that differs from the build.
 | Path | Contents |
 |---|---|
 | `src/` | The kext: GSP-RM boot (`NVGsp.cpp`), GPU interface (`NVGpu.cpp`), runtime power (`NVPower.cpp`), MMU, VRAM heap, VBIOS/FWSEC/GSP firmware parsers, r570 structures (`nv_gsp_rm`), user-space ABI (`nv_uapi.h`) |
-| `tools/` | `nvgsp`, `nvtest`, `vktest`, `libnvmac` (C library over `nv_uapi.h`), `vbios_tool`, the boot daemon (`daemon/`, `install_daemon.sh`), `verify_install.sh`, `run-llama.sh`, `gsp_test.sh` |
+| `tools/` | `nvgsp`, `nvtest`, `vktest`, `libnvmac` (C library over `nv_uapi.h`), `vbios_tool`, the boot daemon (`daemon/`, `install_daemon.sh`), `install.sh`, `uninstall.sh`, `verify_install.sh`, `run-llama.sh`, `gsp_test.sh` |
 | `accel/` | NVMetalAccel, the IOAccelerator kext for Metal, and `tools/nvmetal_root_install.sh` |
 | `monitor/` | GPU Monitor (SwiftUI menu bar app and WidgetKit widget) |
 | `docs/` | Task recipes ([howto](docs/howto.md)) and design decisions: what was chosen, the alternatives, and the measurements behind them ([index](docs/README.md)) |
