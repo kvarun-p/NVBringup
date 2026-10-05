@@ -59,7 +59,7 @@ if has bundle; then
     step "NVMetal.bundle"
     if [[ ! -e $SYS_BUNDLE ]]; then
         ok "not installed"
-    elif run sudo accel/tools/nvmetal_root_install.sh remove; then
+    elif run sudo /bin/zsh accel/tools/nvmetal_root_install.sh remove; then
         REBOOT+="NVMetal.bundle removal (a new system snapshot)"
     else
         err "nvmetal_root_install.sh remove failed (it needs csr-active-config 0x803 and FileVault off)"
@@ -99,7 +99,7 @@ if has daemon; then
     if [[ ! -e /Library/LaunchDaemons/com.nvbringup.gsp.plist && ! -d "/Library/Application Support/NVBringup" ]]; then
         ok "not installed"
     else
-        run sudo tools/uninstall_daemon.sh || err "uninstall_daemon.sh failed"
+        run sudo /bin/zsh tools/uninstall_daemon.sh || err "uninstall_daemon.sh failed"
     fi
 fi
 

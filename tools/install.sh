@@ -179,7 +179,7 @@ if has daemon; then
     step "Boot daemon (step 4)"
     if daemon_current; then
         ok "the installed daemon is current"
-    elif run sudo tools/install_daemon.sh; then
+    elif run sudo /bin/zsh tools/install_daemon.sh; then
         REBOOT+="boot daemon (or now: sudo build/nvgsp boot)"
     else
         err "install_daemon.sh failed"
@@ -216,7 +216,7 @@ if has bundle; then
         TODO+="csr-active-config 03080000 (0x803) in config.plist, reboot, then: tools/install.sh bundle"
     elif ! fdesetup status | grep -q "FileVault is Off"; then
         err "FileVault is on: turn it off, then tools/install.sh bundle"
-    elif run sudo accel/tools/nvmetal_root_install.sh install $BUNDLE; then
+    elif run sudo /bin/zsh accel/tools/nvmetal_root_install.sh install $BUNDLE; then
         REBOOT+="NVMetal.bundle (a new system snapshot)"
     else
         err "nvmetal_root_install.sh failed"
@@ -227,7 +227,7 @@ fi
 
 if has monitor; then
     step "GPU Monitor (step 8)"
-    run monitor/build.sh || err "monitor/build.sh failed"
+    run /bin/zsh monitor/build.sh || err "monitor/build.sh failed"
 fi
 
 # ---------------------------------------------------------------------------------------------
