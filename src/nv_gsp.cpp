@@ -92,17 +92,20 @@ bool nv_booter_parse(const uint8_t *bin, uint32_t len, nv_booter *b)
     b->patch_loc = rd32(bin + p_loc);
     uint32_t sig_idx0 = rd32(bin + p_sig);
     b->sig_count = rd32(bin + p_num);
-    if (b->sig_count == 0 || sig_total % b->sig_count)
+    if (b->sig_count == 0 || b->sig_count > 64 || sig_total % b->sig_count)
         return booter_fail(b, "booter: bad signature count");
-    // r570's booters (tu102 and tu116 alike) carry one signature. Several would need the one
-    // matching the chip's fuse version (nouveau/r570 pick it by fuse_ver): not implemented.
-    if (b->sig_count != 1)
-        return booter_fail(b, "booter: several signatures; choosing by fuse version is not implemented");
+    // r570's Turing booters (tu102 and tu116 alike) carry one signature; GA10x+ files may carry
+    // one per fuse version (nv_booter_sig_index picks it, as nouveau and r570 do).
     b->sig_size = sig_total / b->sig_count;
     if (sig_off > len || (uint64_t)sig_idx0 + sig_total > len - sig_off || b->sig_size == 0 || (b->sig_size & 3))
         return booter_fail(b, "booter: signatures outside file");
     b->sig = bin + sig_off + sig_idx0;
-    b->fuse_ver = (meta_size >= 4 && meta_off + 4 <= len) ? rd32(bin + meta_off) : 0;
+    // Meta data (nouveau: fuse_ver, engine_id, ucode_id): Turing files carry only the first.
+    if (meta_off > len || meta_size > len - meta_off)
+        return booter_fail(b, "booter: meta data outside file");
+    b->fuse_ver  = meta_size >= 4  ? rd32(bin + meta_off) : 0;
+    b->engine_id = meta_size >= 8  ? rd32(bin + meta_off + 4) : 0;
+    b->ucode_id  = meta_size >= 12 ? rd32(bin + meta_off + 8) : 0;
 
     // nvfw_hs_load_header_v2: os_code_offset/size, os_data_offset/size, num_apps, apps[] {offset, size}
     if (lh_off + 28 > len)
@@ -132,12 +135,18 @@ bool nv_booter_parse(const uint8_t *bin, uint32_t len, nv_booter *b)
     b->dmem_img  = b->os_data_off;
     b->dmem_size = b->os_data_size;
     b->boot_vector = 0;
+    // GA10x+ (nouveau ga102_gsp_booter_ctor): only the HS app is loaded, DMA-tagged with its
+    // image offset; the OS data to DMEM 0; the signature is at patch_loc inside that data.
+    b->hs_code_img  = b->app0_off;
+    b->hs_code_size = b->app0_size;
+    b->hs_code_va   = b->app0_off;
+    b->hs_sig_dmem  = b->patch_loc - b->os_data_off;
 
     if ((uint64_t)b->nsec_img + b->nsec_size > b->img_size ||
         (uint64_t)b->sec_img + b->sec_size > b->img_size ||
         (uint64_t)b->dmem_img + b->dmem_size > b->img_size)
         return booter_fail(b, "booter: sections outside the image");
-    if ((b->nsec_size | b->sec_size | b->nsec_imem | b->sec_imem) & 0xff)
+    if ((b->nsec_size | b->sec_size | b->nsec_imem | b->sec_imem | b->hs_code_img) & 0xff)
         return booter_fail(b, "booter: IMEM sections not 256-byte aligned");
     if (b->dmem_size & 3)
         return booter_fail(b, "booter: DMEM size not 4-byte aligned");
@@ -146,9 +155,31 @@ bool nv_booter_parse(const uint8_t *bin, uint32_t len, nv_booter *b)
     return true;
 }
 
-void nv_booter_patch(const nv_booter *b, uint8_t *img)
+// nouveau ga100_flcn_fw_signature: the fuse register holds one bit per burnt version; the
+// file's fuse_ver is the version of its first signature, the following ones are one lower
+// each. No burnt bit: the last (lowest) signature. Turing: fuse 0 and one signature.
+bool nv_booter_sig_index(const nv_booter *b, uint32_t fuse_reg, uint32_t *index)
 {
-    memcpy(img + b->patch_loc, b->sig, b->sig_size);
+    uint32_t idx;
+    if (fuse_reg) {
+        uint32_t ver = 0;                   // position of the highest set bit, 1-based (fls)
+        for (uint32_t v = fuse_reg; v; v >>= 1)
+            ver++;
+        if (b->fuse_ver < ver)
+            return false;
+        idx = b->fuse_ver - ver;
+    } else {
+        idx = b->sig_count - 1;
+    }
+    if (idx >= b->sig_count)
+        return false;
+    *index = idx;
+    return true;
+}
+
+void nv_booter_patch(const nv_booter *b, uint8_t *img, uint32_t index)
+{
+    memcpy(img + b->patch_loc, b->sig + (size_t)index * b->sig_size, b->sig_size);
 }
 
 // ---- RISC-V GSP bootloader ---------------------------------------------------
@@ -182,23 +213,37 @@ bool nv_gspbl_parse(const uint8_t *bin, uint32_t len, nv_gspbl *bl)
 
 // ---- WPR2 layout ------------------------------------------------------------
 
-uint64_t nv_gsp_heap_size_tu1xx(uint64_t fb_size)
+// _kgspCalculateFwHeapSize (r570): OS carve-out + base + per GiB of FB + client allocations,
+// clamped to the architecture's bounds (gsp_fw_heap.h).
+static uint64_t gsp_heap_size(uint64_t fb_size, uint64_t os_mib, uint64_t min_mib, uint64_t max_mib)
 {
     const uint64_t MiB = 1ull << 20;
     uint64_t fb_gb = (fb_size + (1ull << 30) - 1) >> 30;
-    uint64_t heap = 0                                   // GSP_FW_HEAP_PARAM_OS_SIZE_LIBOS2
-                  + 8 * MiB                             // GSP_FW_HEAP_PARAM_BASE_RM_SIZE_TU10X
+    uint64_t heap = os_mib * MiB                        // GSP_FW_HEAP_PARAM_OS_SIZE_*
+                  + 8 * MiB                             // GSP_FW_HEAP_PARAM_BASE_RM_SIZE_TU10X (Turing through Ada)
                   + align_up(98304 * fb_gb, MiB)        // GSP_FW_HEAP_PARAM_SIZE_PER_GB_FB
                   + align_up(100663296, MiB);           // GSP_FW_HEAP_PARAM_CLIENT_ALLOC_SIZE
-    if (heap < 64 * MiB)                                // GSP_FW_HEAP_SIZE_OVERRIDE_LIBOS2_MIN_MB
-        heap = 64 * MiB;
-    if (heap > 256 * MiB)                               // GSP_FW_HEAP_SIZE_OVERRIDE_LIBOS2_MAX_MB
-        heap = 256 * MiB;
+    if (heap < min_mib * MiB)
+        heap = min_mib * MiB;
+    if (heap > max_mib * MiB)
+        heap = max_mib * MiB;
     return heap;
 }
 
-bool nv_wpr2_layout_tu1xx(uint64_t fb_size, uint64_t vga_addr, uint64_t elf_size,
-                          uint64_t boot_size, uint32_t meta_size, nv_wpr2_layout *l)
+uint64_t nv_gsp_heap_size_tu1xx(uint64_t fb_size)
+{
+    // LIBOS2: no OS carve-out; GSP_FW_HEAP_SIZE_OVERRIDE_LIBOS2_MIN_MB..MAX_MB
+    return gsp_heap_size(fb_size, 0, 64, 256);
+}
+
+uint64_t nv_gsp_heap_size_ga10x(uint64_t fb_size)
+{
+    // LIBOS3 bare metal: 22 MiB carve-out; GSP_FW_HEAP_SIZE_OVERRIDE_LIBOS3_BAREMETAL_MIN_MB..MAX_MB
+    return gsp_heap_size(fb_size, 22, 88, 280);
+}
+
+static bool wpr2_layout(uint64_t fb_size, uint64_t vga_addr, uint64_t elf_size,
+                        uint64_t boot_size, uint32_t meta_size, uint64_t heap, nv_wpr2_layout *l)
 {
     memset(l, 0, sizeof(*l));
     if (!fb_size || vga_addr >= fb_size || !elf_size || !boot_size || !meta_size)
@@ -216,10 +261,9 @@ bool nv_wpr2_layout_tu1xx(uint64_t fb_size, uint64_t vga_addr, uint64_t elf_size
     l->elf_size = elf_size;
     l->elf_addr = align_down(l->boot_addr - elf_size, 0x10000);
 
-    // Turing has no scrubber ucode, so the heap must also fit in the 256 MiB the
-    // VBIOS pre-scrubs at the top of VRAM, next to the 1 MiB meta + 1 MiB non-WPR
-    // heap below it and everything above it (kgspGetFwHeapSize, r570).
-    uint64_t heap = nv_gsp_heap_size_tu1xx(fb_size);
+    // Without a scrubber ucode the heap must also fit in the 256 MiB the VBIOS
+    // pre-scrubs at the top of VRAM, next to the 1 MiB meta + 1 MiB non-WPR heap
+    // below it and everything above it (kgspGetFwHeapSize, kgspGetPrescrubbedTopFbSize).
     uint64_t post = align_up(fb_size - l->elf_addr, 0x100000);
     if (post + 2 * 0x100000 >= 256ull << 20)
         return false;
@@ -242,4 +286,18 @@ bool nv_wpr2_layout_tu1xx(uint64_t fb_size, uint64_t vga_addr, uint64_t elf_size
            l->heap_addr + l->heap_size <= l->elf_addr && l->elf_addr + l->elf_size <= l->boot_addr &&
            l->boot_addr + l->boot_size <= l->frts_addr && l->frts_addr + l->frts_size <= l->wpr_end &&
            l->wpr_end <= fb_size && l->nonwpr_addr < fb_size;
+}
+
+bool nv_wpr2_layout_tu1xx(uint64_t fb_size, uint64_t vga_addr, uint64_t elf_size,
+                          uint64_t boot_size, uint32_t meta_size, nv_wpr2_layout *l)
+{
+    return wpr2_layout(fb_size, vga_addr, elf_size, boot_size, meta_size,
+                       nv_gsp_heap_size_tu1xx(fb_size), l);
+}
+
+bool nv_wpr2_layout_ga10x(uint64_t fb_size, uint64_t vga_addr, uint64_t elf_size,
+                          uint64_t boot_size, uint32_t meta_size, nv_wpr2_layout *l)
+{
+    return wpr2_layout(fb_size, vga_addr, elf_size, boot_size, meta_size,
+                       nv_gsp_heap_size_ga10x(fb_size), l);
 }

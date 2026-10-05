@@ -4,11 +4,13 @@
 //                           analyze a dumped VBIOS (see tools/dump_vbios.py) and
 //                           prepare the FWSEC FRTS command (VRAM default 4096 MiB)
 //   vbios_tool --selftest   parse a synthetic ROM with a known layout
-//   vbios_tool --synthetic <file.rom>   write that synthetic ROM (fuzzing seed)
+//   vbios_tool --synthetic <file.rom> [3]   write that synthetic ROM (fuzzing seed); 3: with
+//                           the v3 (GA10x+) FWSEC descriptor instead of Turing's v2
 //   vbios_tool --gsp <fwdir> [vram_mib] [chip]
 //                           parse the r570 GSP firmware under <fwdir> (linux-firmware
 //                           nvidia/ layout) for a chip (TU117 default; tu10x = TU102, tu11x =
-//                           TU117) and print the WPR2 layout
+//                           TU117, ga10x = GA102, ad10x = AD102, or any name from nv_hal.cpp)
+//                           and print the WPR2 layout
 
 #include "../src/nv_vbios.h"
 #include "../src/nv_fwsec.h"
@@ -56,12 +58,24 @@ static int fwsec_report(const nv_vbios &v, uint64_t vram)
         printf("FWSEC parse failed: %s\n", f.err);
         return 1;
     }
-    printf("FWSEC v2 ucode: ROM 0x%x, 0x%x bytes, uncompressed\n", f.image_rom, f.stored_size);
+    printf("FWSEC v%u ucode: ROM 0x%x, 0x%x bytes, uncompressed\n", f.version, f.image_rom, f.stored_size);
     printf("  load plan (image offset -> falcon address, size):\n");
     printf("    IMEM non-secure  0x%05x -> 0x%05x  0x%05x\n", f.nsec_img, f.nsec_imem, f.nsec_size);
-    printf("    IMEM secure (HS) 0x%05x -> 0x%05x  0x%05x\n", f.sec_img, f.sec_imem, f.sec_size);
+    printf("    IMEM secure (HS) 0x%05x -> 0x%05x  0x%05x  (tag 0x%x)\n", f.sec_img, f.sec_imem, f.sec_size, f.sec_va);
     printf("    DMEM             0x%05x -> 0x%05x  0x%05x\n", f.dmem_img, f.dmem_addr, f.dmem_size);
     printf("    boot vector      0x%x\n", f.boot_vector);
+    if (f.version == 3) {
+        printf("  PKC (GA10x+): %u signature(s) at ROM 0x%x for fuse versions 0x%x, slot at DMEM 0x%x, engine mask 0x%x, ucode id %u\n",
+               f.sig_count, f.sigs_rom, f.sig_versions, f.pkc_data_off, f.engine_id_mask, f.ucode_id);
+        for (uint32_t fuse = 0; fuse < 4; fuse++) {
+            uint32_t idx;
+            uint32_t reg = fuse ? 1u << (fuse - 1) : 0;         // fuse version `fuse` = highest bit fuse-1
+            if (nv_fwsec_sig_index(&f, reg, &idx))
+                printf("    fuse version %u (register 0x%x): signature %u\n", fuse, reg, idx);
+            else
+                printf("    fuse version %u (register 0x%x): no signature\n", fuse, reg);
+        }
+    }
     printf("  interface table at DMEM 0x%x, %u entries; DMEMMAPPER v%u at DMEM 0x%x\n",
            f.appif_off, f.appif_count, f.dmap_version, f.dmap_off);
     printf("  command buffer DMEM 0x%x (0x%x bytes), init_cmd 0x%x, cmd_mask0 0x%x cmd_mask1 0x%x\n",
@@ -78,6 +92,10 @@ static int fwsec_report(const nv_vbios &v, uint64_t vram)
            (unsigned long long)(vram >> 20), (unsigned long long)frts, (unsigned long long)(frts + NV_FRTS_SIZE));
     printf("  patched DMEMMAPPER init_cmd -> 0x%x; FRTS command at DMEM 0x%x:\n", NV_DMEMMAPPER_CMD_FRTS, f.cmd_in_off);
     hexdump(dmem.data() + f.cmd_in_off, NV_FRTS_CMD_SIZE, f.cmd_in_off);
+    if (f.version == 3) {
+        printf("GA10x+ load the ucode with the falcon's DMA engine; the generic bootloader isn't used\n");
+        return 0;
+    }
 
     nv_genbl bl;
     if (!nv_genbl_parse(nv_gen_bootloader, sizeof(nv_gen_bootloader), &bl)) {
@@ -147,10 +165,19 @@ static bool booter_report(const char *name, const std::vector<uint8_t> &bin)
         printf("%s: %s\n", name, b.err);
         return false;
     }
-    printf("%s: image 0x%x bytes, %u signature(s) of 0x%x bytes, fuse %u, patch at image 0x%x (DMEM 0x%x)\n",
-           name, b.img_size, b.sig_count, b.sig_size, b.fuse_ver, b.patch_loc, b.patch_loc - b.dmem_img);
-    printf("  SEC2 PIO: IMEM non-secure 0x%05x -> 0x%05x 0x%05x | secure 0x%05x -> 0x%05x 0x%05x | DMEM 0x%05x -> 0 0x%05x | boot 0x%x\n",
+    printf("%s: image 0x%x bytes, %u signature(s) of 0x%x bytes, fuse version %u, engine 0x%x ucode %u, patch at image 0x%x (DMEM 0x%x)\n",
+           name, b.img_size, b.sig_count, b.sig_size, b.fuse_ver, b.engine_id, b.ucode_id, b.patch_loc, b.patch_loc - b.dmem_img);
+    printf("  Turing, SEC2 PIO: IMEM non-secure 0x%05x -> 0x%05x 0x%05x | secure 0x%05x -> 0x%05x 0x%05x | DMEM 0x%05x -> 0 0x%05x | boot 0x%x\n",
            b.nsec_img, b.nsec_imem, b.nsec_size, b.sec_img, b.sec_imem, b.sec_size, b.dmem_img, b.dmem_size, b.boot_vector);
+    printf("  GA10x+, SEC2 DMA: HS code 0x%05x 0x%05x -> IMEM 0 (tag and boot 0x%x) | DMEM 0x%05x -> 0 0x%05x | signature at DMEM 0x%x\n",
+           b.hs_code_img, b.hs_code_size, b.hs_code_va, b.dmem_img, b.dmem_size, b.hs_sig_dmem);
+    for (uint32_t fuse = 0; fuse < 3; fuse++) {
+        uint32_t idx, reg = fuse ? 1u << (fuse - 1) : 0;
+        if (nv_booter_sig_index(&b, reg, &idx))
+            printf("    fuse version %u: signature %u\n", fuse, idx);
+        else
+            printf("    fuse version %u: no signature\n", fuse);
+    }
     return true;
 }
 
@@ -242,7 +269,11 @@ static const uint32_t pmu_logical  = 0x1000 + 0x100;   // in FWSEC#1
 static const uint32_t desc_logical = 0x1800 + 0x200;   // in FWSEC#2
 static const uint32_t desc_rom     = FW2 + 0x200;
 
-static std::vector<uint8_t> build_synthetic()
+// v3 (GA10x+) variant: the 44-byte descriptor, two PKC signatures (versions 0 and 1), then
+// the ucode: IMEM 0x200 (all secure), DMEM 0x400 with the signature slot at 0x200.
+static const uint32_t v3_desc_size = NV_FWSEC_DESC_V3_SIZE + 2 * NV_FWSEC_V3_SIG_SIZE;
+
+static std::vector<uint8_t> build_synthetic(uint8_t desc_version = 2)
 {
     // Layout: PCI-AT 0x1000 | EFI 0x800 | FWSEC#1 0x800 | FWSEC#2 0x1000
     std::vector<uint8_t> b(0x4000, 0xff);   // trailing 0xff like erased flash
@@ -267,22 +298,48 @@ static std::vector<uint8_t> build_synthetic()
     b[t + 4]  = 0x05; b[t + 5]  = 0x07; w32(b, t + 6, 0xdeadbeef);
     b[t + 10] = NV_FALCON_APPID_FWSEC_PROD; b[t + 11] = 0x07; w32(b, t + 12, desc_logical);
 
-    // v2 descriptor. Ucode: IMEM 0x200 (non-secure 0x100, secure 0x100 at 0x100),
-    // then DMEM 0x200 at image offset 0x200.
-    const uint32_t desc[15] = {
-        1 | 2 << 8 | 0x3c << 16,    // hdr
-        0x400, 0x400,               // stored, uncompressed
-        0,                          // virtual entry
-        0x20,                       // interface offset (in DMEM)
-        0, 0x200, 0, 0x100, 0x100,  // IMEM phys, load size, virt, sec base, sec size
-        0x200, 0, 0x200,            // DMEM offset, phys base, load size
-        0x200, 0x200,               // alt IMEM/DMEM load size
-    };
-    for (uint32_t i = 0; i < 15; i++)
-        w32(b, desc_rom + 4 * i, desc[i]);
-    const uint32_t dmem = desc_rom + 0x3c + 0x200;
-    for (uint32_t i = 0; i < 0x200; i++)
-        b[dmem + i] = 0;
+    uint32_t dmem;
+    if (desc_version == 2) {
+        // v2 descriptor. Ucode: IMEM 0x200 (non-secure 0x100, secure 0x100 at 0x100),
+        // then DMEM 0x200 at image offset 0x200.
+        const uint32_t desc[15] = {
+            1 | 2 << 8 | 0x3c << 16,    // hdr
+            0x400, 0x400,               // stored, uncompressed
+            0,                          // virtual entry
+            0x20,                       // interface offset (in DMEM)
+            0, 0x200, 0, 0x100, 0x100,  // IMEM phys, load size, virt, sec base, sec size
+            0x200, 0, 0x200,            // DMEM offset, phys base, load size
+            0x200, 0x200,               // alt IMEM/DMEM load size
+        };
+        for (uint32_t i = 0; i < 15; i++)
+            w32(b, desc_rom + 4 * i, desc[i]);
+        dmem = desc_rom + 0x3c + 0x200;
+        for (uint32_t i = 0; i < 0x200; i++)
+            b[dmem + i] = 0;
+    } else {
+        const uint32_t desc[9] = {
+            1 | 3 << 8 | v3_desc_size << 16,    // hdr: v3, header size covers the signatures
+            0x600,                      // stored size: IMEM 0x200 + DMEM 0x400
+            0x200,                      // PKC data offset (in DMEM)
+            0x20,                       // interface offset (in DMEM)
+            0, 0x200, 0,                // IMEM phys, load size, virt
+            0, 0x400,                   // DMEM phys base, load size
+        };
+        for (uint32_t i = 0; i < 9; i++)
+            w32(b, desc_rom + 4 * i, desc[i]);
+        w16(b, desc_rom + 0x24, 0x400);                 // engine id mask: GSP
+        b[desc_rom + 0x26] = 3;                         // ucode id
+        b[desc_rom + 0x27] = 2;                         // signature count
+        w16(b, desc_rom + 0x28, 0x3);                   // signature versions 0 and 1
+        w16(b, desc_rom + 0x2a, 0);
+        for (uint32_t s = 0; s < 2; s++)
+            for (uint32_t i = 0; i < NV_FWSEC_V3_SIG_SIZE; i++)
+                b[desc_rom + NV_FWSEC_DESC_V3_SIZE + s * NV_FWSEC_V3_SIG_SIZE + i] = (uint8_t)(0x11 * (s + 1));
+        const uint32_t image = desc_rom + v3_desc_size;
+        for (uint32_t i = 0; i < 0x600; i++)
+            b[image + i] = (uint8_t)(i < 0x200 ? 0xc0 : 0);     // code, then zeroed DMEM
+        dmem = image + 0x200;
+    }
     b[dmem + 0x20] = 1; b[dmem + 0x21] = 4; b[dmem + 0x22] = 8; b[dmem + 0x23] = 2;
     w32(b, dmem + 0x24, 0x05); w32(b, dmem + 0x28, 0x80);                   // other app
     w32(b, dmem + 0x2c, NV_APPIF_ID_DMEMMAPPER); w32(b, dmem + 0x30, 0x100);
@@ -334,6 +391,54 @@ static int selftest()
     CHECK(f.dmem_img == 0x200 && f.dmem_size == 0x200 && f.dmem_addr == 0);
     CHECK(f.appif_count == 2 && f.dmap_off == 0x100 && f.dmap_version == 3);
     CHECK(f.cmd_in_off == 0x180 && f.cmd_in_size == 0x40 && f.cmd_mask0 == 0x44000);
+
+    {   // The same ROM with a v3 (GA10x+) descriptor: PKC-signed, DMA-loaded, no bootloader.
+        std::vector<uint8_t> b3 = build_synthetic(3);
+        nv_vbios v3;
+        nv_fwsec f3;
+        CHECK(nv_vbios_scan(b3.data(), (uint32_t)b3.size(), &v3, &need) == NV_SCAN_OK);
+        CHECK(nv_vbios_find_fwsec(&v3));
+        CHECK(v3.desc_version == 3 && v3.desc_size == v3_desc_size && v3.desc_stored_size == 0x600);
+        CHECK(nv_fwsec_parse(&v3, &f3));
+        CHECK(f3.version == 3 && f3.image_rom == desc_rom + v3_desc_size && f3.sigs_rom == desc_rom + NV_FWSEC_DESC_V3_SIZE);
+        CHECK(f3.nsec_size == 0 && f3.sec_img == 0 && f3.sec_size == 0x200 && f3.sec_imem == 0 && f3.sec_va == 0);
+        CHECK(f3.dmem_img == 0x200 && f3.dmem_size == 0x400 && f3.dmem_addr == 0 && f3.boot_vector == 0);
+        CHECK(f3.pkc_data_off == 0x200 && f3.engine_id_mask == 0x400 && f3.ucode_id == 3);
+        CHECK(f3.sig_count == 2 && f3.sig_versions == 0x3);
+        CHECK(f3.appif_count == 2 && f3.dmap_off == 0x100 && f3.cmd_in_off == 0x180);
+        uint32_t idx = 99;
+        CHECK(nv_fwsec_sig_index(&f3, 0, &idx) && idx == 0);                    // nothing burnt: version 0
+        CHECK(nv_fwsec_sig_index(&f3, 0x1, &idx) && idx == 1);                  // bit 0 burnt: version 1
+        CHECK(!nv_fwsec_sig_index(&f3, 0x2, &idx));                             // version 2: not in the VBIOS
+        CHECK(!nv_fwsec_sig_index(&f, 0, &idx));                                // v2 has no signatures
+        std::vector<uint8_t> d3(b3.begin() + f3.image_rom + f3.dmem_img, b3.begin() + f3.image_rom + f3.dmem_img + f3.dmem_size);
+        CHECK(nv_fwsec_patch_frts(&f3, d3.data(), 0xffe00000ull, NV_FRTS_SIZE));
+        nv_fwsec_patch_sig(&f3, b3.data(), d3.data(), 1);
+        CHECK(d3[0x200] == 0x22 && d3[0x200 + NV_FWSEC_V3_SIG_SIZE - 1] == 0x22 && d3[0x1ff] == 0);
+        CHECK(d3[0x12c] == NV_DMEMMAPPER_CMD_FRTS && d3[0x12d] == 0);             // init_cmd still patched
+        uint8_t bld[NV_BL_DMEM_DESC_SIZE];
+        CHECK(!nv_fwsec_bl_desc(&f3, 0x80000000ull, bld));                      // the bootloader is v2 only
+        b3[desc_rom + 0x27] = 3;                                                // three signatures don't fit the header
+        CHECK(nv_vbios_scan(b3.data(), (uint32_t)b3.size(), &v3, &need) == NV_SCAN_OK && nv_vbios_find_fwsec(&v3));
+        CHECK(!nv_fwsec_parse(&v3, &f3));
+    }
+
+    {   // Booter signature choice (nouveau ga100_flcn_fw_signature): three signatures for
+        // versions 5, 4, 3 in that order.
+        nv_booter b = {};
+        b.sig_count = 3;
+        b.fuse_ver = 5;
+        uint32_t idx = 99;
+        CHECK(nv_booter_sig_index(&b, 0, &idx) && idx == 2);                    // nothing burnt: the last
+        CHECK(nv_booter_sig_index(&b, 0x10, &idx) && idx == 0);                 // highest bit 5: version 5
+        CHECK(nv_booter_sig_index(&b, 0x0f, &idx) && idx == 1);                 // highest bit 4
+        CHECK(nv_booter_sig_index(&b, 0x04, &idx) && idx == 2);                 // highest bit 3
+        CHECK(!nv_booter_sig_index(&b, 0x20, &idx));                            // version 6: newer than the file
+        CHECK(!nv_booter_sig_index(&b, 0x01, &idx));                            // version 1: older than the file
+        b.sig_count = 1;
+        b.fuse_ver = 0;
+        CHECK(nv_booter_sig_index(&b, 0, &idx) && idx == 0);                    // Turing: one signature, no fuse
+    }
 
     // Placement, following nova-core fb.rs
     const uint64_t G4 = 4ull << 30;
@@ -392,6 +497,15 @@ static int selftest()
     CHECK(l.wpr2_addr == 0xf7800000ull && l.wpr2_size == 0x8700000ull);
     CHECK(l.nonwpr_addr == 0xf7700000ull && l.wpr_end == 0xfff00000ull);
     CHECK(!nv_wpr2_layout_tu1xx(G4, G4, 28528288, 0x1000, 256, &l));        // bad VGA address
+
+    // GA10x/AD10x (LibOS3): 22 MiB OS carve-out, 88..280 MiB; the layout above it is the same.
+    CHECK(nv_gsp_heap_size_ga10x(G4) == 127ull << 20);
+    CHECK(nv_gsp_heap_size_ga10x(1ull << 30) == 127ull << 20);
+    CHECK(nv_gsp_heap_size_ga10x(64ull << 30) == 132ull << 20);
+    CHECK(nv_wpr2_layout_ga10x(G4, G4 - 0x100000, 28528288, 0x1000, 256, &l));
+    CHECK(l.frts_addr == 0xffe00000ull && l.boot_addr == 0xffdff000ull && l.elf_addr == 0xfe2c0000ull);
+    CHECK(l.heap_addr == 0xf6300000ull && l.heap_size == 0x7f00000ull);
+    CHECK(l.wpr2_addr == 0xf6200000ull && l.wpr2_size == 0x9d00000ull && l.nonwpr_addr == 0xf6100000ull);
 
     // Minimal ELF64: null section, ".fwimage" (16 bytes of data), ".shstrtab".
     {
@@ -744,15 +858,16 @@ int main(int argc, char **argv)
 {
     if (argc == 2 && strcmp(argv[1], "--selftest") == 0)
         return selftest();
-    if (argc == 3 && strcmp(argv[1], "--synthetic") == 0) {
-        std::vector<uint8_t> b = build_synthetic();
+    if ((argc == 3 || argc == 4) && strcmp(argv[1], "--synthetic") == 0) {
+        std::vector<uint8_t> b = build_synthetic(argc == 4 && strcmp(argv[3], "3") == 0 ? 3 : 2);
         FILE *f = fopen(argv[2], "wb");
         if (!f || fwrite(b.data(), 1, b.size(), f) != b.size()) { perror(argv[2]); return 2; }
         fclose(f);
         return 0;
     }
     if (argc >= 3 && argc <= 5 && strcmp(argv[1], "--gsp") == 0) {
-        const char *name = argc < 5 ? "TU117" : !strcmp(argv[4], "tu10x") ? "TU102" : !strcmp(argv[4], "tu11x") ? "TU117" : argv[4];
+        const char *name = argc < 5 ? "TU117" : !strcmp(argv[4], "tu10x") ? "TU102" : !strcmp(argv[4], "tu11x") ? "TU117"
+                         : !strcmp(argv[4], "ga10x") ? "GA102" : !strcmp(argv[4], "ad10x") ? "AD102" : argv[4];
         const nv_chip *chip = nv_chip_find_name(name);
         if (!chip) {
             fprintf(stderr, "unknown chip %s\n", name);

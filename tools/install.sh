@@ -57,6 +57,19 @@ FW=firmware/nvidia
 FW_BASE=https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/nvidia
 FW_FILES=(tu102/gsp/gsp tu102/gsp/bootloader tu102/gsp/gen_bootloader
           tu102/gsp/booter_load tu102/gsp/booter_unload tu116/gsp/booter_load tu116/gsp/booter_unload)
+# An Ampere or Ada GPU (experimental, see docs/firmware-and-boot.md) also needs its
+# architecture's GSP-RM and bootloader and its own chip's booters (the table mirrors
+# src/nv_hal.cpp; known only once the kext is loaded).
+case $(ioreg -r -c NVBringup -d 1 2>/dev/null | awk -F' = ' '/"NVChipset"/{print $2; exit}') in
+    370) FW_ARCH=ga102; FW_CHIP=ga102 ;;  371) FW_ARCH=ga102; FW_CHIP=ga103 ;;
+    372) FW_ARCH=ga102; FW_CHIP=ga104 ;;  374) FW_ARCH=ga102; FW_CHIP=ga106 ;;
+    375) FW_ARCH=ga102; FW_CHIP=ga107 ;;
+    402) FW_ARCH=ad102; FW_CHIP=ad102 ;;  403) FW_ARCH=ad102; FW_CHIP=ad103 ;;
+    404) FW_ARCH=ad102; FW_CHIP=ad104 ;;  406) FW_ARCH=ad102; FW_CHIP=ad106 ;;
+    407) FW_ARCH=ad102; FW_CHIP=ad107 ;;
+    *)   FW_ARCH=; FW_CHIP= ;;
+esac
+[[ -n $FW_ARCH ]] && FW_FILES+=($FW_ARCH/gsp/gsp $FW_ARCH/gsp/bootloader $FW_CHIP/gsp/booter_load $FW_CHIP/gsp/booter_unload)
 ACCEL=/Library/Extensions/NVMetalAccel.kext
 SYS_BUNDLE=/System/Library/Extensions/NVMetal.bundle
 BA=" $(sysctl -n kern.bootargs 2>/dev/null) "
@@ -94,7 +107,7 @@ daemon_current() {
     cmp -s build/nvgsp "$DAEMON_DIR/nvgsp" && cmp -s tools/daemon/gsp_boot.sh "$DAEMON_DIR/gsp_boot.sh" &&
         cmp -s tools/daemon/com.nvbringup.gsp.plist /Library/LaunchDaemons/com.nvbringup.gsp.plist || return 1
     local f
-    for f in $FW/{tu102,tu116}/gsp/*-570.144.bin(N); do
+    for f in $FW/*/gsp/*-570.144.bin(N); do
         [[ $f == *gen_bootloader* ]] && continue
         sudo -n cmp -s $f "$DAEMON_DIR/firmware/${f#$FW/}" 2>/dev/null || return 1
     done

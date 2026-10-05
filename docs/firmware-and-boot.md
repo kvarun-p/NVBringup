@@ -39,6 +39,10 @@ path**. VT-d
 is active on the machine, so every GPU DMA buffer is mapped with `IODMACommand` and the GPU gets
 an IOVA.
 
+On GA10x and Ada the VBIOS carries a v3 descriptor instead: the ucode is a PKC-signed HS image
+(RSA-3K signatures, one per fuse version, stored after the descriptor) that the GSP falcon's own
+DMA engine loads and its boot ROM verifies; there is no generic bootloader. See the HAL section.
+
 Other choices here:
 - **Bootloader format:** linux-firmware ships `.bin` files, not nova-core's `.tlv`, so they're
   parsed the way nouveau does.
@@ -116,11 +120,11 @@ What differs between GPU architectures is small next to what GSP-RM does for eve
 so it lives in one kext behind a table, as in NVIDIA's own driver (its `_TU102`, `_GA102`
 function variants), nouveau and nova-core:
 
-| Part | Where | Turing |
-|---|---|---|
-| Chips: name, firmware folders, ELF signature section, experimental flag | `nv_chips` in `src/nv_hal.cpp` | TU102/104/106 (booters `tu102`), TU116/117 (`tu116`) |
-| Architecture data: engine classes, SM level, GSP-RM heap and WPR2 layout | `nv_arch` in `src/nv_hal.cpp` | `TURING_*` classes, sm 7.5, `nv_wpr2_layout_tu1xx` |
-| Boot sequences: falcon reset, FWSEC, GSP-RM start, sequencer CORE_RESUME, teardown | `NVBringup::Hal`, `src/hal_tu1xx.cpp` | generic bootloader + FWSEC v2; booter_load/unload on SEC2 |
+| Part | Where | Turing | Ampere GA10x, Ada |
+|---|---|---|---|
+| Chips: name, firmware folders, ELF signature section, experimental flag | `nv_chips` in `src/nv_hal.cpp` | TU102/104/106 (booters `tu102`), TU116/117 (`tu116`) | GA102..GA107, AD102..AD107, booters from the chip's own folder; experimental |
+| Architecture data: engine classes, SM level, GSP-RM heap and WPR2 layout, display fuse and FB-size registers | `nv_arch` in `src/nv_hal.cpp` | `TURING_*` classes, sm 7.5, LibOS2 heap | `AMPERE_*`/`ADA_*` classes, sm 8.6/8.9, LibOS3 heap (22 MiB carve-out, 88..280 MiB), `NV_USABLE_FB_SIZE_IN_MB` |
+| Boot sequences: falcon reset, FWSEC, GSP-RM start, sequencer CORE_RESUME, teardown | `NVBringup::Hal`, `src/hal_tu1xx.cpp`, `src/hal_ga10x.cpp` | generic bootloader + FWSEC v2; booters PIO-loaded on SEC2 | FWSEC v3 and booters are PKC-signed HS ucodes loaded by the falcon's DMA engine; the GSP is switched to RISC-V through `BCR_CTRL` |
 
 Everything else (GSP-RM messages and RPCs, channels, memory, the user-space interface, power) is
 shared. The host tools use the same table: `nvgsp boot` picks the firmware files from it, and
@@ -130,10 +134,45 @@ Separate kexts per architecture were considered and rejected: the per-architectu
 hundred lines, while a C++ interface between separately built kexts is fragile, and every extra
 kext is another file OpenCore must load in order at boot.
 
-Adding an architecture (Ampere/Ada next: the same r570 firmware, `gsp_ga10x`): its `nv_arch` and
-chips, with `experimental` set until it has run on hardware (boot-arg `nvexperimental=1` lets it
-boot); a `Hal` with NVIDIA's `_GA102` sequences (FWSEC v3 without the generic bootloader, the
-GA102 falcon reset, the scrubber on Ada); the v3 descriptor in `nv_fwsec.cpp`; and the firmware
-folders in `install_daemon.sh`, `install.sh` and `verify_install.sh`. Check also the GFW-boot
-wait (`NVPower.cpp`, `kgspWaitForGfwBootOk_TU102`), the interrupt tree and the page-table
-kinds against r570.
+### Ampere GA10x and Ada: what the HAL does differently, and what is untested
+
+`hal_ga10x.cpp` follows r570's `_GA102` functions (`kflcnResetIntoRiscv_GA102`,
+`kgspExecuteHsFalcon_GA102`, `kgspExecuteSequencerCommand_GA102`; `kgspBootstrap_TU102` and
+`kgspTeardown_TU102` are shared with Turing) and nouveau's `ga102.c` files, which boot the same
+firmware on Linux. It has **not run on hardware**: every GA10x and AD10x chip is marked
+experimental, so FWSEC and GSP-RM only run with boot-arg `nvexperimental=1`.
+
+- **Falcon reset** (`kflcnReset_TU102` as built for GA102): wait for `HWCFG2.RESET_READY`, toggle
+  the engine reset, wait for `HWCFG2.MEM_SCRUBBING`, and switch a falcon that had its RISC-V core
+  selected back to falcon mode (`BCR_CTRL`). The GSP is reset *into* RISC-V before the booter
+  starts it (`BCR_CTRL` = core select RISC-V, valid, BR fetch). RISC-V is active when
+  `NV_PRISCV_RISCV_CPUCTL` says so, not `CORE_SWITCH_RISCV_STATUS`.
+- **HS ucodes** (FWSEC v3 from the VBIOS, the booters): one system-memory image, mapped through
+  the IOMMU. The falcon DMAs its code into IMEM (secure, tagged with its virtual base, which is
+  also the boot vector) and its data into DMEM in 256-byte blocks; the boot ROM is told where
+  the PKC signature sits in DMEM, the engine id mask and the ucode id, and verifies it before
+  the code runs. The signature is chosen by the chip's fuse version register for that ucode id
+  (`NV_FUSE_OPT_FPF_GSP_UCODE<n>_VERSION` for FWSEC, `..._SEC2_...` for the booters): FWSEC's
+  descriptor lists the versions it carries signatures for as a bit mask (`nv_fwsec_sig_index`),
+  a booter's meta data gives the version of its first signature (`nv_booter_sig_index`, as
+  nouveau's `ga100_flcn_fw_signature`).
+- **Heap and layout**: GSP-RM is LibOS3 on GA10x and later, so the heap gets a 22 MiB OS
+  carve-out and 88..280 MiB bounds (`gsp_fw_heap.h`); the WPR2 layout around it is Turing's.
+  On Ada NVIDIA runs a scrubber ucode from its driver package first
+  (`kgspExecuteScrubberIfNeeded_AD102`), which lets the heap leave the 256 MiB the VBIOS
+  pre-scrubs. linux-firmware doesn't ship it, so the heap stays inside that region, as it does
+  for nouveau; the scrubber's handoff state (`BSI_SECURE_SCRATCH_15`) is logged.
+- **Registers that moved**: the display fuse (`NV_FUSE_STATUS_OPT_DISPLAY` at 0x820c04 on GA100
+  and later) and the VRAM size, which the VBIOS reports in `NV_USABLE_FB_SIZE_IN_MB` (nouveau
+  `ga102_fb_vidmem_size`), with `LOCAL_MEMORY_RANGE` as the fallback. The GFW-boot wait
+  (`NVPower.cpp`), the WPR2 registers, the interrupt tree, the MSI re-arm, the PRAMIN window and
+  the page-table kinds are the same as Turing's in r570.
+- **Log buffers**: r570 adds a `LOGKRNL` region for LibOS3; the four Turing regions are passed,
+  as nouveau passes three, since the firmware looks them up by id.
+- **GA100** (A100) is left out: no FRTS, LibOS2, Turing-style falcons with a GA100-specific
+  signature section, and nothing to test it on.
+
+Checks before running on hardware, in order: `vbios_tool <rom>` on a dump of the card's VBIOS
+(v3 descriptor, DMEMMAPPER, signature versions), `vbios_tool --gsp firmware/nvidia <vram> GA104`
+(or the chip's name) for the firmware and layout, then boot with `nvfwsec=1` alone and read
+`NVFrtsResult` and the log before adding `nvgsp=1`.

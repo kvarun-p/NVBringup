@@ -38,9 +38,16 @@ KEXT_UP=0; [[ -s "$TMP/ioreg.plist" ]] && plutil -extract 0 raw -o /dev/null "$T
 prop() { plutil -extract "0.$1" raw -o - "$TMP/ioreg.plist" 2>/dev/null; }
 
 CHIPSET=$(prop NVChipset); CHIPSET=${CHIPSET:-0}
+# ARCH: the directory with GSP-RM and its bootloader; GROUP: the one with this chip's booters
+# (Turing: per group; Ampere GA10x and Ada: per chip; the table mirrors src/nv_hal.cpp).
+ARCH=tu102
 case $CHIPSET in
     354|356|358) GROUP=tu102 ;;   # TU102 TU104 TU106
     359|360)     GROUP=tu116 ;;   # TU117 TU116
+    370) ARCH=ga102; GROUP=ga102 ;;  371) ARCH=ga102; GROUP=ga103 ;;  372) ARCH=ga102; GROUP=ga104 ;;
+    374) ARCH=ga102; GROUP=ga106 ;;  375) ARCH=ga102; GROUP=ga107 ;;
+    402) ARCH=ad102; GROUP=ad102 ;;  403) ARCH=ad102; GROUP=ad103 ;;  404) ARCH=ad102; GROUP=ad104 ;;
+    406) ARCH=ad102; GROUP=ad106 ;;  407) ARCH=ad102; GROUP=ad107 ;;
     *)           GROUP= ;;
 esac
 
@@ -52,21 +59,29 @@ typeset -A SIZE=(
     tu102/gsp/booter_load-570.144.bin 59272     tu102/gsp/booter_unload-570.144.bin 39304
     tu116/gsp/booter_load-570.144.bin 59016     tu116/gsp/booter_unload-570.144.bin 39048
 )
-for f in tu102/gsp/gsp-570.144.bin tu102/gsp/bootloader-570.144.bin tu102/gsp/gen_bootloader-570.144.bin \
-         {tu102,tu116}/gsp/booter_{load,unload}-570.144.bin; do
+if [[ $ARCH == tu102 ]]; then
+    FWLIST=(tu102/gsp/gsp-570.144.bin tu102/gsp/bootloader-570.144.bin tu102/gsp/gen_bootloader-570.144.bin
+            {tu102,tu116}/gsp/booter_{load,unload}-570.144.bin)
+else
+    FWLIST=($ARCH/gsp/gsp-570.144.bin $ARCH/gsp/bootloader-570.144.bin tu102/gsp/gen_bootloader-570.144.bin
+            $GROUP/gsp/booter_{load,unload}-570.144.bin)
+fi
+for f in $FWLIST; do
     g=${f%%/*}
     needed=1
     [[ $f == *booter* && -n "$GROUP" && $g != "$GROUP" ]] && needed=0   # the other chip group's booters
     if [[ ! -f $FW/$f ]]; then
         if (( needed )); then fail "$f missing" "download it (README, step 1)"
         else warn "$f missing (only for $([[ $g == tu102 ]] && print TU102/104/106 || print TU116/117), not this GPU)"; fi
+    elif [[ -z ${SIZE[$f]:-} ]]; then
+        pass "$f (present; size not checked for this architecture)"
     elif [[ $(stat -f %z $FW/$f) != ${SIZE[$f]} ]]; then
         fail "$f has $(stat -f %z $FW/$f) bytes, expected ${SIZE[$f]}" "download it again (release 570.144)"
     else
         pass "$f"
     fi
 done
-[[ -z "$GROUP" ]] && warn "chip unknown (kext not loaded): both booter groups were treated as needed"
+[[ -z "$GROUP" ]] && warn "chip unknown (kext not loaded): both Turing booter groups were treated as needed"
 
 # ---------------------------------------------------------------------------------------------
 step "2. Build (make)"
@@ -80,8 +95,8 @@ for t in nvgsp nvtest vbios_tool; do
 done
 if [[ -x build/vbios_tool ]]; then
     build/vbios_tool --selftest >/dev/null 2>&1 && pass "parser self-test" || fail "parser self-test failed" "build/vbios_tool --selftest"
-    if [[ -n "$GROUP" && -f $FW/tu102/gsp/gsp-570.144.bin ]]; then
-        grp=tu11x; [[ $GROUP == tu102 ]] && grp=tu10x
+    if [[ -n "$GROUP" && -f $FW/$ARCH/gsp/gsp-570.144.bin ]]; then
+        grp=$(prop NVChipName); grp=${grp:-TU117}
         vram=$(( $(prop NVVramSize || echo 0) >> 20 ))
         if build/vbios_tool --gsp $FW ${vram:-4096} $grp > "$TMP/gsp.txt" 2>&1; then
             pass "firmware parses for this GPU ($grp, WPR2 layout for ${vram} MiB)"
@@ -109,10 +124,13 @@ for a in nvfwsec=1 nvgsp=1; do
 done
 [[ "$BA" == *" -wegnoegpu "* ]] && fail "boot-arg -wegnoegpu is set: WhateverGreen terminates the GPU device" "remove it"
 if (( KEXT_UP )); then
-    if [[ -n "$GROUP" ]]; then
+    if [[ -n "$GROUP" && $ARCH == tu102 ]]; then
         pass "Turing chip: $(prop NVChipName) ($(prop NVGpuName || echo name after GSP-RM boot)), $(( $(prop NVVramSize) >> 20 )) MiB VRAM"
+    elif [[ -n "$GROUP" ]]; then
+        warn "$(prop NVArch) chip $(prop NVChipName) ($(prop NVGpuName || echo name after GSP-RM boot)), $(( $(prop NVVramSize) >> 20 )) MiB VRAM: experimental, untested on hardware" "boot-arg nvexperimental=1 lets it run FWSEC and GSP-RM (docs/firmware-and-boot.md)"
+        [[ "$BA" == *" nvexperimental=1 "* ]] && pass "boot-arg nvexperimental=1" || fail "boot-arg nvexperimental=1 missing (this chip is experimental)" "add it to boot-args in config.plist"
     else
-        fail "chip $(prop NVChipName) (0x$(printf %x $CHIPSET)) is not a supported Turing chip"
+        fail "chip $(prop NVChipName) (0x$(printf %x $CHIPSET)) is not a supported chip (Turing; experimental: Ampere GA10x, Ada)"
     fi
     frts=$(prop NVFrtsResult)
     case $frts in
@@ -131,7 +149,7 @@ step "4. Boot daemon (sudo tools/install_daemon.sh)"
 if [[ -x "$DAEMON_DIR/nvgsp" && -f "$DAEMON_DIR/gsp_boot.sh" ]]; then
     pass "nvgsp and gsp_boot.sh in $DAEMON_DIR"
     cmp -s "$DAEMON_DIR/nvgsp" build/nvgsp || warn "the daemon's nvgsp differs from build/nvgsp" "sudo tools/install_daemon.sh to update it"
-    dfw=(tu102/gsp/gsp-570.144.bin tu102/gsp/bootloader-570.144.bin)
+    dfw=($ARCH/gsp/gsp-570.144.bin $ARCH/gsp/bootloader-570.144.bin)
     [[ -n "$GROUP" ]] && dfw+=($GROUP/gsp/booter_load-570.144.bin $GROUP/gsp/booter_unload-570.144.bin)
     for f in $dfw; do
         [[ -f "$DAEMON_DIR/firmware/$f" ]] || fail "daemon firmware $f missing" "sudo tools/install_daemon.sh"

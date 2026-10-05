@@ -93,8 +93,9 @@ static int cmd_boot(const std::string &dir)
     io_service_t s = find_driver();
     if (!s)
         return 1;
-    // GSP-RM and its bootloader are shared per architecture (Turing: linux-firmware nvidia/tu102);
-    // the booters are signed per chip group (TU102/TU104/TU106: tu102, TU116/TU117: tu116). nv_hal.cpp.
+    // GSP-RM and its bootloader are shared per architecture (linux-firmware nvidia/tu102, ga102,
+    // ad102); the booters are signed per chip group (TU102/TU104/TU106: tu102, TU116/TU117:
+    // tu116) or per chip (GA10x, AD10x: the chip's own directory). nv_hal.cpp.
     uint32_t chipset = driver_chipset(s);
     const nv_chip *chip = nv_chip_find(chipset);
     if (!chip) {

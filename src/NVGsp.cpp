@@ -289,8 +289,9 @@ IOReturn NVBringup::bootGsp()
     OSSynchronizeIO();
     wr32(NV_PGSP_QUEUE_HEAD(0), 0);     // doorbell, as NVIDIA does after each push
 
-    // ---- 3-5. Start GSP-RM (HAL; on Turing booter_load on SEC2 starts the GSP's RISC-V core)
+    // ---- 3-5. Start GSP-RM (HAL; booter_load on SEC2 starts the GSP's RISC-V core)
     g->touched = true;
+    g->appVersion = gbl.app_version;
     if (!(this->*hal_->gspStart)(gbl.app_version))
         goto fail;
 
@@ -308,7 +309,7 @@ IOReturn NVBringup::bootGsp()
         if (res == 0) {
             LOG("GSP: FAILED: no GSP_INIT_DONE within %u s (queue %s; GSP mailbox0 0x%x, RISC-V %s)",
                 limitMs / 1000, g->linked ? "up" : "never came up", grd(NV_FALCON_MAILBOX0),
-                (rd32(NV_PRISCV_GSP_BASE + NV_PRISCV_CORE_SWITCH_RISCV_STATUS) & 1) ? "active" : "stopped");
+                riscvActive() ? "active" : "stopped");
             goto fail;
         }
     }

@@ -37,9 +37,10 @@ private:
     const nv_chip *chip_ = nullptr;     // nullptr: not a supported chip (nv_hal.h)
 
     // HAL: the sequences that differ per architecture, chosen in identifyChip from chip_->arch
-    // (hal_tu1xx.cpp for Turing). Named after NVIDIA's per-chip HAL functions they follow.
+    // (hal_tu1xx.cpp for Turing, hal_ga10x.cpp for Ampere GA10x and Ada). Named after NVIDIA's
+    // per-chip HAL functions they follow.
     struct Hal {
-        // kflcnReset: reset a falcon (GSP or SEC2), wait for its memory scrubbing
+        // kflcnReset: reset a falcon (GSP or SEC2) into falcon mode, wait for its memory scrubbing
         bool (NVBringup::*falconReset)(uint32_t base);
         // kgspExecuteFwsec: FWSEC from the VBIOS, FRTS (cmd NV_DMEMMAPPER_CMD_FRTS, at boot) or SB (unload)
         bool (NVBringup::*runFwsec)(const uint8_t *rom, const nv_fwsec &f, uint32_t cmd, uint64_t frts);
@@ -50,9 +51,11 @@ private:
         bool (NVBringup::*gspResume)();
         // kgspTeardown, once GSP-RM has suspended: hand the GPU back to the VBIOS and clear WPR2
         bool (NVBringup::*gspTeardown)();
+        // kflcnIsRiscvActive: the GSP's RISC-V core is running
+        bool (NVBringup::*riscvActive)();
     };
     const Hal *hal_ = nullptr;
-    static const Hal halTu1xx;
+    static const Hal halTu1xx, halGa10x;
     const char *chipRefusal() const;    // why GSP-RM can't run on this chip, or nullptr
 
     // Boot-time IOLog output is lost before logd starts, so every log line is
@@ -104,6 +107,11 @@ private:
     // cmd: NV_DMEMMAPPER_CMD_FRTS (boot, needs frts) or NV_DMEMMAPPER_CMD_SB (unload)
     bool runFwsec(const uint8_t *rom, const nv_fwsec &f, uint32_t cmd, uint64_t frts)
         { return hal_ && (this->*hal_->runFwsec)(rom, f, cmd, frts); }
+    bool riscvActive() { return hal_ && (this->*hal_->riscvActive)(); }
+    // After FWSEC halted: the result registers for FRTS (WPR2 created at frts, no error in
+    // SW_SCRATCH_0E) or SB (GFW privilege mask lowered, GFW boot complete, no SB error);
+    // kgspExecuteFwsec_TU102, shared by the HALs. Logs under `tag`, publishes NVWpr2Lo/Hi.
+    bool fwsecCheck(const char *tag, uint32_t cmd, uint64_t frts, uint32_t mbox0, uint32_t mbox1);
     // Turing (hal_tu1xx.cpp)
     bool tu1xxFalconReset(uint32_t base);
     bool tu1xxRunFwsec(const uint8_t *rom, const nv_fwsec &f, uint32_t cmd, uint64_t frts);
@@ -111,6 +119,29 @@ private:
     bool tu1xxGspStart(uint32_t appVersion);
     bool tu1xxGspResume();
     bool tu1xxGspTeardown();
+    bool tu1xxRiscvActive();
+    // Ampere GA10x and Ada (hal_ga10x.cpp). An HS ucode (FWSEC v3 from the VBIOS, a booter)
+    // is PKC-signed and loaded with the falcon's DMA engine from one system-memory image:
+    // HsImage says where its code and data are and what the boot ROM must be told.
+    struct HsImage {
+        const uint8_t *data;        // the image (code and data), copied into a DMA buffer
+        uint32_t size;
+        uint32_t code_img, code_size, code_pa, code_va;   // IMEM: image offset, bytes, IMEM address, tag and boot vector
+        uint32_t data_img, data_size, data_pa;            // DMEM: image offset, bytes, DMEM address
+        uint32_t sig_dmem;          // DMEM offset of the signature (BROM_PARAADDR 0)
+        uint32_t engine_id, ucode_id;
+    };
+    bool ga10xResetCore(uint32_t base);     // reset and wait for memory scrubbing; the core selection stays
+    bool ga10xFalconReset(uint32_t base);
+    bool ga10xResetIntoRiscv();
+    bool ga10xRunHs(const char *tag, uint32_t base, const HsImage &hs, uint32_t mbox0, uint32_t mbox1,
+                    uint32_t waitMs, uint32_t *mboxOut);
+    bool ga10xRunFwsec(const uint8_t *rom, const nv_fwsec &f, uint32_t cmd, uint64_t frts);
+    bool ga10xRunBooter(uint32_t kind, uint32_t mbox0, uint32_t mbox1);
+    bool ga10xGspStart(uint32_t appVersion);
+    bool ga10xGspResume();
+    bool ga10xGspTeardown();
+    bool ga10xRiscvActive();
     bool frtsOk_ = false;       // FRTS succeeded this boot; GSP-RM boot requires it
     uint64_t frtsAddr_ = 0, vgaAddr_ = 0, vramSize_ = 0;
 

@@ -23,23 +23,11 @@ static bool fail(nv_fwsec *f, const char *why)
     return false;
 }
 
-bool nv_fwsec_parse(const nv_vbios *v, nv_fwsec *f)
+// v2 (Turing): FALCON_UCODE_DESC_V2, the ucode image right after it, DMEM at DMEMOffset.
+static bool parse_v2(const nv_vbios *v, nv_fwsec *f, uint32_t img_end)
 {
-    memset(f, 0, sizeof(*f));
-    if (v->desc_version != 2)
-        return fail(f, "FWSEC descriptor is not v2 (Turing)");
     if (v->desc_size != NV_FWSEC_DESC_V2_SIZE)
         return fail(f, "FWSEC v2 descriptor has unexpected size");
-
-    // The descriptor and ucode must lie within the FWSEC image that holds them.
-    uint32_t img_end = 0;
-    for (uint32_t i = 0; i < v->nimages; i++) {
-        const nv_rom_image &im = v->img[i];
-        if (im.type == NV_IMAGE_FWSEC && v->desc_rom >= im.offset && v->desc_rom < im.offset + im.size)
-            img_end = im.offset + im.size;
-    }
-    if (!img_end)
-        return fail(f, "FWSEC descriptor is not inside a FWSEC image");
     if (v->desc_rom + NV_FWSEC_DESC_V2_SIZE > img_end)
         return fail(f, "FWSEC descriptor runs past its image");
 
@@ -72,6 +60,7 @@ bool nv_fwsec_parse(const nv_vbios *v, nv_fwsec *f)
     f->sec_img   = f->imem_sec_base - f->imem_virt_base;
     f->sec_size  = f->imem_sec_size;
     f->sec_imem  = f->imem_phys_base + f->sec_img;     // as nova-core: phys base + offset
+    f->sec_va    = f->imem_sec_base;
     if (f->sec_img + f->sec_size > f->imem_load_size)
         return fail(f, "FWSEC secure IMEM runs past the IMEM load size");
     if ((f->nsec_size | f->sec_size | f->sec_imem) & 0xff)
@@ -85,6 +74,83 @@ bool nv_fwsec_parse(const nv_vbios *v, nv_fwsec *f)
     if ((f->dmem_size | f->dmem_addr) & 3)
         return fail(f, "FWSEC DMEM not 4-byte aligned");
     f->boot_vector = f->virtual_entry;
+    return true;
+}
+
+// v3 (GA10x+): FALCON_UCODE_DESC_V3 (44 bytes), then SignatureCount PKC signatures (the
+// descriptor's header size covers both), then the ucode image: all of IMEM (secure, loaded
+// at IMEMPhysBase, tagged from IMEMVirtBase) followed by DMEM (r570 s_vbiosFillFlcnUcodeFromDescV3,
+// nouveau nvkm_gsp_fwsec_v3).
+static bool parse_v3(const nv_vbios *v, nv_fwsec *f, uint32_t img_end)
+{
+    if (v->desc_size < NV_FWSEC_DESC_V3_SIZE)
+        return fail(f, "FWSEC v3 descriptor too small");
+    if (v->desc_size > img_end - v->desc_rom)
+        return fail(f, "FWSEC descriptor runs past its image");
+
+    const uint8_t *d = v->rom + v->desc_rom;
+    f->stored_size      = rd32(d + 0x04);
+    f->pkc_data_off     = rd32(d + 0x08);
+    f->interface_offset = rd32(d + 0x0c);
+    f->imem_phys_base   = rd32(d + 0x10);
+    f->imem_load_size   = rd32(d + 0x14);
+    f->imem_virt_base   = rd32(d + 0x18);
+    f->dmem_phys_base   = rd32(d + 0x1c);
+    f->dmem_load_size   = rd32(d + 0x20);
+    f->engine_id_mask   = rd16(d + 0x24);
+    f->ucode_id         = d[0x26];
+    f->sig_count        = d[0x27];
+    f->sig_versions     = rd16(d + 0x28);
+    f->uncompressed_size = f->stored_size;
+
+    f->sigs_rom  = v->desc_rom + NV_FWSEC_DESC_V3_SIZE;
+    f->image_rom = v->desc_rom + v->desc_size;
+    if (f->sig_count == 0 || (uint32_t)f->sig_count * NV_FWSEC_V3_SIG_SIZE > v->desc_size - NV_FWSEC_DESC_V3_SIZE)
+        return fail(f, "FWSEC v3 signatures don't fit the descriptor");
+    if (f->stored_size > img_end - f->image_rom)
+        return fail(f, "FWSEC ucode runs past its image");
+
+    f->nsec_img  = f->nsec_size = f->nsec_imem = 0;
+    f->sec_img   = 0;
+    f->sec_size  = f->imem_load_size;
+    f->sec_imem  = f->imem_phys_base;
+    f->sec_va    = f->imem_virt_base;
+    if (f->sec_size == 0 || f->sec_size > f->stored_size)
+        return fail(f, "FWSEC IMEM load size outside the ucode image");
+    if ((f->sec_size | f->sec_imem | f->sec_va) & 0xff)
+        return fail(f, "FWSEC IMEM section is not 256-byte aligned");
+
+    f->dmem_img  = f->imem_load_size;
+    f->dmem_size = f->dmem_load_size;
+    f->dmem_addr = f->dmem_phys_base;
+    if (f->dmem_size == 0 || f->dmem_img + f->dmem_size > f->stored_size)
+        return fail(f, "FWSEC DMEM outside the ucode image");
+    if ((f->dmem_size | f->dmem_addr) & 3)
+        return fail(f, "FWSEC DMEM not 4-byte aligned");
+    if (f->pkc_data_off + NV_FWSEC_V3_SIG_SIZE > f->dmem_size || (f->pkc_data_off & 3))
+        return fail(f, "FWSEC v3 signature slot outside DMEM");
+    f->boot_vector = f->imem_virt_base;
+    return true;
+}
+
+bool nv_fwsec_parse(const nv_vbios *v, nv_fwsec *f)
+{
+    memset(f, 0, sizeof(*f));
+    if (v->desc_version != 2 && v->desc_version != 3)
+        return fail(f, "FWSEC descriptor is neither v2 (Turing) nor v3 (GA10x+)");
+    f->version = v->desc_version;
+
+    // The descriptor and ucode must lie within the FWSEC image that holds them.
+    uint32_t img_end = 0;
+    for (uint32_t i = 0; i < v->nimages; i++) {
+        const nv_rom_image &im = v->img[i];
+        if (im.type == NV_IMAGE_FWSEC && v->desc_rom >= im.offset && v->desc_rom < im.offset + im.size)
+            img_end = im.offset + im.size;
+    }
+    if (!img_end)
+        return fail(f, "FWSEC descriptor is not inside a FWSEC image");
+    if (!(f->version == 2 ? parse_v2(v, f, img_end) : parse_v3(v, f, img_end)))
+        return false;
 
     // Application interface table in DMEM.
     const uint8_t *dmem = v->rom + f->image_rom + f->dmem_img;
@@ -179,6 +245,32 @@ bool nv_fwsec_patch_sb(const nv_fwsec *f, uint8_t *dmem)
     return true;
 }
 
+// s_prepareForFwsec_TU102 (r570), BOOT_FROM_HS branch, and nouveau ga102_gsp_fwsec_signature:
+// the fuse version is bit (highest set bit + 1) of sig_versions; the signature for it is
+// stored after the ones for the lower set bits.
+bool nv_fwsec_sig_index(const nv_fwsec *f, uint32_t fuse_reg, uint32_t *index)
+{
+    if (f->version != 3)
+        return false;
+    uint32_t ver = 0;
+    for (uint32_t v = fuse_reg; v; v >>= 1)
+        ver++;
+    if (ver >= 16 || !(f->sig_versions & (1u << ver)))
+        return false;
+    uint32_t idx = 0;
+    for (uint32_t bit = 0; bit < ver; bit++)
+        idx += (f->sig_versions >> bit) & 1;
+    if (idx >= f->sig_count)
+        return false;
+    *index = idx;
+    return true;
+}
+
+void nv_fwsec_patch_sig(const nv_fwsec *f, const uint8_t *rom, uint8_t *dmem, uint32_t index)
+{
+    memcpy(dmem + f->pkc_data_off, rom + f->sigs_rom + index * NV_FWSEC_V3_SIG_SIZE, NV_FWSEC_V3_SIG_SIZE);
+}
+
 // ---- Generic bootloader ----------------------------------------------------
 
 bool nv_genbl_parse(const uint8_t *bin, uint32_t len, nv_genbl *bl)
@@ -230,6 +322,8 @@ bool nv_fwsec_bl_desc(const nv_fwsec *f, uint64_t dma_base, uint8_t out[NV_BL_DM
     // The descriptor uses one offset as both DMA source and IMEM destination, so
     // the buffer must mirror IMEM; the bootloader always copies data to DMEM 0.
     uint32_t pad = nv_fwsec_dma_padding(f);
+    if (f->version != 2)
+        return false;
     if (f->sec_imem < f->sec_img || f->nsec_imem != f->nsec_img + pad || f->dmem_addr != 0)
         return false;
     if (dma_base & 0xff)

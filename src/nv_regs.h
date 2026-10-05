@@ -19,7 +19,17 @@
 #define NV_PFB_PRI_MMU_WPR2_ADDR_LO 0x001fa824  // bits 31:4 = address >> 12
 #define NV_PFB_PRI_MMU_WPR2_ADDR_HI 0x001fa828  // exclusive bound; 0 = WPR2 not set
 #define NV_FUSE_STATUS_OPT_DISPLAY 0x00021c04   // bit 0: display disabled (gm107..tu1xx)
+#define NV_FUSE_STATUS_OPT_DISPLAY_GA100 0x00820c04  // the same fuse on GA100 and later (ga100 dev_fuse.h)
 #define NV_PDISP_VGA_WORKSPACE_BASE 0x00625f04  // bits 31:8 = addr >> 16, bit 3 = valid
+// GA102+: usable FB size in MiB, set by the VBIOS (NV_PGC6_AON_SECURE_SCRATCH_GROUP_42, ga102
+// dev_gc6_island_addendum.h NV_USABLE_FB_SIZE_IN_MB; nouveau ga102_fb_vidmem_size). 0 = unset.
+#define NV_USABLE_FB_SIZE_IN_MB     0x001183a4
+// GA10x+ fuse versions of PKC-signed ucodes, one register per ucode id (ga100 dev_fuse.h); the
+// highest set bit + 1 is the version a signature must carry (kgspReadUcodeFuseVersion_GA100).
+#define NV_FUSE_OPT_FPF_NVDEC_UCODE1_VERSION 0x00824100
+#define NV_FUSE_OPT_FPF_SEC2_UCODE1_VERSION  0x00824140
+#define NV_FUSE_OPT_FPF_GSP_UCODE1_VERSION   0x008241c0
+#define NV_FUSE_OPT_FPF_UCODE_VERSION_COUNT  16
 #define NV_THERM_TSENSOR        0x00020460  // bit 29 valid, 16:3 temperature in 1/32 °C (nouveau gp100_temp_get)
 
 // GSP falcon (nova-core regs.rs, falcon/gsp.rs). Offsets are relative to NV_PGSP.
@@ -41,7 +51,36 @@
 #define NV_FALCON_FBIF_CTL          0x624   // bit 7 allow_phys_no_ctx
 
 #define NV_FALCON_OS                0x080   // GSP: RISC-V bootloader app version
-#define NV_FALCON_HWCFG2            0x0f4   // bit 10: RISC-V core present
+#define NV_FALCON_HWCFG2            0x0f4   // bit 10: RISC-V core present; GA10x+: bit 12 memory scrubbing, bit 31 reset ready
+
+// Falcon DMA engine (GA10x+ load HS ucodes with it: kgspExecuteHsFalcon_GA102, ga102 dev_falcon_v4.h)
+#define NV_FALCON_DMATRFBASE        0x110   // source address >> 8, bits 31:0
+#define NV_FALCON_DMATRFMOFFS       0x114   // destination offset in IMEM/DMEM (23:0)
+#define NV_FALCON_DMATRFCMD         0x118   // bit 0 queue full, bit 1 idle, 3:2 sec, bit 4 imem, bit 5 write, 10:8 size, 14:12 ctxdma, bit 16 set_dmtag
+#define NV_FALCON_DMATRFFBOFFS      0x11c   // source offset (added to DMATRFBASE; IMEM tag = offset >> 8)
+#define NV_FALCON_DMATRFBASE1       0x128   // source address >> 40, bits 8:0
+#define NV_DMATRFCMD_FULL           (1u << 0)
+#define NV_DMATRFCMD_IDLE           (1u << 1)
+#define NV_DMATRFCMD_SEC            (1u << 2)
+#define NV_DMATRFCMD_IMEM           (1u << 4)
+#define NV_DMATRFCMD_SIZE_256B      (6u << 8)
+#define NV_HWCFG2_MEM_SCRUBBING     (1u << 12)
+#define NV_HWCFG2_RESET_READY       (1u << 31)
+
+// Second register space of a GA10x+ falcon (NV_FALCON2_*: GSP 0x111000, SEC2 0x841000; ga102
+// dev_riscv_pri.h, dev_falcon_second_pri.h), 0x1000 past the falcon's own.
+#define NV_FALCON2_OFFSET           0x1000
+#define NV_PRISCV_RISCV_CPUCTL      0x388   // bit 4 halted, bit 7 RISC-V active (GA10x+)
+#define NV_PRISCV_RISCV_CPUCTL_ACTIVE (1u << 7)
+#define NV_PRISCV_RISCV_BCR_CTRL    0x668   // bit 0 valid, bit 4 core select (1 RISC-V), bit 8 BR fetch
+#define NV_PRISCV_BCR_VALID         (1u << 0)
+#define NV_PRISCV_BCR_CORE_RISCV    (1u << 4)
+#define NV_PRISCV_BCR_BRFETCH       (1u << 8)
+#define NV_PFALCON2_FALCON_MOD_SEL  0x180   // 7:0 algorithm: 1 = RSA3K (PKC boot ROM)
+#define NV_PFALCON2_MOD_SEL_RSA3K   1u
+#define NV_PFALCON2_FALCON_BROM_CURR_UCODE_ID 0x198  // 7:0 ucode id (fuse version register index)
+#define NV_PFALCON2_FALCON_BROM_ENGIDMASK     0x19c
+#define NV_PFALCON2_FALCON_BROM_PARAADDR(i)   (0x210 + 4 * (i))  // (0): DMEM offset of the PKC signature
 
 // SEC2 falcon (r570 dev_sec_pri.h): same falcon register layout as the GSP's.
 #define NV_PSEC                     0x00840000
@@ -64,6 +103,9 @@
 // Set by SEC2 once it has restarted GSP-RM (sequencer CORE_RESUME, r570 dev_gc6_island.h)
 #define NV_PGC6_BSI_SECURE_SCRATCH_14 0x001180f8
 #define NV_BSI_SCRATCH_14_BOOT_STAGE_3_HANDOFF (1u << 26)
+// Ada: bits 31:29 = 3 once the scrubber ucode has run (kgspExecuteScrubberIfNeeded_AD102; logged only)
+#define NV_PGC6_BSI_SECURE_SCRATCH_15 0x001180fc
+#define NV_BSI_SCRATCH_15_SCRUBBER_HANDOFF_DONE 3u
 
 #define NV_HWCFG2_RISCV             (1u << 10)
 #define NV_IMEMC_SECURE             (1u << 28)

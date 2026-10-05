@@ -248,7 +248,7 @@ void NVBringup::logBars()
 const char *NVBringup::chipRefusal() const
 {
     if (!chip_ || !hal_)
-        return "chip not supported (Turing: TU102/104/106/116/117)";
+        return "chip not supported (Turing TU102/104/106/116/117; experimental: Ampere GA102..GA107, Ada AD102..AD107)";
     uint32_t exp = 0;
     if (chip_->experimental && (!PE_parse_boot_argn("nvexperimental", &exp, sizeof(exp)) || exp != 1))
         return "support for this chip is experimental (boot-arg nvexperimental=1)";
@@ -271,6 +271,8 @@ bool NVBringup::identifyChip()
     if (chip_) {
         switch (chip_->arch->id) {
         case NV_ARCH_TU1XX: hal_ = &halTu1xx; break;
+        case NV_ARCH_GA10X:
+        case NV_ARCH_AD10X: hal_ = &halGa10x; break;
         }
     }
     const char *name = chip_ ? chip_->name : "unknown";
@@ -496,17 +498,31 @@ void NVBringup::prepareFwsec(const uint8_t *buf, uint32_t len)
         LOG("FWSEC: parse failed: %s", f.err);
         return;
     }
-    LOG("FWSEC: IMEM nsec 0x%x@0x%x, sec 0x%x@0x%x; DMEM 0x%x@0x%x; boot 0x%x",
-        f.nsec_size, f.nsec_imem, f.sec_size, f.sec_imem, f.dmem_size, f.dmem_addr, f.boot_vector);
+    LOG("FWSEC: v%u: IMEM nsec 0x%x@0x%x, sec 0x%x@0x%x (tag 0x%x); DMEM 0x%x@0x%x; boot 0x%x",
+        f.version, f.nsec_size, f.nsec_imem, f.sec_size, f.sec_imem, f.sec_va, f.dmem_size, f.dmem_addr, f.boot_vector);
+    if (f.version == 3)
+        LOG("FWSEC: PKC: %u signature(s) for versions 0x%x, engine mask 0x%x, ucode id %u, signature slot at DMEM 0x%x",
+            f.sig_count, f.sig_versions, f.engine_id_mask, f.ucode_id, f.pkc_data_off);
     LOG("FWSEC: DMEMMAPPER v%u at DMEM 0x%x, command buffer 0x%x (0x%x bytes), mask0 0x%x",
         f.dmap_version, f.dmap_off, f.cmd_in_off, f.cmd_in_size, f.cmd_mask0);
 
+    // The registers that moved after Turing come from the architecture table; an unknown chip
+    // is read as Turing (the result is only logged: chipRefusal stops FRTS).
+    const nv_arch *arch = chip_ ? chip_->arch : nullptr;
     uint32_t range = rd32(NV_PFB_PRI_MMU_LOCAL_MEMORY_RANGE);
     uint64_t vram  = nv_vram_size(range);
+    uint32_t usable = (arch && arch->usable_fb_mb) ? rd32(arch->usable_fb_mb) : 0;
     uint32_t lo    = rd32(NV_PFB_PRI_MMU_WPR2_ADDR_LO);
     uint32_t hi    = rd32(NV_PFB_PRI_MMU_WPR2_ADDR_HI);
     uint32_t scr   = rd32(NV_PBUS_SW_SCRATCH_0E);
     LOG("FB: LOCAL_MEMORY_RANGE 0x%08x -> VRAM %llu MiB", range, (unsigned long long)(vram >> 20));
+    if (arch && arch->usable_fb_mb) {
+        // GA102+: the VBIOS reports the usable size (ga102_fb_vidmem_size, kmemsysGetUsableFbSize);
+        // LOCAL_MEMORY_RANGE is the fallback when it hasn't.
+        LOG("FB: USABLE_FB_SIZE_IN_MB %u (0x%08x)%s", usable, usable, usable ? "" : ": unset, using LOCAL_MEMORY_RANGE");
+        if (usable)
+            vram = (uint64_t)usable << 20;
+    }
     LOG("WPR2: lo 0x%08x hi 0x%08x (%s); SW_SCRATCH_0E 0x%08x",
         lo, hi, (hi >> 4) ? "ALREADY SET UP" : "not set up", scr);
 
@@ -517,7 +533,7 @@ void NVBringup::prepareFwsec(const uint8_t *buf, uint32_t len)
         LOG("FRTS: VRAM size implausible, not planning FRTS");
         return;
     }
-    uint32_t fuse   = rd32(NV_FUSE_STATUS_OPT_DISPLAY);
+    uint32_t fuse   = rd32(arch ? arch->fuse_display : NV_FUSE_STATUS_OPT_DISPLAY);
     bool display    = !(fuse & 1);
     uint32_t vgaReg = display ? rd32(NV_PDISP_VGA_WORKSPACE_BASE) : 0;
     uint64_t vga    = nv_vga_workspace(vram, display, vgaReg);
@@ -538,6 +554,8 @@ void NVBringup::prepareFwsec(const uint8_t *buf, uint32_t len)
     const char *why = nullptr;
     if (const char *c = chipRefusal())
         why = c;
+    else if (f.version != chip_->arch->fwsec_desc)
+        why = "FWSEC descriptor version doesn't match the chip's architecture";
     else if (hi >> 4)
         why = "WPR2 already set up; shut down fully to reset the GPU";
     else if (!vram)
@@ -561,6 +579,46 @@ void NVBringup::wr32(uint32_t offset, uint32_t value)
 {
     volatile uint32_t *base = (volatile uint32_t *)bar0_->getVirtualAddress();
     base[offset / 4] = value;
+}
+
+// kgspExecuteFwsec_TU102 after the falcon halted (every architecture checks the same
+// registers): FRTS must have created WPR2 at `frts` with no error in SW_SCRATCH_0E; SB must
+// have lowered the GFW privilege mask, completed the GFW boot, and left no error in VBIOS
+// scratch 0x15. mailbox0 must be 0 either way (nouveau checks it; NVIDIA doesn't).
+bool NVBringup::fwsecCheck(const char *tag, uint32_t cmd, uint64_t frts, uint32_t mbox0, uint32_t mbox1)
+{
+    bool ok = false;
+    if (cmd == NV_DMEMMAPPER_CMD_SB) {
+        uint32_t plm = rd32(NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK);
+        uint32_t gfw = rd32(NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_0_GFW_BOOT);
+        uint32_t err = rd32(NV_PBUS_VBIOS_SCRATCH_15) & 0xffff;
+        LOG("%s: halted; mailbox0 0x%x, PLM 0x%x, GFW boot 0x%x, SB error 0x%x", tag, mbox0, plm, gfw, err);
+        ok = mbox0 == 0 && (plm & 1) && (gfw & 0xff) == 0xff && err == 0;
+        LOG("%s: %s", tag, ok ? "SUCCESS" : "FAILED");
+        return ok;
+    }
+    uint32_t err   = rd32(NV_PBUS_SW_SCRATCH_0E) >> 16;
+    uint32_t wlo_r = rd32(NV_PFB_PRI_MMU_WPR2_ADDR_LO), whi_r = rd32(NV_PFB_PRI_MMU_WPR2_ADDR_HI);
+    uint64_t wlo   = nv_wpr2_addr(wlo_r), whi = nv_wpr2_addr(whi_r);
+    LOG("%s: halted; mailbox0 0x%x mailbox1 0x%x, FRTS error 0x%x, WPR2 0x%llx..0x%llx", tag,
+        mbox0, mbox1, err, (unsigned long long)wlo, (unsigned long long)whi);
+    setProperty("NVWpr2Lo", wlo_r, 32);
+    setProperty("NVWpr2Hi", whi_r, 32);
+    if (mbox0 != 0)
+        LOG("%s: FAILED: FWSEC returned error 0x%x", tag, mbox0);
+    else if (err != 0)
+        LOG("%s: FAILED: FRTS error code 0x%x", tag, err);
+    else if (!(whi_r >> 4))
+        LOG("%s: FAILED: WPR2 was not created", tag);
+    else if (wlo != frts)
+        LOG("%s: FAILED: WPR2 starts at 0x%llx, expected 0x%llx", tag,
+            (unsigned long long)wlo, (unsigned long long)frts);
+    else {
+        LOG("%s: SUCCESS: WPR2 created at 0x%llx..0x%llx", tag,
+            (unsigned long long)wlo, (unsigned long long)whi);
+        ok = true;
+    }
+    return ok;
 }
 
 bool NVBringup::falconWaitHalted(uint32_t ms, uint32_t base)

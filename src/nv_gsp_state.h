@@ -180,6 +180,7 @@ struct NVBringup::GspState {
     uint8_t *msgBuf = nullptr;      // MSG_MAX bytes: one message being built or read
     bool touched = false;   // GSP/SEC2 were reset or started: no retry until the next cold boot
     bool booted  = false;
+    uint32_t appVersion = 0;    // the RISC-V bootloader's app version (NV_FALCON_OS, written at boot and resume)
     bool leadWas = false, leadSet = false;
 
     // Phase 5: engines, the utility channel, GR context buffers, user connections

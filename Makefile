@@ -20,7 +20,7 @@ CFLAGS    := $(KFLAGS) -std=gnu11
 LDFLAGS   := $(ARCHFLAGS) -nostdlib -Xlinker -kext -Xlinker -export_dynamic \
              -lkmodc++ -lkmod -lcc_kext
 
-OBJS := $(BUILD)/NVBringup.o $(BUILD)/nv_hal.o $(BUILD)/hal_tu1xx.o $(BUILD)/nv_vbios.o $(BUILD)/nv_fwsec.o $(BUILD)/nv_gsp.o $(BUILD)/nv_gsp_rm.o $(BUILD)/nv_vram.o $(BUILD)/nv_mmu.o $(BUILD)/NVGsp.o $(BUILD)/NVBringupUserClient.o $(BUILD)/NVGpu.o $(BUILD)/NVGpuUserClient.o $(BUILD)/NVPower.o $(BUILD)/kmod_info.o
+OBJS := $(BUILD)/NVBringup.o $(BUILD)/nv_hal.o $(BUILD)/hal_tu1xx.o $(BUILD)/hal_ga10x.o $(BUILD)/nv_vbios.o $(BUILD)/nv_fwsec.o $(BUILD)/nv_gsp.o $(BUILD)/nv_gsp_rm.o $(BUILD)/nv_vram.o $(BUILD)/nv_mmu.o $(BUILD)/NVGsp.o $(BUILD)/NVBringupUserClient.o $(BUILD)/NVGpu.o $(BUILD)/NVGpuUserClient.o $(BUILD)/NVPower.o $(BUILD)/kmod_info.o
 TOOL := $(BUILD)/vbios_tool
 NVGSP := $(BUILD)/nvgsp
 NVTEST := $(BUILD)/nvtest

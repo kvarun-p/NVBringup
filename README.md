@@ -22,6 +22,13 @@ such as llama.cpp for local LLMs, run on the NVIDIA GPU. Optionally, a Metal dri
 Developed and tested on a laptop GeForce GTX 1650 (TU117). The other chips use the same code
 paths but have **not been tested**.
 
+**Experimental, never run on hardware:** Ampere **GA102..GA107** (GeForce RTX 30 series) and Ada
+**AD102..AD107** (RTX 40 series). The kext has a HAL for their boot path (PKC-signed FWSEC v3
+and booters loaded by the falcon's DMA engine, following NVIDIA's r570 and nouveau's GA102
+code), but it was written without such a GPU. It identifies the chip and parses its firmware
+on any of them; FWSEC and GSP-RM only run with the boot-arg `nvexperimental=1`. See
+[docs/firmware-and-boot.md](docs/firmware-and-boot.md).
+
 ## How it fits together
 
 | Layer | Component | Where |
@@ -71,8 +78,9 @@ paths but have **not been tested**.
   through Metal (CAMetalLayer).
 - **No video encode**, decode only H.264 and only through Vulkan Video (not VideoToolbox, so
   QuickTime and Safari don't use it), and no copy-only transfer queue.
-- **Only Turing.** Pascal and older have no GSP. Ampere and newer need different firmware and code
-  paths.
+- **Only Turing has been tested.** Pascal and older have no GSP. Ampere GA10x and Ada have a HAL
+  here that has never run (see Supported chips); Hopper and Blackwell need different firmware
+  and code paths; GA100 is left out.
 - **Intel x86-64 only**, with OpenCore loading the kext. Apple Silicon can't use it.
 - **No CPU-visible VRAM for apps.** Memory a program maps for the CPU comes from system memory,
   because macOS gives the driver no way to revoke a CPU mapping of VRAM once a program has copied
@@ -133,6 +141,9 @@ into `firmware/nvidia/`, keeping the directory layout:
 | `tu102/gsp/gen_bootloader-570.144.bin` | all Turing chips (built into the kext) |
 | `tu102/gsp/booter_load-570.144.bin`, `booter_unload-570.144.bin` | TU102, TU104, TU106 |
 | `tu116/gsp/booter_load-570.144.bin`, `booter_unload-570.144.bin` | TU116, TU117 |
+| `ga102/gsp/gsp-570.144.bin`, `bootloader-570.144.bin` | Ampere GA10x (experimental) |
+| `ad102/gsp/gsp-570.144.bin`, `bootloader-570.144.bin` | Ada AD10x (experimental) |
+| `<chip>/gsp/booter_load-570.144.bin`, `booter_unload-570.144.bin` | each GA10x or AD10x chip (`ga104`, `ad107`, ...) has its own |
 
 ```bash
 base=https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/nvidia
@@ -386,7 +397,7 @@ firmware and your Mesa and llama.cpp builds. By hand:
 | `nvboost=<n>` | P-state boost after each submission: `2` adaptive (default: full clocks on the first submission after idle and while the GPU stays busy, cleared after 150 ms idle; `nvgsp perf policy adaptive burst=1level` starts one level up instead and goes to full clocks at ≥50 % busy over ~80 ms), `1` fixed (full clocks for 2 s), `0` off (GSP-RM alone takes ~250 ms of load to raise the memory clock). `build/nvgsp perf` shows the P-state; `nvgsp perf policy …` changes the policy and its thresholds at runtime; `nvgsp perf watch` follows the P-state |
 | `nvgpu_users=1` | Let any user open the GPU, not only root and the console user |
 | `nvtest=1` | Run the kext's boot-time self-tests |
-| `nvexperimental=1` | Let chips whose support is marked experimental run FWSEC and GSP-RM (none yet; see docs/firmware-and-boot.md) |
+| `nvexperimental=1` | Let chips whose support is marked experimental run FWSEC and GSP-RM: Ampere GA10x and Ada, whose HAL has never run on hardware (see docs/firmware-and-boot.md) |
 | `nvaccel=1` | Start NVMetalAccel, so Metal.framework lists the GPU (Metal step) |
 | `nvkmapvram=1` | NVK keeps its push buffers and descriptors in CPU-mapped VRAM: faster generation (+15 % on a 0.5B model, +6 % on 3B), but each program run holds ~2.7 MiB of BAR1 until a restart; after ~42 runs it falls back to system memory (default speed). `desc` / `cmd:<n>` select parts; see [docs/bar1-cpu-mappings.md](docs/bar1-cpu-mappings.md) |
 
@@ -417,7 +428,7 @@ firmware and your Mesa and llama.cpp builds. By hand:
 
 | Path | Contents |
 |---|---|
-| `src/` | The kext: chips and the per-architecture HAL (`nv_hal.*`, `hal_tu1xx.cpp` for Turing), GSP-RM boot (`NVGsp.cpp`), GPU interface (`NVGpu.cpp`), runtime power (`NVPower.cpp`), MMU, VRAM heap, VBIOS/FWSEC/GSP firmware parsers, r570 structures (`nv_gsp_rm`), user-space ABI (`nv_uapi.h`) |
+| `src/` | The kext: chips and the per-architecture HAL (`nv_hal.*`, `hal_tu1xx.cpp` for Turing, `hal_ga10x.cpp` for Ampere GA10x and Ada), GSP-RM boot (`NVGsp.cpp`), GPU interface (`NVGpu.cpp`), runtime power (`NVPower.cpp`), MMU, VRAM heap, VBIOS/FWSEC/GSP firmware parsers, r570 structures (`nv_gsp_rm`), user-space ABI (`nv_uapi.h`) |
 | `tools/` | `nvgsp`, `nvtest`, `vktest`, `libnvmac` (C library over `nv_uapi.h`), `vbios_tool`, the boot daemon (`daemon/`, `install_daemon.sh`), `install.sh`, `uninstall.sh`, `verify_install.sh`, `run-llama.sh`, `gsp_test.sh` |
 | `accel/` | NVMetalAccel, the IOAccelerator kext for Metal, and `tools/nvmetal_root_install.sh` |
 | `monitor/` | GPU Monitor (SwiftUI menu bar app and WidgetKit widget) |

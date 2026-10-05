@@ -21,7 +21,13 @@ const NVBringup::Hal NVBringup::halTu1xx = {
     &NVBringup::tu1xxGspStart,
     &NVBringup::tu1xxGspResume,
     &NVBringup::tu1xxGspTeardown,
+    &NVBringup::tu1xxRiscvActive,
 };
+
+bool NVBringup::tu1xxRiscvActive()
+{
+    return rd32(NV_PRISCV_GSP_BASE + NV_PRISCV_CORE_SWITCH_RISCV_STATUS) & 1;
+}
 
 // ---- Falcons and FWSEC ---------------------------------------------------------------------
 
@@ -52,6 +58,10 @@ bool NVBringup::tu1xxRunFwsec(const uint8_t *rom, const nv_fwsec &f, uint32_t cm
     const bool sb = cmd == NV_DMEMMAPPER_CMD_SB;
     const char *tag = sb ? "FWSEC-SB" : "FRTS";
     nv_genbl bl;
+    if (f.version != 2) {
+        LOG("%s: FWSEC descriptor is v%u; Turing carries v2", tag, f.version);
+        return false;
+    }
     if (!nv_genbl_parse(nv_gen_bootloader, sizeof(nv_gen_bootloader), &bl)) {
         LOG("%s: bootloader: %s", tag, bl.err);
         return false;
@@ -136,42 +146,7 @@ bool NVBringup::tu1xxRunFwsec(const uint8_t *rom, const nv_fwsec &f, uint32_t cm
         falconReset();   // stops the falcon and its DMA before the buffer is unmapped
         goto out;
     }
-    if (sb) {
-        // kgspExecuteFwsec_TU102, SB branch: GFW privilege mask lowered, GFW boot
-        // completed, and no SB error in VBIOS scratch 0x15.
-        uint32_t mbox0 = grd(NV_FALCON_MAILBOX0);
-        uint32_t plm   = rd32(NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK);
-        uint32_t gfw   = rd32(NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_0_GFW_BOOT);
-        uint32_t err   = rd32(NV_PBUS_VBIOS_SCRATCH_15) & 0xffff;
-        LOG("%s: halted; mailbox0 0x%x, PLM 0x%x, GFW boot 0x%x, SB error 0x%x", tag, mbox0, plm, gfw, err);
-        ok = mbox0 == 0 && (plm & 1) && (gfw & 0xff) == 0xff && err == 0;
-        LOG("%s: %s", tag, ok ? "SUCCESS" : "FAILED");
-    } else {
-        {
-            uint32_t mbox0 = grd(NV_FALCON_MAILBOX0), mbox1 = grd(NV_FALCON_MAILBOX1);
-            uint32_t err   = rd32(NV_PBUS_SW_SCRATCH_0E) >> 16;
-            uint32_t wlo_r = rd32(NV_PFB_PRI_MMU_WPR2_ADDR_LO), whi_r = rd32(NV_PFB_PRI_MMU_WPR2_ADDR_HI);
-            uint64_t wlo   = nv_wpr2_addr(wlo_r), whi = nv_wpr2_addr(whi_r);
-            LOG("%s: halted; mailbox0 0x%x mailbox1 0x%x, FRTS error 0x%x, WPR2 0x%llx..0x%llx", tag,
-                mbox0, mbox1, err, (unsigned long long)wlo, (unsigned long long)whi);
-            setProperty("NVWpr2Lo", wlo_r, 32);
-            setProperty("NVWpr2Hi", whi_r, 32);
-            if (mbox0 != 0)
-                LOG("%s: FAILED: FWSEC returned error 0x%x", tag, mbox0);
-            else if (err != 0)
-                LOG("%s: FAILED: FRTS error code 0x%x", tag, err);
-            else if (!(whi_r >> 4))
-                LOG("%s: FAILED: WPR2 was not created", tag);
-            else if (wlo != frts)
-                LOG("%s: FAILED: WPR2 starts at 0x%llx, expected 0x%llx", tag,
-                    (unsigned long long)wlo, (unsigned long long)frts);
-            else {
-                LOG("%s: SUCCESS: WPR2 created at 0x%llx..0x%llx", tag,
-                    (unsigned long long)wlo, (unsigned long long)whi);
-                ok = true;
-            }
-        }
-    }
+    ok = fwsecCheck(tag, cmd, frts, grd(NV_FALCON_MAILBOX0), grd(NV_FALCON_MAILBOX1));
 
 out:
     if (leadSet)
@@ -207,7 +182,11 @@ bool NVBringup::tu1xxRunBooter(uint32_t kind, uint32_t mbox0, uint32_t mbox1)
         return false;
     }
     memcpy(img, b.img, b.img_size);
-    nv_booter_patch(&b, img);
+    // Turing has no fuse version registers (kgspReadUcodeFuseVersion returns 0), so the
+    // signature is the file's last one, of which r570's tu102 and tu116 booters have one.
+    uint32_t sig = 0;
+    nv_booter_sig_index(&b, 0, &sig);
+    nv_booter_patch(&b, img, sig);
 
     bool ok = false;
     if (falconReset(NV_PSEC_BASE)) {
