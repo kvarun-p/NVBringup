@@ -204,12 +204,16 @@ Enable "Launch at login" in its menu. Add the widget from the desktop's widget g
 
 ```bash
 tools/verify_install.sh          # checks every step above; read-only, doesn't wake the GPU
-tools/verify_install.sh --full   # also runs nvtest, vktest and a short llama-bench
+tools/verify_install.sh --full   # also runs nvtest, vktest, a Metal test and a short llama-bench
 ```
 
 Each step reports PASS, WARN or FAIL with what to fix, for example a missing boot-arg, a
 kext on the EFI that differs from the build, a daemon that needs reinstalling, or a Vulkan
-manifest that points nowhere. The exit code is non-zero if anything failed.
+manifest that points nowhere. The Metal step (optional, `accel/README.md`) checks NVMetalAccel,
+the SIP settings, whether the NVMetal.bundle on the system volume is the current build, the
+kill switch and the apps let in; `--full` runs `tools/metaltest.m` (compute, render, GPU times)
+through it and reports whether the kext supports host memory import. The exit code is non-zero
+if anything failed.
 
 ### Per-machine paths (`local.env`)
 
@@ -223,6 +227,7 @@ NVB_LLAMA_BIN=/path/to/llama.cpp/build/bin           # for run-llama.sh
 NVB_BENCH_MODEL=/path/to/model.gguf                   # for --full and run-llama.sh
 NVB_VK_ICD=/path/to/nouveau_icd.x86_64.json           # optional, for run-llama.sh
 NVB_NVK_LIB=/path/to/mesa/build/src/nouveau/vulkan/libvulkan_nouveau.dylib   # for vktest
+NVB_NVMETAL_BUNDLE=/path/to/mesa/build/src/nouveau/air/NVMetal.bundle   # the build the Metal step compares with
 ```
 
 ## Run a local LLM on the GPU

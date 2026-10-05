@@ -2,12 +2,13 @@
 # Verifies each installation step of the README, in order, and says what to fix.
 #
 #   tools/verify_install.sh           read-only checks; doesn't wake a powered-off GPU
-#   tools/verify_install.sh --full    also runs nvtest, vktest and a short llama-bench (powers the GPU on)
+#   tools/verify_install.sh --full    also runs nvtest, vktest, a Metal test and a short llama-bench (powers the GPU on)
 #
 # Paths (environment or local.env in the repo root, all optional):
 #   NVB_LLAMA_SERVER  llama-server        (default: PATH)
 #   NVB_VULKAN_PREFIX where the Vulkan loader and headers are installed (default: searched)
 #   NVB_BENCH_MODEL   GGUF for --full's llama-bench (default: the smallest in ~/models)
+#   NVB_NVMETAL_BUNDLE the NVMetal.bundle build (default: next to the NVK library, else nvmetal_root_install.sh's)
 # Exit code: 0 when nothing failed (warnings allowed), 1 otherwise. No root needed.
 
 set -u
@@ -15,7 +16,7 @@ cd "${0:A:h}/.." || exit 1
 [[ -f local.env ]] && { set -a; . ./local.env; set +a; }
 FULL=0
 [[ "${1:-}" == --full ]] && FULL=1
-[[ "${1:-}" == -h || "${1:-}" == --help ]] && { sed -n 2,11p "$0"; exit 0; }
+[[ "${1:-}" == -h || "${1:-}" == --help ]] && { sed -n 2,12p "$0"; exit 0; }
 
 typeset -i NPASS=0 NWARN=0 NFAIL=0
 if [[ -t 1 ]]; then G=$'\e[32m' Y=$'\e[33m' R=$'\e[31m' B=$'\e[1m' N=$'\e[0m'; else G= Y= R= B= N=; fi
@@ -230,7 +231,84 @@ else
 fi
 
 # ---------------------------------------------------------------------------------------------
-step "7. GPU Monitor"
+step "7. Metal acceleration (optional: accel/README.md)"
+ACCEL_ID=io.github.kvarun-p.nvmetalaccel
+SYS_BUNDLE=/System/Library/Extensions/NVMetal.bundle
+KILL_FILE=/Library/Preferences/io.github.kvarun-p.nvmetal.disabled
+ALLOW_FILE=/Library/Preferences/io.github.kvarun-p.nvmetal.allow
+# the build to compare with: NVB_NVMETAL_BUNDLE, else next to the NVK library, else the install script's default
+nvb=${NVB_NVMETAL_BUNDLE:-}
+if [[ -z $nvb ]]; then
+    for c in ${lib:+${lib:h:h}/air/NVMetal.bundle} \
+             $(sed -n 's/^DEFAULT_BUNDLE=//p' accel/tools/nvmetal_root_install.sh 2>/dev/null); do
+        [[ -x $c/Contents/MacOS/NVMetal ]] && { nvb=$c; break; }
+    done
+fi
+if [[ "$BA" != *" nvaccel=1 "* && ! -d $SYS_BUNDLE && ! -d /Library/Extensions/NVMetalAccel.kext ]]; then
+    warn "not set up (optional): Metal apps don't see the GPU" "accel/README.md"
+else
+    [[ "$BA" == *" nvaccel=1 "* ]] && pass "boot-arg nvaccel=1" || fail "boot-arg nvaccel=1 missing: NVMetalAccel stays off" "add it to boot-args"
+    accel_uuid=$(kmutil showloaded --bundle-identifier $ACCEL_ID 2>/dev/null | awk 'NR>1{for(i=1;i<=NF;i++) if($i ~ /^[0-9A-F-]{36}$/) print $i}')
+    if [[ -n "$accel_uuid" ]]; then
+        pass "NVMetalAccel loaded"
+        built=$(dwarfdump --uuid accel/build/NVMetalAccel.kext/Contents/MacOS/NVMetalAccel 2>/dev/null | awk '{print $2}')
+        [[ -n "$built" && "$built" != "$accel_uuid" ]] &&
+            warn "the loaded NVMetalAccel isn't accel/build/NVMetalAccel.kext" "copy it to /Library/Extensions, approve it, reboot"
+    elif [[ -d /Library/Extensions/NVMetalAccel.kext ]]; then
+        fail "NVMetalAccel is in /Library/Extensions but not loaded" "approve it in System Settings → Privacy & Security, then reboot (needs the kext-signing SIP bit)"
+    else
+        fail "NVMetalAccel not installed" "accel: make, copy build/NVMetalAccel.kext to /Library/Extensions (accel/README.md)"
+    fi
+    sip=$(csrutil status 2>/dev/null)
+    [[ $sip == *"Filesystem Protections: disabled"* ]] && csrutil authenticated-root status 2>/dev/null | grep -qi disabled &&
+        pass "SIP allows root changes (filesystem protections and authenticated root off)" ||
+        warn "SIP doesn't allow changing the system volume" "csr-active-config 0x803 (needed only to install NVMetal.bundle)"
+    if [[ -x $SYS_BUNDLE/Contents/MacOS/NVMetal ]]; then
+        pass "NVMetal.bundle installed in /System/Library/Extensions"
+        if [[ -n "$nvb" && -x $nvb/Contents/MacOS/NVMetal ]]; then
+            if cmp -s $SYS_BUNDLE/Contents/MacOS/NVMetal $nvb/Contents/MacOS/NVMetal; then
+                pass "it's the current build (${nvb/#$HOME/~})"
+            else
+                warn "the installed NVMetal.bundle differs from the build ${nvb/#$HOME/~}" \
+                     "sudo accel/tools/nvmetal_root_install.sh install $nvb, then reboot"
+            fi
+        else
+            warn "no NVMetal.bundle build to compare with" "$(hint ${nvb:-/none} 'set NVB_NVMETAL_BUNDLE')"
+        fi
+    else
+        fail "NVMetal.bundle not installed" "sudo accel/tools/nvmetal_root_install.sh install <bundle>, then reboot"
+    fi
+    [[ -e $KILL_FILE ]] && warn "the kill switch is on: no process gets the GPU" "sudo rm $KILL_FILE"
+    if [[ -f $ALLOW_FILE ]]; then
+        apps=(${(f)"$(grep -v '^[[:space:]]*\(#\|$\)' $ALLOW_FILE)"})
+        (( ${#apps} )) && pass "apps let in: ${(j:, :)apps}" || warn "$ALLOW_FILE lists no apps" "one executable name or path per line"
+    else
+        warn "no apps let in: only processes run with NVMETAL_ALLOW=1 get the GPU" "list executables in $ALLOW_FILE (sudo)"
+    fi
+    if (( FULL )); then
+        if clang -fobjc-arc -framework Metal -framework Foundation tools/metaltest.m -o "$TMP/metaltest" 2>"$TMP/mtcc.txt"; then
+            NVMETAL_ALLOW=1 "$TMP/metaltest" > "$TMP/metal.txt" 2>"$TMP/metal-err.txt"
+            if ! grep -q FAIL "$TMP/metal.txt" && grep -q 'ok: render' "$TMP/metal.txt"; then
+                pass "Metal: $(grep -c '^  ok:' $TMP/metal.txt) checks on $(grep -m1 -o 'device .*' $TMP/metal.txt | sed 's/^device //') (compute, render)"
+            else
+                fail "Metal: $(grep -m1 FAIL $TMP/metal.txt || tail -1 $TMP/metal-err.txt)" "NVMETAL_ALLOW=1 metaltest (tools/metaltest.m); log show --predicate 'eventMessage CONTAINS \"NVMetal\"' --last 5m"
+            fi
+            grep 'WARN:' "$TMP/metal.txt" | sed 's/^ *WARN: //' | while read -r w; do
+                warn "Metal: $w" "install the current NVMetal.bundle (above)"
+            done
+            if grep -q 'host memory import' "$TMP/metal-err.txt"; then
+                pass "host memory import (zero-copy IOSurfaces and large no-copy buffers)"
+            elif grep -q 'through NVK' "$TMP/metal-err.txt"; then
+                warn "no host memory import: the loaded kext predates NVMAC_MEM_IMPORT (copies instead)" "put the current build/NVBringup.kext on the EFI and reboot"
+            fi
+        else
+            warn "couldn't build metaltest: $(head -1 $TMP/mtcc.txt)"
+        fi
+    fi
+fi
+
+# ---------------------------------------------------------------------------------------------
+step "8. GPU Monitor"
 if [[ -d ~/Applications/"GPU Monitor.app" ]]; then
     pass "~/Applications/GPU Monitor.app"
     pgrep -x GPUMonitor >/dev/null && pass "running" || warn "not running" "open ~/Applications/GPU\\ Monitor.app"
