@@ -8,6 +8,7 @@
 #
 # usage: tools/check_fwsec_boot.sh [vbios.rom]   (VBIOS_TOOL=path skips the make step)
 #   no argument: dump the ROM the loaded kext read (tools/dump_vbios.py, macOS only)
+# exit status: 0 IMEMVirtBase is 0; 1 it isn't (a finding, not an error); 2 no v3 descriptor
 set -e
 cd "$(dirname "$0")/.."
 ROM="$1"

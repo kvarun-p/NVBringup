@@ -321,9 +321,9 @@ bool nv_fwsec_bl_desc(const nv_fwsec *f, uint64_t dma_base, uint8_t out[NV_BL_DM
 {
     // The descriptor uses one offset as both DMA source and IMEM destination, so
     // the buffer must mirror IMEM; the bootloader always copies data to DMEM 0.
-    uint32_t pad = nv_fwsec_dma_padding(f);
     if (f->version != 2)
         return false;
+    uint32_t pad = nv_fwsec_dma_padding(f);
     if (f->sec_imem < f->sec_img || f->nsec_imem != f->nsec_img + pad || f->dmem_addr != 0)
         return false;
     if (dma_base & 0xff)

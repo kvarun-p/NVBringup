@@ -37,6 +37,8 @@
 #define NV_FALCON_MAILBOX0          0x040
 #define NV_FALCON_MAILBOX1          0x044
 #define NV_FALCON_RM                0x084
+#define NV_FALCON_IRQMCLR           0x014   // write 1s to mask interrupts
+#define NV_FALCON_ITFEN             0x048   // bit 0 ctxen, bit 1 mthden: interface enables
 #define NV_FALCON_CPUCTL            0x100   // bit 6 alias_en, bit 4 halted, bit 1 startcpu
 #define NV_FALCON_BOOTVEC           0x104
 #define NV_FALCON_DMACTL            0x10c   // bit 2 imem scrubbing, bit 1 dmem scrubbing

@@ -36,7 +36,7 @@ def parse(rd):
     for i in range(size):
         if info is None:
             info, typ, inst, n = {"reset": None, "addr": 0, "fault": 0}, ~0, 0, 0
-        data = rd(TABLE + 4 * i)
+        data = rd(TABLE + 4 * i) or 0       # a word missing from a dump reads as 0 (end of entry)
         if not data and n == 0:
             continue
         if n == 0:
@@ -81,7 +81,7 @@ def file_reader(path):
             regs[int(line[0], 16)] = int(line[1], 16)
     if SIZE_REG not in regs:
         sys.exit(f"{path}: no entry for 0x{SIZE_REG:x}")
-    return lambda a: regs.get(a, 0)
+    return lambda a: regs.get(a)
 
 
 def main(argv):
@@ -105,7 +105,10 @@ def main(argv):
             print(f"{name}: no reset bit in the table")
             status = 1
     en = rd(PMC_DEVICE_ENABLE)
-    print(f"register 0x{PMC_DEVICE_ENABLE:x} reads 0x{en:08x}")
+    if en is None:
+        print(f"register 0x{PMC_DEVICE_ENABLE:x}: not in the dump")
+    else:
+        print(f"register 0x{PMC_DEVICE_ENABLE:x} reads 0x{en:08x}")
     return status
 
 

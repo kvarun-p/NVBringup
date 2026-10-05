@@ -64,10 +64,9 @@ static int fwsec_report(const nv_vbios &v, uint64_t vram)
     printf("    IMEM secure (HS) 0x%05x -> 0x%05x  0x%05x  (tag 0x%x)\n", f.sec_img, f.sec_imem, f.sec_size, f.sec_va);
     printf("    DMEM             0x%05x -> 0x%05x  0x%05x\n", f.dmem_img, f.dmem_addr, f.dmem_size);
     printf("    boot vector      0x%x\n", f.boot_vector);
-    if (f.version == 3)
+    if (f.version == 3) {
         printf("  IMEMVirtBase 0x%x, IMEMPhysBase 0x%x (nouveau boots v3 at vector 0 from image offset 0; r570 uses IMEMVirtBase)\n",
                f.imem_virt_base, f.imem_phys_base);
-    if (f.version == 3) {
         printf("  PKC (GA10x+): %u signature(s) at ROM 0x%x for fuse versions 0x%x, slot at DMEM 0x%x, engine mask 0x%x, ucode id %u\n",
                f.sig_count, f.sigs_rom, f.sig_versions, f.pkc_data_off, f.engine_id_mask, f.ucode_id);
         for (uint32_t fuse = 0; fuse < 4; fuse++) {

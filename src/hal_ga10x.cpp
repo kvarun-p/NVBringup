@@ -48,8 +48,16 @@ const NVBringup::Hal NVBringup::halGa10x = {
 // cap), kflcnResetHw (kgspResetHw_TU102 / ksec2ResetHw_TU102: the ENGINE reset bit on and
 // off), kflcnWaitForResetToFinish_GA102 (HWCFG2 memory scrubbing done). Leaves the core
 // selection alone: the callers switch it.
+// Before the reset, nouveau (gm200_flcn_disable) also masks the falcon's interrupts and
+// disables its context and method interfaces; r570's kflcnReset doesn't, but both are
+// harmless on a falcon about to be reset and keep a stale interrupt from reaching the host,
+// so they're done here. nouveau additionally toggles SEC2's PMC enable bit (ga102_sec2_flcn
+// reset_pmc), whose bit comes from the PTOP table (tools/ptop_dump.py); r570 only pulses
+// ENGINE, which is what's followed here.
 bool NVBringup::ga10xResetCore(uint32_t base)
 {
+    gwr(NV_FALCON_ITFEN, grd(NV_FALCON_ITFEN, base) & ~3u, base);
+    gwr(NV_FALCON_IRQMCLR, 0xffffffff, base);
     for (uint32_t us = 0; us < 150 && !(grd(NV_FALCON_HWCFG2, base) & NV_HWCFG2_RESET_READY); us += 10)
         IODelay(10);
     uint32_t e = grd(NV_FALCON_ENGINE, base);
@@ -116,7 +124,12 @@ bool NVBringup::ga10xRunHs(const char *tag, uint32_t base, const HsImage &hs, ui
                            uint32_t waitMs, uint32_t *mboxOut)
 {
     const uint32_t riscv = base + NV_FALCON2_OFFSET;
-    const uint32_t size  = ((hs.size + 0xff) & ~0xffu) + 0x100;      // whole blocks, plus one of slack
+    // The code's device address is its tag base taken back from the image's, so that the
+    // falcon, adding the tag again, reads the image (srcPhysAddr = base + codeOffset - imemVa,
+    // kgspExecuteHsFalcon_GA102). The image is placed `pad` bytes into the buffer so that
+    // subtraction never goes below the buffer's address (both offsets are 256-byte aligned).
+    const uint32_t pad   = hs.code_va > hs.code_img ? hs.code_va - hs.code_img : 0;
+    const uint32_t size  = pad + ((hs.size + 0xff) & ~0xffu) + 0x100;    // whole blocks, plus one of slack
     IOBufferMemoryDescriptor *buf = nullptr;
     IODMACommand *dma = nullptr;
     bool lead = false, leadSet = false, started = false, ok = false;
@@ -124,11 +137,15 @@ bool NVBringup::ga10xRunHs(const char *tag, uint32_t base, const HsImage &hs, ui
 
     // One DMA transfer (s_dmaTransfer_GA102): src is the device address the falcon adds `off`
     // to; dst the IMEM/DMEM address; the request queue must have room before each block.
+    // The first millisecond is spun (a block takes microseconds), the rest slept.
     auto dmaPoll = [&](uint32_t mask, uint32_t value) -> bool {
-        for (uint32_t us = 0; us < 2000000; us += 10) {
+        for (uint32_t us = 0; us < 2000000; us += us < 1000 ? 10 : 1000) {
             if ((grd(NV_FALCON_DMATRFCMD, base) & mask) == value)
                 return true;
-            IODelay(10);
+            if (us < 1000)
+                IODelay(10);
+            else
+                IOSleep(1);
         }
         LOG("%s: falcon DMA did not make progress (DMATRFCMD 0x%08x)", tag, grd(NV_FALCON_DMATRFCMD, base));
         return false;
@@ -149,7 +166,8 @@ bool NVBringup::ga10xRunHs(const char *tag, uint32_t base, const HsImage &hs, ui
     };
 
     if (hs.code_img + hs.code_size > hs.size || hs.data_img + hs.data_size > hs.size ||
-        ((hs.code_img | hs.code_va | hs.code_pa | hs.data_img | hs.data_pa) & 0xff) || !hs.code_size || !hs.data_size) {
+        ((hs.code_img | hs.code_va | hs.code_pa | hs.data_img | hs.data_pa) & 0xff) || !hs.code_size || !hs.data_size ||
+        pad > (16u << 20)) {
         LOG("%s: HS image layout unusable (code 0x%x+0x%x -> 0x%x tag 0x%x, data 0x%x+0x%x -> 0x%x)", tag,
             hs.code_img, hs.code_size, hs.code_pa, hs.code_va, hs.data_img, hs.data_size, hs.data_pa);
         return false;
@@ -162,7 +180,7 @@ bool NVBringup::ga10xRunHs(const char *tag, uint32_t base, const HsImage &hs, ui
     {
         uint8_t *p = (uint8_t *)buf->getBytesNoCopy();
         memset(p, 0, size);
-        memcpy(p, hs.data, hs.size);
+        memcpy(p + pad, hs.data, hs.size);
     }
     // Map through the system IOMMU (VT-d is active); the GPU sees only this buffer.
     dma = IODMACommand::withSpecification(kIODMACommandOutputHost64, 40, 0, IODMACommand::kMapped, 0, 256);
@@ -181,14 +199,8 @@ bool NVBringup::ga10xRunHs(const char *tag, uint32_t base, const HsImage &hs, ui
         }
         dmaBase = seg.fIOVMAddr;
     }
-    // The code's device address is taken back by its tag base, which the falcon adds again
-    // (srcPhysAddr = base + codeOffset - imemVa, kgspExecuteHsFalcon_GA102).
-    if (hs.code_va > dmaBase + hs.code_img) {
-        LOG("%s: IMEM tag base 0x%x above the DMA address", tag, hs.code_va);
-        goto out;
-    }
-    codeBase = dmaBase + hs.code_img - hs.code_va;
-    dataBase = dmaBase + hs.data_img;
+    codeBase = dmaBase + pad + hs.code_img - hs.code_va;     // >= dmaBase by the choice of pad
+    dataBase = dmaBase + pad + hs.data_img;
     LOG("%s: DMA buffer 0x%x bytes at device address 0x%llx; code 0x%x bytes -> IMEM 0x%x (tag 0x%x), data 0x%x bytes -> DMEM 0x%x, signature at DMEM 0x%x, engine 0x%x ucode %u",
         tag, size, (unsigned long long)dmaBase, hs.code_size, hs.code_pa, hs.code_va, hs.data_size, hs.data_pa,
         hs.sig_dmem, hs.engine_id, hs.ucode_id);
@@ -202,8 +214,10 @@ bool NVBringup::ga10xRunHs(const char *tag, uint32_t base, const HsImage &hs, ui
     gwr(NV_FALCON_FBIF_TRANSCFG(0), (grd(NV_FALCON_FBIF_TRANSCFG(0), base) & ~7u) |
         NV_FBIF_TARGET_COHERENT_SYSMEM | NV_FBIF_MEM_TYPE_PHYSICAL, base);
     if (!dmaLoad(codeBase, hs.code_pa, hs.code_va, hs.code_size, NV_DMATRFCMD_SIZE_256B | NV_DMATRFCMD_IMEM | NV_DMATRFCMD_SEC) ||
-        !dmaLoad(dataBase, hs.data_pa, 0, hs.data_size, NV_DMATRFCMD_SIZE_256B))
+        !dmaLoad(dataBase, hs.data_pa, 0, hs.data_size, NV_DMATRFCMD_SIZE_256B)) {
+        ga10xFalconReset(base);     // stops a transfer still in flight before the buffer is unmapped
         goto out;
+    }
 
     // The boot ROM verifies the PKC signature in DMEM against this engine and ucode id.
     wr32(riscv + NV_PFALCON2_FALCON_BROM_PARAADDR(0), hs.sig_dmem);
@@ -404,11 +418,11 @@ bool NVBringup::ga10xGspResume()
 
 // kgspTeardown_TU102 after GSP-RM suspended: FWSEC-SB on the GSP falcon (from the VBIOS read
 // at boot) restores the VBIOS's pre-OS apps, then booter_unload on SEC2 clears WPR2, only
-// while WPR2 is up (kgspExecuteBooterUnloadIfNeeded_TU102). Both run even if the other fails.
+// while WPR2 is up (kgspExecuteBooterUnloadIfNeeded_TU102). Both run even if the other fails;
+// each resets its falcon first.
 bool NVBringup::ga10xGspTeardown()
 {
     bool ok = true;
-    ga10xFalconReset(NV_PGSP_BASE);
     OSData *rom = OSDynamicCast(OSData, getProperty("NVVBIOS"));
     nv_vbios v;
     nv_fwsec f;
