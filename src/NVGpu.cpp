@@ -986,7 +986,7 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
     // The surface. A bigger mode gets a new one; the old one's VRAM stays allocated, since a user
     // mapping of it (NVMAC_DISPLAY_MAP) may outlive this.
     const uint64_t need = (uint64_t)pitch * ((vact + 15) & ~15u);
-    NVDispMem *bufs[] = { &d.fb, &d.fbB };    // two buffers: NVMAC_DISPLAY_FLIP swaps them at vblank
+    NVDispMem *bufs[] = { &d.fb, &d.fbB, &d.fbC };    // three buffers: NVMAC_DISPLAY_FLIP picks one at vblank
     for (NVDispMem *b : bufs) {
         if (b->size < need) {
             NVDispMem nf;
@@ -1278,7 +1278,7 @@ void NVBringup::dispPublish()
 // wait (up to a frame) is outside it, through a retained mapping, so other GPU work isn't held up.
 IOReturn NVBringup::displayFlip(GpuConn *c, uint32_t buffer)
 {
-    if (buffer > 1)
+    if (buffer > 2)
         return kIOReturnBadArgument;
     IOLockLock(gspLock_);
     GspState *g = gsp_;
@@ -1287,7 +1287,7 @@ IOReturn NVBringup::displayFlip(GpuConn *c, uint32_t buffer)
         return kIOReturnNotReady;
     }
     GspState::DispHw &d = g->disp;
-    NVDispMem &f = buffer ? d.fbB : d.fb;
+    NVDispMem &f = buffer == 2 ? d.fbC : buffer ? d.fbB : d.fb;
     if (!f.pa || !d.sync.map) {
         IOLockUnlock(gspLock_);
         return kIOReturnNotReady;
@@ -1390,7 +1390,7 @@ void NVBringup::dispLost()
     if (!g || !g->disp.ready)
         return;
     GspState::DispHw &d = g->disp;
-    NVDispMem *mems[] = { &d.inst, &d.pbCore, &d.pbWndw, &d.sync, &d.ilut, &d.olut, &d.fb, &d.fbB };
+    NVDispMem *mems[] = { &d.inst, &d.pbCore, &d.pbWndw, &d.sync, &d.ilut, &d.olut, &d.fb, &d.fbB, &d.fbC };
     for (NVDispMem *m : mems)
         OSSafeReleaseNULL(m->map);
     d.ready = false;
@@ -3635,11 +3635,11 @@ IOReturn NVBringup::gpuCall(GpuConn *c, uint32_t selector, IOExternalMethodArgum
     }
     case NVMAC_DISPLAY_MEM: {
         const uint64_t buf = a->scalarInputCount ? a->scalarInput[0] : 0;
-        if (a->scalarOutputCount != 5 || a->scalarInputCount > 1 || buf > 1) {
+        if (a->scalarOutputCount != 5 || a->scalarInputCount > 1 || buf > 2) {
             r = kIOReturnBadArgument;
             break;
         }
-        const NVDispMem &fbm = buf ? g->disp.fbB : g->disp.fb;
+        const NVDispMem &fbm = buf == 2 ? g->disp.fbC : buf ? g->disp.fbB : g->disp.fb;
         if (!g->dispLit || !fbm.pa) {
             r = kIOReturnNotReady;
             break;

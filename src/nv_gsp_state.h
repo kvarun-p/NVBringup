@@ -203,7 +203,7 @@ struct NVBringup::GspState {
     // nvdisp=2: the display engine as set up once per GSP boot (dispInit) and the output it lights
     // (dispSetMode, from the boot probe or the hot-plug poll). Kernel CPU mappings through BAR1.
     struct DispHw {
-        NVDispMem inst, pbCore, pbWndw, sync, ilut, olut, fb, fbB;      // fb, fbB: the two scanout buffers
+        NVDispMem inst, pbCore, pbWndw, sync, ilut, olut, fb, fbB, fbC; // fb, fbB, fbC: the scanout buffers
         uint32_t front = 0;             // which one window 0 scans out (0: fb)
         uint32_t flipBy[4] = {};        // flips completed by: timeout (0), notifier (1), armed state (2), armed
                                         // state with the raster not seen passing a vblank (3)

@@ -86,15 +86,16 @@ enum nvmac_selector {
     NVMAC_DISPLAY_MAP,      // scalar out: address, size, width, height, pitch of the surface the lit display
                             //   (boot-arg nvdisp=2) scans out, X8R8G8B8 pitch-linear, mapped write-combined
                             //   (one mapping per connection). kIOReturnNotReady if no display is lit.
-    NVMAC_DISPLAY_MEM,      // scalar in: none or buffer (0, 1); out: handle, size, width, height, pitch:
+    NVMAC_DISPLAY_MEM,      // scalar in: none or buffer (0-2); out: handle, size, width, height, pitch:
                             //   that buffer of the lit display as a VRAM memory object of the connection
                             //   (pitch kind), for VM_BIND and copy-engine writes. MEM_FREE drops the handle;
                             //   the VRAM stays the display's. kIOReturnNotReady if no display is lit.
                             //   Buffer 0 is the one NVMAC_DISPLAY_MAP maps and the one scanned out after a
-                            //   modeset; buffer 1 the second, for NVMAC_DISPLAY_FLIP.
-    NVMAC_DISPLAY_FLIP,     // scalar in: buffer (0, 1). Scans that buffer out from the next vblank and
-                            //   returns once the display engine has switched to it (so the other one is
-                            //   free to write), or kIOReturnTimeout after 100 ms.
+                            //   modeset; buffers 1 and 2 the others, for NVMAC_DISPLAY_FLIP (2: since the
+                            //   third buffer; older kernels reject it).
+    NVMAC_DISPLAY_FLIP,     // scalar in: buffer (0-2). Scans that buffer out from the next vblank and
+                            //   returns once the display engine has switched to it (so the one shown before is
+                            //   out of scanout and free to write), or kIOReturnTimeout after 100 ms.
     NVMAC_SELECTOR_COUNT
 };
 
