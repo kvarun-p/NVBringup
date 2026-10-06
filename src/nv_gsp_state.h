@@ -205,6 +205,8 @@ struct NVBringup::GspState {
     struct DispHw {
         NVDispMem inst, pbCore, pbWndw, sync, ilut, olut, fb, fbB;      // fb, fbB: the two scanout buffers
         uint32_t front = 0;             // which one window 0 scans out (0: fb)
+        uint32_t flipBy[3] = {};        // flips completed by: timeout (0), notifier (1), armed state (2)
+        uint32_t flipLogged = 0;
         uint32_t hRoot = 0;
         uint32_t coreCur = 0, wndwCur = 0;      // push buffer positions, in words
         bool     wanted = false, ready = false;

@@ -1303,14 +1303,48 @@ IOReturn NVBringup::displayFlip(GpuConn *c, uint32_t buffer)
     dispMthd(true, 0x200, 1);                                                     // UPDATE
     d.front = buffer;
     IOLockUnlock(gspLock_);
+    // Done once the notifier leaves NOT_BEGUN, or once window 0's armed (active) offset is the new buffer:
+    // 0x690000 + method is the window channel's assembly state, + 0x800 the armed one (nvkm
+    // gv100_disp_wndw_mthd, .prev).
+    const uint32_t want = (uint32_t)(f.pa >> 8);
     IOReturn r = kIOReturnTimeout;
-    for (int i = 0; i < 100; i++) {         // a 0xffffffff read (GPU gone) ends it too
-        if (ntfy[0] >> 30) {
-            r = kIOReturnSuccess;
-            break;
+    int how = 0;                            // 1 notifier, 2 armed state
+    for (int i = 0; i < 100 && !how; i++) { // a 0xffffffff read (GPU gone) ends it too
+        if (ntfy[0] >> 30)
+            how = 1;
+        else {
+            IOLockLock(gspLock_);
+            if (gsp_ && gsp_->booted && gsp_->disp.ready && rd32(0x690a60) == want)
+                how = 2;
+            IOLockUnlock(gspLock_);
         }
-        IOSleep(1);
+        if (!how)
+            IOSleep(1);
     }
+    if (how)
+        r = kIOReturnSuccess;
+    IOLockLock(gspLock_);
+    if (gsp_ && gsp_->booted && gsp_->disp.ready) {
+        GspState::DispHw &dd = gsp_->disp;
+        dd.flipBy[how]++;
+        if (how != 1 && dd.flipLogged < 3) {     // what the notifier and the window state say
+            dd.flipLogged++;
+            char msg[256];
+            snprintf(msg, sizeof(msg),
+                     "flip to %u by %s: ntfy %08x %08x %08x %08x; offset asy %08x armed %08x (want %08x); "
+                     "ntfy ctl asy %08x/%08x armed %08x/%08x; exc %08x %08x %08x; PUT %x GET %x",
+                     buffer, how ? "armed state" : "nothing (timeout)", ntfy[0], ntfy[1], ntfy[2], ntfy[3],
+                     rd32(0x690260), rd32(0x690a60), want, rd32(0x69021c), rd32(0x690220), rd32(0x690a1c),
+                     rd32(0x690a20), rd32(0x61102c), rd32(0x611030), rd32(0x611034), rd32(0x690000),
+                     rd32(0x690004));
+            LOG("GSP: display: %s", msg);
+            setProperty("NVDisplayFlipDiag", msg);
+        }
+        char counts[96];
+        snprintf(counts, sizeof(counts), "notifier %u, armed state %u, timed out %u", dd.flipBy[1], dd.flipBy[2], dd.flipBy[0]);
+        setProperty("NVDisplayFlips", counts);
+    }
+    IOLockUnlock(gspLock_);
     keep->release();
     return r;
 }
