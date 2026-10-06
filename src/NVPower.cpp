@@ -104,7 +104,7 @@ void NVBringup::idleTick()
     GspState *g = gsp_;
     if (!g || pwrMode_ != kModeAuto || !idleSec_ || pwrState_ != kPwrOn || !idleCall_)
         return;
-    bool used = false;
+    bool used = g->dispLit;         // a lit display counts as in use
     for (uint32_t i = 0; i < kMaxConns && !used; i++)
         used = g->conns[i] != nullptr;
     uint64_t now = mach_absolute_time();

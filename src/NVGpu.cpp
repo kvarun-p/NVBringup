@@ -512,8 +512,10 @@ void NVBringup::probeDisplay()
 {
     GspState *g = gsp_;
     uint32_t arm = 0, st = 0;
-    if (!PE_parse_boot_argn("nvdisp", &arm, sizeof(arm)) || arm != 1)
+    if (!PE_parse_boot_argn("nvdisp", &arm, sizeof(arm)) || (arm != 1 && arm != 2))
         return;
+    uint32_t modeId = 0, modeProto = 0;     // nvdisp=2: the first connected TMDS output and its EDID
+    uint8_t modeEdid[128] = {};
     char sum[512];
     uint32_t pos = 0;
 #define ADD(...) do { if (pos < sizeof(sum)) pos += (uint32_t)snprintf(sum + pos, sizeof(sum) - pos, __VA_ARGS__); } while (0)
@@ -612,6 +614,11 @@ void NVBringup::probeDisplay()
             LOG("GSP: display 0x%x: EDID %u bytes, %s %04x, preferred %ux%u", id, n, mfg, e[10] | e[11] << 8,
                 hact, vact);
             ADD(" EDID %s %ux%u", mfg, hact, vact);
+            if (!modeId && (proto == 1 || proto == 2 || proto == 5)) {
+                modeId = id;
+                modeProto = proto;
+                memcpy(modeEdid, e, sizeof(modeEdid));
+            }
             char key[32];
             snprintf(key, sizeof(key), "NVDisplayEDID-%x", id);
             if (OSData *d = OSData::withBytes(e, n)) {
@@ -636,6 +643,420 @@ void NVBringup::probeDisplay()
     }
     setProperty("NVDisplayProbe", sum);
 #undef ADD
+    if (arm == 2 && modeId) {       // initBar1 runs after this: modesetDisplay is called once it has
+        g->dispModeId = modeId;
+        g->dispModeProto = modeProto;
+        memcpy(g->dispModeEdid, modeEdid, sizeof(modeEdid));
+    }
+}
+
+// Display, step B1 (boot-arg nvdisp=2): the first modeset. Scans a colour-bar test pattern out of VRAM
+// on the first connected TMDS output (HEAD 0, WINDOW 0), following nouveau's r535 path for Turing
+// (c57d core + c57e window channels, no cursor, no window-immediate channel, no HDMI infoframes: the
+// sink gets a DVI-style signal). GSP-RM owns the OR/SOR and the PHY; this writes the channel methods.
+// Order, as nouveau's nv50_disp_atomic_commit_tail for the first modeset:
+//   RM: display root object, push buffers, channels, SOR assignment
+//   core: init (window usage bounds), SOR ctrl, head raster/clock/output resource, window owner, UPDATE
+//   window: surface, format, composition; UPDATE interlocked with the core; core UPDATE
+// Results: the log (every step) and NVDisplayModeset (summary). Nothing here is undone: a failed step
+// leaves the objects allocated until the next boot.
+bool NVBringup::modesetDisplay(uint32_t displayId, uint32_t rmProto, const uint8_t *edid)
+{
+    GspState *g = gsp_;
+    uint32_t st = 0;
+    const char *what = "";
+#define FAIL(msg) do { what = msg; goto fail; } while (0)
+    struct Mem { uint64_t pa = 0, bar1 = 0, size = 0; IOMemoryMap *map = nullptr; volatile uint8_t *cpu = nullptr; };
+    Mem inst, pbCore, pbWndw, sync, fb, ilut, olut;
+    uint32_t hRoot = 0, hCoreObj = 0, hWndwObj = 0;
+    uint32_t head = 0, sorIdx = 0xffffffff;
+
+    // Mode: the EDID's first detailed timing descriptor (bytes 54..71).
+    const uint8_t *d = edid + 54;
+    const uint32_t pclkKhz = (uint32_t)(d[0] | d[1] << 8) * 10;
+    const uint32_t hact = d[2] | (uint32_t)(d[4] & 0xf0) << 4, hblank = d[3] | (uint32_t)(d[4] & 0x0f) << 8;
+    const uint32_t vact = d[5] | (uint32_t)(d[7] & 0xf0) << 4, vblank = d[6] | (uint32_t)(d[7] & 0x0f) << 8;
+    const uint32_t hso = d[8] | (uint32_t)(d[11] & 0xc0) << 2, hsw = d[9] | (uint32_t)(d[11] & 0x30) << 4;
+    const uint32_t vso = (d[10] >> 4) | (uint32_t)(d[11] & 0x0c) << 2, vsw = (d[10] & 0x0f) | (uint32_t)(d[11] & 0x03) << 4;
+    const uint32_t flags = d[17];
+    if (!pclkKhz || !hact || !vact || (flags & 0x80)) {      // no timing, or interlaced
+        LOG("GSP: modeset: EDID has no usable progressive detailed timing (pclk %u kHz %ux%u flags 0x%x)",
+            pclkKhz, hact, vact, flags);
+        return false;
+    }
+    const bool nhsync = !(flags & 0x02), nvsync = !(flags & 0x04);
+    const uint32_t htotal = hact + hblank, vtotal = vact + vblank;
+    const uint32_t hsyncs = hact + hso, vsyncs = vact + vso;
+    LOG("GSP: modeset: display 0x%x proto %u: %ux%u, pclk %u kHz, h %u/%u/%u/%u v %u/%u/%u/%u, hsync %c vsync %c",
+        displayId, rmProto, hact, vact, pclkKhz, hact, hso, hsw, htotal, vact, vso, vsw, vtotal,
+        nhsync ? '-' : '+', nvsync ? '-' : '+');
+    const uint32_t pitch = (hact * 4 + 255) & ~255u;
+
+    // VRAM blocks, CPU-mapped through BAR1 (the push buffers, display instance memory and the surface).
+    auto memAlloc = [&](Mem &m, uint64_t size, uint64_t pa) {
+        m.size = size;
+        m.pa = pa ? pa : nv_vram_alloc(g->vram, size, 0x10000);
+        if (!m.pa)
+            return false;
+        if (!bar1Map(m.pa, size, &m.bar1))
+            return false;
+        IODeviceMemory *bar1 = pci_->getDeviceMemoryWithIndex(1);
+        m.map = bar1 ? bar1->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapInhibitCache, m.bar1, size)
+                     : nullptr;
+        if (!m.map)
+            return false;
+        m.cpu = (volatile uint8_t *)m.map->getVirtualAddress();
+        for (uint64_t o = 0; o < size; o += 4)
+            *(volatile uint32_t *)(m.cpu + o) = 0;
+        return true;
+    };
+    auto w32 = [](Mem &m, uint32_t off, uint32_t v) { *(volatile uint32_t *)(m.cpu + off) = v; };
+    // On a failure: the display exception registers (gv100_disp_exception: stat = type << 12 | mthd >> 2),
+    // the channels' PUT/GET and the core notifier.
+    auto dump = [&]() {
+        for (uint32_t chid = 0; chid < 3; chid++)
+            LOG("GSP: modeset: exception chid %u: stat 0x%08x data 0x%08x code 0x%08x", chid,
+                rd32(0x611020 + chid * 12), rd32(0x611024 + chid * 12), rd32(0x611028 + chid * 12));
+        LOG("GSP: modeset: intr 0x%08x exc-other 0x%08x exc-winim 0x%08x exc-win 0x%08x", rd32(0x611ec0),
+            rd32(0x611854), rd32(0x611850), rd32(0x611858));
+        LOG("GSP: modeset: core PUT 0x%x GET 0x%x; window PUT 0x%x GET 0x%x", rd32(0x680000), rd32(0x680004),
+            rd32(0x690000), rd32(0x690004));
+        for (uint32_t pass = 0; pass < 2; pass++) {
+            // gv100_head_state: 0x682xxx is the core channel's assembly state, 0x68axxx the armed (active) one.
+            const uint32_t base = pass ? 0x68a000 : 0x682000;
+            LOG("GSP: modeset: head 0 %s: raster 0x%08x sync 0x%08x blankE 0x%08x blankS 0x%08x clk %u or 0x%08x",
+                pass ? "armed" : "asm", rd32(base + 0x64), rd32(base + 0x68), rd32(base + 0x6c), rd32(base + 0x70),
+                rd32(base + 0x0c), rd32(base + 0x04));
+        }
+        {
+            const uint32_t v0 = rd32(0x616330), h0 = rd32(0x616334);
+            IOSleep(20);
+            LOG("GSP: modeset: head 0 raster position v %u h %u, 20 ms later v %u", v0 & 0xffff, h0 & 0xffff,
+                rd32(0x616330) & 0xffff);
+        }
+        if (sync.cpu)
+            LOG("GSP: modeset: notifier %08x %08x %08x %08x", *(volatile uint32_t *)sync.cpu,
+                *(volatile uint32_t *)(sync.cpu + 4), *(volatile uint32_t *)(sync.cpu + 8),
+                *(volatile uint32_t *)(sync.cpu + 12));
+    };
+    if (!memAlloc(inst, 0x10000, g->dispInst) || !memAlloc(pbCore, 0x1000, 0) || !memAlloc(pbWndw, 0x1000, 0) ||
+        !memAlloc(sync, 0x1000, 0) || !memAlloc(ilut, 0x10000, 0) || !memAlloc(olut, 0x10000, 0) ||
+        !memAlloc(fb, (uint64_t)pitch * ((vact + 15) & ~15u), 0))
+        FAIL("VRAM allocation or BAR1 mapping failed");
+
+    // Test pattern: eight colour bars, a white frame.
+    {
+        static const uint32_t bars[8] = { 0xffffff, 0xffff00, 0x00ffff, 0x00ff00, 0xff00ff, 0xff0000, 0x0000ff, 0x000000 };
+        for (uint32_t y = 0; y < vact; y++)
+            for (uint32_t x = 0; x < hact; x++) {
+                const bool frame = x < 16 || y < 16 || x >= hact - 16 || y >= vact - 16;
+                w32(fb, y * pitch + x * 4, frame ? 0xffffff : bars[x * 8 / hact]);
+            }
+    }
+
+    // Input LUT: nvdisplay 3 needs one to convert a fixed-point surface to the pipe's FP16 (nvkms
+    // EvoFlipC5Common). Identity, DIRECT10: a 0x20-byte VSS header, then 1024 entries of FP16 R, G, B
+    // (8 bytes each) and the last one repeated (EvoSetupIdentityBaseLutC5, wndwc57e_ilut_load).
+    {
+        auto unorm10ToFp16 = [](uint32_t i) -> uint16_t {
+            if (!i)
+                return 0;
+            uint64_t n = i;
+            const uint64_t den = 1023;
+            int e = 0;
+            while (n < den) {
+                n <<= 1;
+                e--;
+            }
+            uint32_t man = (uint32_t)(((n - den) * 1024 + den / 2) / den);
+            if (man == 1024) {
+                man = 0;
+                e++;
+            }
+            return (uint16_t)((e + 15) << 10 | man);
+        };
+        for (uint32_t i = 0; i <= 1024; i++) {
+            const uint32_t v = unorm10ToFp16(i < 1024 ? i : 1023);
+            w32(ilut, 0x20 + i * 8 + 0, v | v << 16);       // R, G
+            w32(ilut, 0x20 + i * 8 + 4, v);                 // B
+        }
+    }
+
+    // Output LUT: nvdisplay 3 heads take one too (nouveau headc57d olut_identity, nvkms
+    // EvoSetupIdentityOutputLutC5): a 0x20-byte VSS header, then 1024 entries of 16-bit fixed point
+    // R, G, B (i << 6) and the last one repeated.
+    for (uint32_t i = 0; i <= 1024; i++) {
+        const uint32_t v = (i < 1024 ? i : 1023) << 6;
+        w32(olut, 0x20 + i * 8 + 0, v | v << 16);
+        w32(olut, 0x20 + i * 8 + 4, v);
+    }
+
+    // Context DMAs and the RAMHT, in the display instance memory: the RAMHT is the first 0x2000 bytes
+    // (1024 entries of handle + context), then 24-byte gv100 DMA objects on 16-byte alignment.
+    {
+        const uint32_t kHandleSync = 0xf0000000, kHandleVram = 0xf0000001, kHandleFb = 0xf0000002;
+        const uint32_t instSync = 0x2000, instVram = 0x2020, instFb = 0x2040;
+        auto dmaObj = [&](uint32_t off, uint64_t start, uint64_t limit, uint32_t flags = 0x45) {
+            w32(inst, off + 0x00, flags);                   // 0x45: VRAM | RW | small pages, pitch kind
+            w32(inst, off + 0x04, (uint32_t)(start >> 8));
+            w32(inst, off + 0x08, (uint32_t)(start >> 40));
+            w32(inst, off + 0x0c, (uint32_t)(limit >> 8));
+            w32(inst, off + 0x10, (uint32_t)(limit >> 40));
+        };
+        dmaObj(instSync, sync.pa, sync.pa + 0xfff);
+        {
+            uint64_t end = fb.pa + fb.size;
+            if (ilut.pa + ilut.size > end)
+                end = ilut.pa + ilut.size;
+            if (olut.pa + olut.size > end)
+                end = olut.pa + olut.size;
+            dmaObj(instVram, 0, ((end + 0xfffff) & ~0xfffffull) - 1);
+            // Scanout (ISO) surfaces take a big-page context DMA (nv50_wndw_ctxdma_new: GF119_DMA_V0_PAGE_LP).
+            dmaObj(instFb, 0, ((end + 0xfffff) & ~0xfffffull) - 1, 0x05);
+        }
+        // nvkm_ramht_insert: hash(chid, handle) with linear probing; context = chid << 25 | client | inst << 9.
+        bool used[1024] = {};
+        auto ramhtInsert = [&](uint32_t chid, uint32_t handle, uint32_t instOff) {
+            uint32_t hash = 0;
+            for (uint32_t h = handle; h; h >>= 10)
+                hash ^= h & 1023;
+            hash ^= chid << 6;
+            hash &= 1023;
+            for (uint32_t n = 0; n < 1024; n++, hash = (hash + 1) & 1023)
+                if (!used[hash]) {
+                    used[hash] = true;
+                    w32(inst, hash * 8 + 0, handle);
+                    w32(inst, hash * 8 + 4, chid << 25 | (g->hClient & 0x3fff) | instOff << 9);
+                    return true;
+                }
+            return false;
+        };
+        // chid.user: core 0, window n 1 + n.
+        if (!ramhtInsert(0, kHandleSync, instSync) || !ramhtInsert(0, kHandleVram, instVram) ||
+            !ramhtInsert(1, kHandleSync, instSync) || !ramhtInsert(1, kHandleVram, instVram) ||
+            !ramhtInsert(1, kHandleFb, instFb))
+            FAIL("RAMHT full");
+        // The RM may need the client handle's bit 13 free: the context ORs inst << 9 over it.
+        if (g->hClient & 0x2000)
+            LOG("GSP: modeset: warning: client handle 0x%x has bit 13 set, which collides with the DMA object offset", g->hClient);
+        bar1Flush();
+        LOG("GSP: modeset: RAMHT and DMA objects written; sync 0x%llx, surface 0x%llx (%u x %u, pitch %u)",
+            (unsigned long long)sync.pa, (unsigned long long)fb.pa, hact, vact, pitch);
+
+        // RM objects.
+        hRoot = g->nextHandle;
+        g->nextHandle += 8;
+        if (!gspRmAlloc(g->hClient, g->hDevice, hRoot, 0xc570 /* TU102_DISP */, nullptr, 0, &st)) {
+            LOG("GSP: modeset: TU102_DISP allocation failed (status 0x%x)", st);
+            FAIL("TU102_DISP allocation failed");
+        }
+        {
+            uint8_t man[8] = {};         // NV0073_CTRL_CMD_DP_SET_MANUAL_DISPLAYPORT: as r535_disp_oneinit
+            gspRmControl(g->hClient, g->hDisp, 0x731365, man, sizeof(man), &st);
+        }
+        auto chanAlloc = [&](uint32_t hclass, Mem &pb, uint32_t &hObj) {
+            uint8_t cp[56] = {};         // NV2080_CTRL_INTERNAL_DISPLAY_CHANNEL_PUSHBUFFER (r570 layout)
+            put32(cp, 0, 2);             // ADDR_FBMEM
+            put64(cp, 8, pb.pa);
+            put64(cp, 16, pb.size - 1);
+            put32(cp, 28, hclass);
+            put32(cp, 32, 0);            // channel instance
+            cp[36] = 1;                  // valid
+            put32(cp, 40, 1);            // pbTargetAperture: PHYS_NVM
+            put32(cp, 44, 0);            // channelPBSize: 4 KiB
+            put32(cp, 48, 1);            // subDeviceId: BIT(0)
+            if (!gspRmControl(g->hIntClient, g->hIntSubdevice, 0x20800a58, cp, sizeof(cp), &st)) {
+                LOG("GSP: modeset: DISPLAY_CHANNEL_PUSHBUFFER class 0x%x failed (status 0x%x)", hclass, st);
+                return false;
+            }
+            uint8_t args[40] = {};       // NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS (r570): channelInstance 0, offset 0
+            put32(args, 32, 1);          // subDeviceId: BIT(0)
+            hObj = hclass << 16;
+            if (!gspRmAlloc(g->hClient, hRoot, hObj, hclass, args, sizeof(args), &st)) {
+                LOG("GSP: modeset: channel class 0x%x allocation failed (status 0x%x)", hclass, st);
+                return false;
+            }
+            return true;
+        };
+        if (!chanAlloc(0xc57d, pbCore, hCoreObj))
+            FAIL("core channel allocation failed");
+        LOG("GSP: modeset: core channel allocated");
+        if (!chanAlloc(0xc57e, pbWndw, hWndwObj))
+            FAIL("window channel allocation failed");
+        LOG("GSP: modeset: window channel allocated");
+
+        // SOR: DFP_ASSIGN_SOR for the display, as r535_outp_acquire.
+        {
+            uint8_t as[80] = {};
+            put32(as, 4, displayId);
+            if (!gspRmControl(g->hClient, g->hDisp, 0x731152, as, sizeof(as), &st)) {
+                LOG("GSP: modeset: DFP_ASSIGN_SOR failed (status 0x%x)", st);
+                FAIL("DFP_ASSIGN_SOR failed");
+            }
+            for (uint32_t i = 0; i < 4; i++) {
+                uint32_t mask;
+                memcpy(&mask, as + 40 + i * 8, 4);
+                if (mask & displayId) {
+                    sorIdx = i;
+                    break;
+                }
+            }
+            LOG("GSP: modeset: display 0x%x -> SOR %d", displayId, (int)sorIdx);
+            if (sorIdx == 0xffffffff)
+                FAIL("no SOR assigned");
+        }
+
+        // Channels: a push buffer, the PUT/GET registers in the BAR0 user region, and a kick that
+        // flushes BAR1 first (push buffer fetches are not coherent with it).
+        struct Chan { Mem *pb; uint32_t user; uint32_t cur; uint32_t chid; } core = { &pbCore, 0x680000, 0, 0 },
+                                                                              wndw = { &pbWndw, 0x690000, 0, 1 };
+        // Every method is kicked and checked on its own: the exception registers (stat: type << 12 | mthd >> 2,
+        // data, code) then name the first method the display engine objects to. Acked as nouveau does (0x90000000).
+        uint32_t nErr = 0, nRb = 0;
+        auto mthd = [&](Chan &c, uint32_t m, uint32_t v) {
+            w32(*c.pb, c.cur * 4, 0u << 29 | 1u << 18 | m);       // METHOD_OFFSET is bits 13:2: the byte offset as is
+            w32(*c.pb, c.cur * 4 + 4, v);
+            c.cur += 2;
+            bar1Flush();
+            wr32(c.user, c.cur * 4);
+            for (int i = 0; i < 1000 && rd32(c.user + 4) != c.cur * 4; i++)
+                IODelay(10);
+            IODelay(200);
+            // The channel's control region maps a method offset to its assembly-state register: read it back.
+            const uint32_t rb = rd32(c.user + m);
+            if (rb != v && nRb++ < 40)
+                LOG("GSP: modeset: %s method 0x%04x wrote 0x%08x, reads back 0x%08x", c.chid ? "window" : "core", m, v, rb);
+            const uint32_t stat = rd32(0x611020 + c.chid * 12);
+            if ((stat >> 12) & 7) {
+                if (nErr++ < 12)
+                    LOG("GSP: modeset: %s method 0x%04x data 0x%08x -> exception stat 0x%08x data 0x%08x code 0x%08x",
+                        c.chid ? "window" : "core", m, v, stat, rd32(0x611024 + c.chid * 12),
+                        rd32(0x611028 + c.chid * 12));
+                wr32(0x611020 + c.chid * 12, 0x90000000);
+            }
+        };
+        auto kick = [&](Chan &c) {
+            bar1Flush();
+            wr32(c.user, c.cur * 4);
+            for (int i = 0; i < 2000; i++) {
+                if (rd32(c.user + 4) == c.cur * 4)
+                    return true;
+                IOSleep(1);
+            }
+            LOG("GSP: modeset: channel 0x%x did not consume its push buffer: PUT 0x%x GET 0x%x", c.user,
+                rd32(c.user), rd32(c.user + 4));
+            return false;
+        };
+        auto ntfyDone = [&]() {
+            for (int i = 0; i < 2000; i++) {
+                if ((*(volatile uint32_t *)sync.cpu >> 30) == 2)        // NV_DISP_NOTIFIER _0 STATUS: FINISHED
+                    return true;
+                IOSleep(1);
+            }
+            return false;
+        };
+        auto coreUpdate = [&](uint32_t windowMask) {
+            *(volatile uint32_t *)sync.cpu = 0;                                    // NOT_BEGUN
+            mthd(core, 0x20c, 0u | 0u << 4 | 1u << 12);                            // NOTIFIER_CONTROL: write, offset 0, enable
+            mthd(core, 0x218, 0);                                                  // SET_INTERLOCK_FLAGS (cursors)
+            mthd(core, 0x21c, windowMask);                                         // SET_WINDOW_INTERLOCK_FLAGS
+            mthd(core, 0x200, 1);                                                  // UPDATE
+            mthd(core, 0x20c, 0);                                                  // NOTIFY disable
+            if (!kick(core))
+                return false;
+            if (!ntfyDone()) {              // not fatal: the update may have run with the notifier unwritten
+                LOG("GSP: modeset: warning: core notifier not written (0x%08x); going on", *(volatile uint32_t *)sync.cpu);
+                IOSleep(100);
+            }
+            return true;
+        };
+
+        // Core init: notifier ctxdma and the usage bounds of the eight windows (corec57d_init).
+        mthd(core, 0x208, kHandleSync);
+        for (uint32_t i = 0; i < 8; i++) {
+            mthd(core, 0x1004 + i * 0x80, 0xf);                                    // RGB packed 1/2/4/8 bpp
+            mthd(core, 0x1008 + i * 0x80, 0);
+            mthd(core, 0x1010 + i * 0x80, 0x7fff | 1u << 16 | 1u << 20);          // pixels/line, ILUT, 2 taps
+        }
+        if (!kick(core))
+            FAIL("core init not consumed");
+        LOG("GSP: modeset: core channel initialised");
+
+        // SOR control, head raster, clock, output resource (headc57d_*).
+        mthd(core, 0x300 + sorIdx * 0x20, rmProto << 8 | 1u << head);              // SOR_SET_CONTROL: protocol, owner head
+        mthd(core, 0x2020 + head * 0x400, displayId);                              // HEAD_SET_DISPLAY_ID
+        mthd(core, 0x204c + head * 0x400, hact | vact << 16);                      // viewport in
+        mthd(core, 0x2058 + head * 0x400, hact | vact << 16);                      // viewport out
+        mthd(core, 0x2064 + head * 0x400, htotal | vtotal << 16);                  // raster size
+        mthd(core, 0x2068 + head * 0x400, (hsw - 1) | (vsw - 1) << 16);            // sync end
+        const uint32_t hblankE = htotal - hsyncs - 1, vblankE = vtotal - vsyncs - 1;
+        mthd(core, 0x206c + head * 0x400, hblankE | vblankE << 16);                // blank end
+        mthd(core, 0x2070 + head * 0x400, (hblankE + hact) | (vblankE + vact) << 16);   // blank start
+        mthd(core, 0x2074 + head * 0x400, 0u << 16 | 1);                           // blank2 end / start (undocumented, as nouveau)
+        mthd(core, 0x2008 + head * 0x400, 0);                                      // progressive
+        mthd(core, 0x200c + head * 0x400, pclkKhz * 1000);                         // pixel clock
+        mthd(core, 0x2028 + head * 0x400, pclkKhz * 1000);                         // pixel clock max
+        mthd(core, 0x2030 + head * 0x400, 4u | 1u << 4 | 1u << 8 | 1u << 12);      // head usage bounds
+        mthd(core, 0x2004 + head * 0x400, (nhsync ? 4u : 0) | (nvsync ? 8u : 0) | 4u << 4 | 0x3fu << 26);
+        mthd(core, 0x2000 + head * 0x400, 0);                                      // procamp: RGB, VESA range
+        mthd(core, 0x2280 + head * 0x400, (4u + 1025u) << 8 | 2u << 2 | 1u);      // OLUT: size, DIRECT10, interpolate
+        mthd(core, 0x2284 + head * 0x400, 0xffffffff);                             // OLUT FP norm scale
+        mthd(core, 0x2288 + head * 0x400, kHandleVram);                            // OLUT context DMA
+        mthd(core, 0x228c + head * 0x400, (uint32_t)(olut.pa >> 8));               // OLUT offset
+        // Window ownership (corec37d_wndw_owner): window i belongs to head i / 2. Its own update.
+        for (uint32_t i = 0; i < 8; i++)
+            mthd(core, 0x1000 + i * 0x80, i >> 1);
+        if (!coreUpdate(0))
+            FAIL("core update (head, SOR, window owner) did not complete");
+        LOG("GSP: modeset: core update done (notifier finished)");
+
+        // Window 0: the surface (wndwc37e_image_set, blend_set), interlocked with the core.
+        mthd(wndw, 0x308, 1u | 0u << 4);                                           // present: interval 1, non-tearing
+        mthd(wndw, 0x224, hact | vact << 16);                                      // size
+        mthd(wndw, 0x228, 0u | 1u << 4);                                           // storage: pitch layout
+        mthd(wndw, 0x22c, 0xe6);                                                   // params: X8R8G8B8, RGB, no gamma
+        mthd(wndw, 0x230, pitch >> 6);                                             // planar storage 0: pitch
+        mthd(wndw, 0x240, kHandleFb);                                              // context DMA ISO 0
+        mthd(wndw, 0x260, (uint32_t)(fb.pa >> 8));                                 // offset 0
+        mthd(wndw, 0x290, 0);                                                      // point in
+        mthd(wndw, 0x298, hact | vact << 16);                                      // size in
+        mthd(wndw, 0x2a4, hact | vact << 16);                                      // size out
+        mthd(wndw, 0x2a8, 1u | 1u << 4);                                           // input scaler: 2 taps each way
+        static const uint32_t fmtIdentity[12] = { 0x10000, 0, 0, 0, 0, 0x10000, 0, 0, 0, 0, 0x10000, 0 };
+        for (uint32_t i = 0; i < 12; i++)
+            mthd(wndw, 0x400 + i * 4, fmtIdentity[i]);                             // FMT matrix: identity (RGB)
+        mthd(wndw, 0x440, (4u + 1025u) << 8 | 2u << 2);                            // ILUT: size, DIRECT10, no interp
+        mthd(wndw, 0x444, kHandleVram);                                            // ILUT context DMA
+        mthd(wndw, 0x448, (uint32_t)(ilut.pa >> 8));                               // ILUT offset
+        mthd(wndw, 0x59c, 0);                                                      // CSC11 off (identity, as nvkms)
+        mthd(wndw, 0x2ec, 0u | 255u << 4);                                         // composition control: depth 255
+        mthd(wndw, 0x2f0, 255);                                                    // constant alpha K1
+        mthd(wndw, 0x2f4, 0x4422);                                                 // src K1, dst NEG_K1
+        mthd(wndw, 0x2f8, 0xffff0000);
+        mthd(wndw, 0x2fc, 0xffff0000);
+        mthd(wndw, 0x300, 0xffff0000);
+        mthd(wndw, 0x304, 0xffff0000);
+        mthd(wndw, 0x370, 1);                                                      // interlock with the core
+        mthd(wndw, 0x374, 1);                                                      // and window 0
+        mthd(wndw, 0x200, 1);                                                      // UPDATE
+        if (!kick(wndw))
+            FAIL("window push buffer not consumed");
+        if (!coreUpdate(1))
+            FAIL("interlocked core update did not complete");
+        LOG("GSP: modeset: window update done: scanning out %ux%u on head %u -> SOR %u", hact, vact, head, sorIdx);
+
+    }
+    dump();
+    g->dispLit = true;              // keeps the idle power-off away while the display scans out
+    setProperty("NVDisplayModeset", "ok");
+    return true;
+fail:
+    LOG("GSP: modeset: FAILED: %s", what);
+    if (hRoot)
+        dump();
+    setProperty("NVDisplayModeset", what);
+    return false;
+#undef FAIL
 }
 
 // Item 4 (non-stall interrupts), step 1: read-only probe. Asks GSP-RM which interrupt vectors the

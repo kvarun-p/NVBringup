@@ -1145,6 +1145,8 @@ bool NVBringup::createRmObjects()
         probeIntr();
         if (!initBar1())
             LOG("GSP: BAR1 unavailable: CPU-mappable VRAM disabled");
+        else if (g->dispModeId)
+            modesetDisplay(g->dispModeId, g->dispModeProto, g->dispModeEdid);
     }
     if (ready && tests) {
         testScrub();

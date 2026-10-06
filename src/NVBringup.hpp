@@ -221,6 +221,7 @@ private:
     bool     initGrGlobal();
     void     initNvdec();
     void     probeDisplay();
+    bool     modesetDisplay(uint32_t displayId, uint32_t rmProto, const uint8_t *edid);
     void     queryGrInfo();
     void     probeIntr();               // read-only: CPU interrupt table and tree state
     bool     initBar1();
