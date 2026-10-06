@@ -1049,6 +1049,40 @@ bool NVBringup::modesetDisplay(uint32_t displayId, uint32_t rmProto, const uint8
     dump();
     g->dispLit = true;              // keeps the idle power-off away while the display scans out
     setProperty("NVDisplayModeset", "ok");
+    // For NVFramebuffer.kext (display/): the scanout surface as a physical BAR1 range, its mode and
+    // the sink's EDID, then the NVDisplayLit resource its personality matches.
+    if (IODeviceMemory *bar1 = pci_->getDeviceMemoryWithIndex(1)) {
+        OSDictionary *d = OSDictionary::withCapacity(10);
+        if (d) {
+            auto num = [&](const char *k, uint64_t v, unsigned bits) {
+                if (OSNumber *n = OSNumber::withNumber(v, bits)) {
+                    d->setObject(k, n);
+                    n->release();
+                }
+            };
+            num("PhysAddr", bar1->getPhysicalAddress() + fb.bar1, 64);
+            num("Size", fb.size, 64);
+            num("Width", hact, 32);
+            num("Height", vact, 32);
+            num("Pitch", pitch, 32);
+            num("PixelClockKHz", pclkKhz, 32);
+            num("HTotal", htotal, 32);
+            num("VTotal", vtotal, 32);
+            num("HSyncStart", hsyncs, 32);
+            num("HSyncWidth", hsw, 32);
+            num("VSyncStart", vsyncs, 32);
+            num("VSyncWidth", vsw, 32);
+            num("Flags", (nhsync ? 1u : 0) | (nvsync ? 2u : 0), 32);
+            num("DisplayID", displayId, 32);
+            if (OSData *e = OSData::withBytes(edid, 128)) {
+                d->setObject("EDID", e);
+                e->release();
+            }
+            setProperty("NVDisplayFB", d);
+            d->release();
+            publishResource("NVDisplayLit", this);
+        }
+    }
     return true;
 fail:
     LOG("GSP: modeset: FAILED: %s", what);

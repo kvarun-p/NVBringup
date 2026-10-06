@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>NVFramebuffer</string>
+	<key>CFBundleIdentifier</key>
+	<string>io.github.kvarun-p.nvframebuffer</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>NVFramebuffer</string>
+	<key>CFBundlePackageType</key>
+	<string>KEXT</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>0.1.0</string>
+	<key>IOKitPersonalities</key>
+	<dict>
+		<key>NVFramebuffer</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>io.github.kvarun-p.nvframebuffer</string>
+			<key>IOClass</key>
+			<string>NVFramebuffer</string>
+			<!-- On IOResources, not on the GPU's PCI device (see accel/README.md: WindowServer's
+			     GPUWrangler adopts a PCI GPU it finds graphics services under). NVBringup publishes
+			     the NVDisplayLit resource only after a modeset that scans out (boot-arg nvdisp=2). -->
+			<key>IOProviderClass</key>
+			<string>IOResources</string>
+			<key>IOResourceMatch</key>
+			<string>NVDisplayLit</string>
+			<key>IOMatchCategory</key>
+			<string>NVFramebuffer</string>
+			<key>IOProbeScore</key>
+			<integer>1000</integer>
+		</dict>
+	</dict>
+	<key>OSBundleLibraries</key>
+	<dict>
+		<key>com.apple.iokit.IOGraphicsFamily</key>
+		<string>1.0.0b1</string>
+		<key>com.apple.kpi.iokit</key>
+		<string>19.0</string>
+		<key>com.apple.kpi.libkern</key>
+		<string>19.0</string>
+		<key>com.apple.kpi.mach</key>
+		<string>19.0</string>
+	</dict>
+</dict>
+</plist>
