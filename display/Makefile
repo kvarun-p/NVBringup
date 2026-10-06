@@ -30,7 +30,7 @@ vdisplay: $(VDISPLAY)
 
 $(VDISPLAY): vdisplay/nvvdisplay.m ../tools/libnvmac.c ../tools/libnvmac.h ../src/nv_uapi.h | $(BUILD)
 	clang -fobjc-arc -O2 -Wall -Wextra -Wno-unused-parameter -I../tools -I../src vdisplay/nvvdisplay.m ../tools/libnvmac.c \
-		-framework Foundation -framework CoreGraphics -framework IOSurface -framework IOKit -o $@
+		-framework Foundation -framework CoreGraphics -framework IOSurface -framework IOKit -framework ScreenCaptureKit -framework CoreMedia -framework CoreVideo -o $@
 	codesign --force --sign - --identifier io.github.kvarun-p.nvvdisplay $@
 
 $(BUILD)/%.o: src/%.cpp | $(BUILD)

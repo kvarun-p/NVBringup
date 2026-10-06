@@ -3,7 +3,8 @@
 // WindowServer only drives displays of a GPU that has its own Metal display pipeline, so a kernel
 // IOFramebuffer on the NVIDIA GPU hangs the login (display/README.md). Instead this creates a virtual
 // display (CGVirtualDisplay, the private API DeskPad and BetterDisplay use) at the monitor's mode, takes
-// the frames WindowServer composes for it (CGDisplayStream), and copies each frame's dirty rectangles
+// the frames WindowServer composes for it (ScreenCaptureKit, macOS 12.3 and later; CGDisplayStream as a
+// fallback on macOS 14), and copies each frame's dirty rectangles
 // into the surface the NVIDIA GPU scans out. The GPU's copy engine does the copies: each frame's IOSurface is
 // imported once (NVMAC_MEM_IMPORT) and the scanout surface bound (NVMAC_DISPLAY_MEM), so only the dirty
 // rectangles cross PCIe, as DMA. The display has two buffers: the copies go to the one not scanned out, which
@@ -14,7 +15,8 @@
 // disconnect; this follows it once a second, removing the virtual display while nothing is lit (so macOS
 // moves the windows back) and making it again, at the new monitor's mode, when one is.
 //
-//   nvvdisplay            run until killed (the LaunchAgent from install.sh)
+//   nvvdisplay                     run until killed (the LaunchAgent from install.sh)
+//   nvvdisplay --cgdisplaystream   capture with CGDisplayStream instead (macOS 14 only; for comparison)
 //
 // Needs the Screen Recording permission (System Settings → Privacy & Security) for whatever starts it.
 
@@ -22,6 +24,9 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <IOKit/IOKitLib.h>
 #import <IOSurface/IOSurface.h>
+#import <ScreenCaptureKit/ScreenCaptureKit.h>
+#import <CoreMedia/CoreMedia.h>
+#import <CoreVideo/CoreVideo.h>
 #include <signal.h>
 #include "libnvmac.h"
 
@@ -138,8 +143,20 @@ static NSString *edidName(const Monitor *mon)
 
 // ---- A session: the virtual display for one lit monitor ---------------------------------------------
 
-@interface NVSession : NSObject
+static BOOL gUseCG;                 // --cgdisplaystream
+
+// Runs the main run loop (and so the main queue) until *done is set there, or timeout seconds pass.
+static BOOL spinUntil(const BOOL *done, double timeout)
+{
+    const CFAbsoluteTime end = CFAbsoluteTimeGetCurrent() + timeout;
+    while (!*done && CFAbsoluteTimeGetCurrent() < end)
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, true);
+    return *done;
+}
+
+@interface NVSession : NSObject <SCStreamOutput, SCStreamDelegate>
 @property (nonatomic) uint32_t gen;
+@property (nonatomic, readonly) BOOL failed;    // the capture stopped on its own (main queue)
 - (BOOL)startWithMonitor:(const Monitor *)mon;
 - (void)stop;
 - (void)report;
@@ -166,7 +183,8 @@ static uint32_t *ceMthd(uint32_t *p, uint32_t method, uint32_t count, const uint
     uint64_t _fbSize;
     uint32_t _w, _h, _pitch;
     CGVirtualDisplay *_vd;
-    CGDisplayStreamRef _stream;
+    CGDisplayStreamRef _stream;     // capture: one of these
+    SCStream *_scStream;
     dispatch_queue_t _q;
     BOOL _active;                   // on _q: copies allowed (cleared before the surface is unmapped)
     uint64_t _frames, _rects, _bytes, _lastFrames, _gpuFrames;
@@ -239,61 +257,200 @@ static uint32_t *ceMthd(uint32_t *p, uint32_t method, uint32_t count, const uint
     // Its frames: dirty rectangles copied into the scanout surface.
     _q = dispatch_queue_create("nvvdisplay.copy", DISPATCH_QUEUE_SERIAL);
     _active = YES;
-    uint8_t *fb = _fb;
-    const uint32_t fbW = _w, fbH = _h, fbPitch = _pitch;
+    const char *how = NULL;
+    if (!gUseCG && [self startScreenCaptureKit:did hz:hz])
+        how = "ScreenCaptureKit";
+    else if ([self startDisplayStream:did hz:hz])
+        how = "CGDisplayStream";
+    if (!how) {
+        fprintf(stderr, "nvvdisplay: no capture of the virtual display (Screen Recording permission?)\n");
+        [self stop];
+        return NO;
+    }
+    printf("nvvdisplay: display generation %u: virtual display %u \"%s\" %ux%u @ %.2f Hz, captured by %s\n", self.gen,
+           did, desc.name.UTF8String, _w, _h, hz, how);
+    fflush(stdout);
+    return YES;
+}
+
+// ScreenCaptureKit: the virtual display as an SCDisplay (it shows up shortly after it's made), streamed at
+// its own size and rate. Frames arrive on _q (stream:didOutputSampleBuffer:ofType:).
+- (BOOL)startScreenCaptureKit:(CGDirectDisplayID)did hz:(double)hz
+{
+    SCDisplay *display = nil;
+    for (int attempt = 0; attempt < 20 && !display; attempt++) {
+        __block BOOL done = NO;
+        __block SCShareableContent *content = nil;
+        __block NSError *error = nil;
+        [SCShareableContent getShareableContentExcludingDesktopWindows:YES onScreenWindowsOnly:YES
+            completionHandler:^(SCShareableContent *c, NSError *e) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    content = c;
+                    error = e;
+                    done = YES;
+                });
+            }];
+        if (!spinUntil(&done, 5.0) || error) {
+            fprintf(stderr, "nvvdisplay: ScreenCaptureKit: listing displays failed (%s)\n",
+                    error ? error.localizedDescription.UTF8String : "timed out");
+            return NO;
+        }
+        for (SCDisplay *d in content.displays)
+            if (d.displayID == did)
+                display = d;
+        if (!display) {
+            BOOL never = NO;
+            spinUntil(&never, 0.25);
+        }
+    }
+    if (!display) {
+        fprintf(stderr, "nvvdisplay: ScreenCaptureKit doesn't list virtual display %u\n", did);
+        return NO;
+    }
+    SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
+    SCStreamConfiguration *cfg = [SCStreamConfiguration new];
+    cfg.width = _w;
+    cfg.height = _h;
+    cfg.pixelFormat = kCVPixelFormatType_32BGRA;
+    cfg.minimumFrameInterval = CMTimeMake(1000, (int32_t)lround(hz * 1000.0));
+    cfg.showsCursor = YES;
+    cfg.scalesToFit = NO;
+    cfg.queueDepth = 5;                         // within the surface cache (kSurfCache)
+    cfg.captureResolution = SCCaptureResolutionNominal;
+    _scStream = [[SCStream alloc] initWithFilter:filter configuration:cfg delegate:self];
+    NSError *error = nil;
+    if (![_scStream addStreamOutput:self type:SCStreamOutputTypeScreen sampleHandlerQueue:_q error:&error]) {
+        fprintf(stderr, "nvvdisplay: ScreenCaptureKit: %s\n", error.localizedDescription.UTF8String);
+        _scStream = nil;
+        return NO;
+    }
+    __block BOOL done = NO;
+    __block NSError *startError = nil;
+    [_scStream startCaptureWithCompletionHandler:^(NSError *e) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            startError = e;
+            done = YES;
+        });
+    }];
+    if (!spinUntil(&done, 10.0) || startError) {
+        fprintf(stderr, "nvvdisplay: ScreenCaptureKit: starting the stream failed (%s)\n",
+                startError ? startError.localizedDescription.UTF8String : "timed out");
+        [self stopScreenCaptureKit];
+        return NO;
+    }
+    return YES;
+}
+
+- (void)stream:(SCStream *)stream didOutputSampleBuffer:(CMSampleBufferRef)sb ofType:(SCStreamOutputType)type
+{
+    if (type != SCStreamOutputTypeScreen || !_active)
+        return;
+    CFArrayRef atts = CMSampleBufferGetSampleAttachmentsArray(sb, false);
+    NSDictionary *info = atts && CFArrayGetCount(atts) ? (__bridge NSDictionary *)CFArrayGetValueAtIndex(atts, 0) : nil;
+    NSNumber *status = info[SCStreamFrameInfoStatus];
+    if (!status || status.integerValue != SCFrameStatusComplete)    // idle, blank, ...: no new image
+        return;
+    CVImageBufferRef img = CMSampleBufferGetImageBuffer(sb);
+    IOSurfaceRef surf = img ? CVPixelBufferGetIOSurface(img) : NULL;
+    if (!surf)
+        return;
+    // Documented as NSValues; some releases hand out CGRect dictionaries. Either is taken.
+    NSArray *dirty = info[SCStreamFrameInfoDirtyRects];
+    CGRect rects[kMaxRects];
+    size_t n = 0;
+    BOOL all = dirty == nil || dirty.count > kMaxRects;
+    for (id v in all ? nil : dirty) {
+        CGRect r = CGRectNull;
+        if ([v isKindOfClass:NSValue.class])
+            [v getValue:&r size:sizeof(r)];
+        else if ([v isKindOfClass:NSDictionary.class] && !CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)v, &r))
+            r = CGRectNull;
+        if (!CGRectIsNull(r))
+            rects[n++] = r;
+    }
+    if (all)
+        n = 0;                              // the whole frame
+    [self frame:surf rects:rects count:n];
+}
+
+- (void)stream:(SCStream *)stream didStopWithError:(NSError *)error
+{
+    fprintf(stderr, "nvvdisplay: ScreenCaptureKit stopped the stream: %s\n", error.localizedDescription.UTF8String);
+    dispatch_async(dispatch_get_main_queue(), ^{ self->_failed = YES; });
+}
+
+- (void)stopScreenCaptureKit
+{
+    if (!_scStream)
+        return;
+    __block BOOL done = NO;
+    [_scStream stopCaptureWithCompletionHandler:^(NSError *e) {
+        dispatch_async(dispatch_get_main_queue(), ^{ done = YES; });
+    }];
+    spinUntil(&done, 5.0);
+    [_scStream removeStreamOutput:self type:SCStreamOutputTypeScreen error:nil];
+    _scStream = nil;
+}
+
+// CGDisplayStream: macOS 14 only (removed in 15), for when ScreenCaptureKit fails or --cgdisplaystream.
+- (BOOL)startDisplayStream:(CGDirectDisplayID)did hz:(double)hz
+{
     __unsafe_unretained NVSession *weakSelf = self;     // the stream is stopped and drained before self goes
 #pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"     // CGDisplayStream: removed in macOS 15
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
     NSDictionary *props = @{ (__bridge NSString *)kCGDisplayStreamShowCursor : @YES,
                              (__bridge NSString *)kCGDisplayStreamMinimumFrameTime : @(1.0 / hz) };
     _stream = CGDisplayStreamCreateWithDispatchQueue(
-        did, fbW, fbH, 'BGRA', (__bridge CFDictionaryRef)props, _q,
+        did, _w, _h, 'BGRA', (__bridge CFDictionaryRef)props, _q,
         ^(CGDisplayStreamFrameStatus status, uint64_t time, IOSurfaceRef surf, CGDisplayStreamUpdateRef upd) {
             NVSession *me = weakSelf;
             if (status != kCGDisplayStreamFrameStatusFrameComplete || !surf || !me->_active)
                 return;
-            me->_frames++;
             size_t n = 0;
             const CGRect *r = upd ? CGDisplayStreamUpdateGetRects(upd, kCGDisplayStreamUpdateDirtyRects, &n) : NULL;
-            const CGRect all = CGRectMake(0, 0, fbW, fbH);
-            if (!r || !n) {
-                r = &all;
-                n = 1;
-            }
-            IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL);
-            const size_t sw = IOSurfaceGetWidth(surf), sh = IOSurfaceGetHeight(surf);
-            const CGRect bounds = CGRectMake(0, 0, MIN(sw, fbW), MIN(sh, fbH));
-            if (!(me->_gpu && [me gpuCopy:surf rects:r count:n bounds:bounds])) {
-                if ([me cpuCopyNeedsFullFrame]) {
-                    r = &bounds;
-                    n = 1;
-                }
-                const uint8_t *src = IOSurfaceGetBaseAddress(surf);
-                const size_t srcPitch = IOSurfaceGetBytesPerRow(surf);
-                for (size_t i = 0; i < n; i++) {
-                    CGRect c = CGRectIntegral(CGRectIntersection(r[i], bounds));
-                    if (CGRectIsEmpty(c))
-                        continue;
-                    const size_t x = (size_t)c.origin.x, y = (size_t)c.origin.y;
-                    const size_t w = (size_t)c.size.width, h = (size_t)c.size.height;
-                    for (size_t row = 0; row < h; row++)
-                        memcpy(fb + (y + row) * fbPitch + x * 4, src + (y + row) * srcPitch + x * 4, w * 4);
-                    me->_rects++;
-                    me->_bytes += (uint64_t)w * h * 4;
-                }
-            }
-            IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+            [me frame:surf rects:r count:r ? n : 0];
         });
-    if (!_stream || CGDisplayStreamStart(_stream) != kCGErrorSuccess) {
+    if (_stream && CGDisplayStreamStart(_stream) == kCGErrorSuccess)
+        return YES;
+    if (_stream)
+        CFRelease(_stream);
 #pragma clang diagnostic pop
-        fprintf(stderr, "nvvdisplay: no display stream (Screen Recording permission?)\n");
-        [self stop];
-        return NO;
+    _stream = NULL;
+    return NO;
+}
+
+// One captured frame (on _q): its dirty rectangles (none: all of it) into the scanout surface.
+- (void)frame:(IOSurfaceRef)surf rects:(const CGRect *)r count:(size_t)n
+{
+    _frames++;
+    const CGRect all = CGRectMake(0, 0, _w, _h);
+    if (!r || !n) {
+        r = &all;
+        n = 1;
     }
-    printf("nvvdisplay: display generation %u: virtual display %u \"%s\" %ux%u @ %.2f Hz\n", self.gen, did,
-           desc.name.UTF8String, _w, _h, hz);
-    fflush(stdout);
-    return YES;
+    IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL);
+    const size_t sw = IOSurfaceGetWidth(surf), sh = IOSurfaceGetHeight(surf);
+    const CGRect bounds = CGRectMake(0, 0, MIN(sw, _w), MIN(sh, _h));
+    if (!(_gpu && [self gpuCopy:surf rects:r count:n bounds:bounds])) {
+        if ([self cpuCopyNeedsFullFrame]) {
+            r = &bounds;
+            n = 1;
+        }
+        const uint8_t *src = IOSurfaceGetBaseAddress(surf);
+        const size_t srcPitch = IOSurfaceGetBytesPerRow(surf);
+        for (size_t i = 0; i < n; i++) {
+            CGRect c = CGRectIntegral(CGRectIntersection(r[i], bounds));
+            if (CGRectIsEmpty(c))
+                continue;
+            const size_t x = (size_t)c.origin.x, y = (size_t)c.origin.y;
+            const size_t w = (size_t)c.size.width, h = (size_t)c.size.height;
+            for (size_t row = 0; row < h; row++)
+                memcpy(_fb + (y + row) * _pitch + x * 4, src + (y + row) * srcPitch + x * 4, w * 4);
+            _rects++;
+            _bytes += (uint64_t)w * h * 4;
+        }
+    }
+    IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
 }
 
 - (void)stop
@@ -301,6 +458,9 @@ static uint32_t *ceMthd(uint32_t *p, uint32_t method, uint32_t count, const uint
     if (_q) {
         dispatch_sync(_q, ^{ self->_active = NO; });     // no copy into the surface from here on
     }
+    [self stopScreenCaptureKit];
+    if (_q)
+        dispatch_sync(_q, ^{});         // no frame handler running
     if (_stream) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -547,16 +707,29 @@ int main(int argc, char **argv)
                             "Security), then run it again\n");
             return 4;
         }
+        for (int i = 1; i < argc; i++)
+            if (!strcmp(argv[i], "--cgdisplaystream"))
+                gUseCG = YES;
         signal(SIGINT, onSignal);
         signal(SIGTERM, onSignal);
 
         // Follows NVBringup's lit display: a session per display generation, none while nothing is lit.
         NVSession *session = nil;
         uint32_t failedGen = UINT32_MAX;        // a generation whose session couldn't start: not retried
+        int restarts = 0;                       // of this generation's session, after its capture stopped
+        uint32_t lastGen = UINT32_MAX;
         BOOL saidIdle = NO;
         for (int tick = 0; !gStop; tick++) {
             Monitor mon;
             const BOOL lit = readMonitor(&mon);
+            if (session && session.failed && lit && mon.gen == session.gen) {
+                [session stop];
+                session = nil;
+                if (++restarts > 3)
+                    failedGen = mon.gen;
+                else
+                    printf("nvvdisplay: restarting the capture\n");
+            }
             if (session && (!lit || mon.gen != session.gen)) {
                 printf("nvvdisplay: display generation %u ended (%s)\n", session.gen, lit ? "changed" : "unplugged");
                 fflush(stdout);
@@ -564,6 +737,9 @@ int main(int argc, char **argv)
                 session = nil;
             }
             if (lit && !session && mon.gen != failedGen) {
+                if (mon.gen != lastGen)
+                    restarts = 0;
+                lastGen = mon.gen;
                 session = [NVSession new];
                 session.gen = mon.gen;
                 if (![session startWithMonitor:&mon]) {

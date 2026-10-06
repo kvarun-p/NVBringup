@@ -76,7 +76,8 @@ on any of them; FWSEC and GSP-RM only run with the boot-arg `nvexperimental=1`. 
 - **Display output only through a virtual display** (optional step 9). The kext lights a TMDS
   (HDMI/DVI) port on the NVIDIA GPU at the monitor's preferred mode. WindowServer still composes everything
   on the Intel GPU, and `nvvdisplay` copies it across: no mode switching, no HDMI audio or InfoFrames (TVs
-  may need their input set to PC), and macOS 14 only (CGDisplayStream). A real framebuffer driver hangs
+  may need their input set to PC). Capture uses ScreenCaptureKit, which Sequoia and Tahoe have too, but only
+  Sonoma is tested (the other GPU-side pieces aren't checked there either). A real framebuffer driver hangs
   the boot, because macOS wants a Metal display pipeline for a GPU that drives a screen (see
   [docs/display.md](docs/display.md)). DisplayPort is untested.
 - **No OpenGL, OpenCL or CUDA.** Metal only with the optional Metal step, and only for apps

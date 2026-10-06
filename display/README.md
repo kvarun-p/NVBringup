@@ -7,7 +7,7 @@ GSP-RM and scans out one pitch-linear X8R8G8B8 surface in VRAM. This directory g
 
 `vdisplay/nvvdisplay` creates a macOS virtual display (CGVirtualDisplay, the private API DeskPad and
 BetterDisplay use) with the monitor's EDID name and mode. It takes the frames WindowServer composes for that display
-(CGDisplayStream, cursor included) and copies each frame's dirty rectangles into the scanout surface. The GPU's copy
+(ScreenCaptureKit, cursor included) and copies each frame's dirty rectangles into the scanout surface. The GPU's copy
 engine does the copies: each frame's IOSurface is imported once (`NVMAC_MEM_IMPORT`, at most 8 cached) and the
 scanout surface bound as a VRAM object (`NVMAC_DISPLAY_MEM`), so only dirty rectangles cross PCIe, as DMA. If any of
 that fails, the CPU copies through a write-combined mapping instead (`NVMAC_DISPLAY_MAP`). The log says which.
@@ -27,8 +27,9 @@ display/vdisplay/install.sh        # a LaunchAgent for this user; -u removes it
 
 It needs the Screen Recording permission, and the first run asks for it. Grant it to `nvvdisplay` in System Settings →
 Privacy & Security. The LaunchAgent retries every 10 s, so it starts once the permission is granted. It logs to
-`~/Library/Logs/nvvdisplay.log`. CGDisplayStream is removed in macOS 15, so Sequoia and Tahoe will need
-ScreenCaptureKit instead. The permission is tied to the binary's ad-hoc signature, so after a rebuild and reinstall,
+`~/Library/Logs/nvvdisplay.log`. ScreenCaptureKit exists from macOS 12.3, so the same capture serves Sonoma,
+Sequoia and Tahoe. On Sonoma, `nvvdisplay --cgdisplaystream` captures with the older CGDisplayStream instead
+(removed in macOS 15), which is also the fallback if ScreenCaptureKit fails. The permission is tied to the binary's ad-hoc signature, so after a rebuild and reinstall,
 switch it off and on again.
 
 Hot-plug: while GSP-RM runs with `nvdisp=2`, NVBringup checks the TMDS outputs' connect state once a second. A

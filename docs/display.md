@@ -78,8 +78,15 @@ so it doesn't start.
 
 `nvvdisplay` creates a virtual display (CGVirtualDisplay, the private CoreGraphics API DeskPad and BetterDisplay
 use) with the monitor's EDID name, size and mode. WindowServer treats it as an ordinary display: arrangement,
-mirroring, full-screen spaces. The helper takes the frames WindowServer composes for it (CGDisplayStream, cursor
-included, with dirty rectangles) and puts them in the scanout buffer:
+mirroring, full-screen spaces. The helper takes the frames WindowServer composes for it, cursor included, with
+dirty rectangles, and puts them in the scanout buffer:
+
+- **Capture:** ScreenCaptureKit (macOS 12.3 and later), so one path serves Sonoma, Sequoia and Tahoe. The
+  virtual display shows up in its display list shortly after it's made; the stream runs at the display's size and
+  refresh rate, BGRA, and each complete frame's IOSurface and dirty rectangles go to the copy below. If the stream
+  stops on its own, the helper restarts it, up to 3 times per display generation. CGDisplayStream, the first
+  version's capture, is removed in macOS 15. It stays as the fallback on Sonoma when ScreenCaptureKit fails, or with
+  `--cgdisplaystream`, for comparison.
 
 - **Copy engine:** each frame's IOSurface is imported into the GPU once (`NVMAC_MEM_IMPORT`; the stream reuses a
   small pool, cached up to 8). The scanout buffers are bound as VRAM objects (`NVMAC_DISPLAY_MEM`, borrowed:
@@ -106,7 +113,8 @@ binary's ad-hoc signature, so a rebuild needs it granted again.
   device type to PC fixes that (verified on the Samsung). They also show a stale source name. An AVI InfoFrame
   (IT content, underscan) and an SPD InfoFrame would fix both.
 - **One mode,** the EDID's preferred one, and one head. No mode switching from macOS.
-- **macOS 14 only:** CGDisplayStream is removed in macOS 15, so Sequoia and Tahoe need ScreenCaptureKit.
+- **Tested on Sonoma only.** The capture runs on Sequoia and Tahoe too. Those systems may ask from time to
+  time whether `nvvdisplay` may keep recording the screen, and Sonoma may show a recording indicator in the menu bar.
 - **Not scanned out directly:** every frame is composed on the Intel GPU and copied. Composing on the NVIDIA GPU
   needs the Metal display pipeline above.
 - **The GPU stays powered with `nvdisp=2`,** monitor or not.
