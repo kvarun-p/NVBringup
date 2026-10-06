@@ -47,5 +47,10 @@ cat > "$PLIST" <<PL
 </dict>
 </plist>
 PL
-launchctl bootstrap "gui/$(id -u)" "$PLIST"
+# launchd may still be removing the old instance: retry for a few seconds.
+for i in 1 2 3 4 5; do
+    launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null && break
+    [ $i = 5 ] && { echo "launchctl bootstrap failed" >&2; exit 1; }
+    sleep 1
+done
 echo "nvvdisplay installed and started; log: $LOG"

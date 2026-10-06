@@ -200,6 +200,23 @@ struct NVBringup::GspState {
     uint32_t hDisp = 0;             // NV04_DISPLAY_COMMON under our device
     uint32_t dispModeId = 0, dispModeProto = 0;   // nvdisp=2: the output and EDID modesetDisplay uses
     uint8_t  dispModeEdid[128] = {};
+    // nvdisp=2: the display engine as set up once per GSP boot (dispInit) and the output it lights
+    // (dispSetMode, from the boot probe or the hot-plug poll). Kernel CPU mappings through BAR1.
+    struct DispHw {
+        NVDispMem inst, pbCore, pbWndw, sync, ilut, olut, fb;
+        uint32_t hRoot = 0;
+        uint32_t coreCur = 0, wndwCur = 0;      // push buffer positions, in words
+        bool     wanted = false, ready = false;
+        uint32_t nCand = 0, candId[4] = {}, candProto[4] = {};   // the TMDS outputs (HDMI/DVI)
+        uint32_t litId = 0, sorIdx = ~0u;
+        uint32_t pendId = 0, pendCount = 0, tick = 0;            // hot-plug debounce
+        uint32_t failId = 0;            // an output that failed to light: not retried until it's unplugged
+        uint32_t nErr = 0;
+        // The lit mode (dispSetMode): the EDID's preferred timing and the surface layout.
+        uint8_t  edid[128] = {};
+        uint32_t proto = 0, w = 0, h = 0, pitch = 0, pclkKhz = 0, htotal = 0, vtotal = 0;
+        uint32_t hsyncStart = 0, hsyncWidth = 0, vsyncStart = 0, vsyncWidth = 0, syncFlags = 0;
+    } disp;
     bool     dispLit = false;          // a modeset scans out: the GPU stays powered
     uint64_t dispFbBar1 = 0, dispFbSize = 0;   // the scanout surface: BAR1 offset and size
     uint32_t dispW = 0, dispH = 0, dispPitch = 0;

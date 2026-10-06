@@ -116,6 +116,7 @@ struct NVBringup::GpuConn {
     uint8_t  syncUsed[NVMAC_SYNC_COUNT] = {};   // 1 = user sync, 2 = context seqno
     IOMemoryMap *syncMap = nullptr;
     IOMemoryMap *dispMap = nullptr;     // NVMAC_DISPLAY_MAP
+    uint64_t dispMapBar1 = 0;
     volatile bool dead = false;         // no GPU state: closed, failed, or GSP-RM gone
     volatile bool anyLost = false;      // a context of this connection was lost (device lost)
 };
@@ -595,6 +596,11 @@ void NVBringup::probeDisplay()
             connected ? "connected" : "not connected");
         ADD(" 0x%x: OR %u/%u proto %u conn 0x%x %s", id, orType, orIndex, proto, connType,
             connected ? "connected" : "-");
+        // TMDS outputs (HDMI/DVI) are what nvdisp=2 lights, now or when one is plugged in.
+        if ((proto == 1 || proto == 2 || proto == 5) && g->disp.nCand < 4) {
+            g->disp.candId[g->disp.nCand] = id;
+            g->disp.candProto[g->disp.nCand++] = proto;
+        }
         if (!connected)
             continue;
         uint8_t *ed = (uint8_t *)IOMallocZero(NV0073_EDID_SIZE);
@@ -644,116 +650,160 @@ void NVBringup::probeDisplay()
     }
     setProperty("NVDisplayProbe", sum);
 #undef ADD
-    if (arm == 2 && modeId) {       // initBar1 runs after this: modesetDisplay is called once it has
+    g->disp.wanted = arm == 2;      // initBar1 runs after this; dispInit and dispSetMode once it has
+    if (arm == 2 && modeId) {
         g->dispModeId = modeId;
         g->dispModeProto = modeProto;
         memcpy(g->dispModeEdid, modeEdid, sizeof(modeEdid));
     }
 }
 
-// Display, step B1 (boot-arg nvdisp=2): the first modeset. Scans a colour-bar test pattern out of VRAM
-// on the first connected TMDS output (HEAD 0, WINDOW 0), following nouveau's r535 path for Turing
-// (c57d core + c57e window channels, no cursor, no window-immediate channel, no HDMI infoframes: the
-// sink gets a DVI-style signal). GSP-RM owns the OR/SOR and the PHY; this writes the channel methods.
-// Order, as nouveau's nv50_disp_atomic_commit_tail for the first modeset:
-//   RM: display root object, push buffers, channels, SOR assignment
-//   core: init (window usage bounds), SOR ctrl, head raster/clock/output resource, window owner, UPDATE
-//   window: surface, format, composition; UPDATE interlocked with the core; core UPDATE
-// Results: the log (every step) and NVDisplayModeset (summary). Nothing here is undone: a failed step
-// leaves the objects allocated until the next boot.
-bool NVBringup::modesetDisplay(uint32_t displayId, uint32_t rmProto, const uint8_t *edid)
+// Display, step B1 (boot-arg nvdisp=2): lighting the HDMI/DVI output, at boot and on hot-plug. Follows
+// nouveau's r535/r570 path for Turing: c57d core + c57e window channels (HEAD 0, WINDOW 0), no cursor, no
+// window-immediate channel, no HDMI infoframes (the sink gets a DVI-style signal). GSP-RM owns the
+// OR/SOR and the PHY; this writes the channel methods.
+//   dispInit     once per GSP boot: instance memory (RAMHT, context DMAs), LUTs, root, channels, core init
+//   dispSetMode  per connect: SOR, head timing from the EDID, the surface (colour bars), window 0, UPDATEs
+//   dispBlank    per disconnect: window 0 and the SOR detached
+//   dispHotplugTick  from the GSP poller: the outputs' connect state once a second (debounced)
+// What nvdisplay 3 requires, found on hardware: the DMA header takes the method's byte offset (bits 13:2);
+// window 0 needs an identity ILUT (else UPDATE INVALID_STATE 0x2d), the head an identity OLUT (0x2e);
+// scanout surfaces take a big-page context DMA. Results: the log, NVDisplayModeset, NVDisplayFB (the lit
+// surface and mode, for nvvdisplay) and NVDisplayGen (bumped whenever the lit display comes or goes).
+
+static const uint32_t kDispHandleSync = 0xf0000000, kDispHandleVram = 0xf0000001, kDispHandleFb = 0xf0000002;
+
+static inline void dispW32(NVDispMem &m, uint32_t off, uint32_t v)
+{
+    *(volatile uint32_t *)(m.cpu + off) = v;
+}
+
+// A VRAM block (pa = 0: allocated here), CPU-mapped uncached through BAR1, zeroed.
+bool NVBringup::dispMemAlloc(NVDispMem &m, uint64_t size, uint64_t pa)
 {
     GspState *g = gsp_;
+    m.size = size;
+    m.pa = pa ? pa : nv_vram_alloc(g->vram, size, 0x10000);
+    if (!m.pa || !bar1Map(m.pa, size, &m.bar1))
+        return false;
+    IODeviceMemory *bar1 = pci_->getDeviceMemoryWithIndex(1);
+    m.map = bar1 ? bar1->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapInhibitCache, m.bar1, size)
+                 : nullptr;
+    if (!m.map)
+        return false;
+    m.cpu = (volatile uint8_t *)m.map->getVirtualAddress();
+    for (uint64_t o = 0; o < size; o += 4)
+        *(volatile uint32_t *)(m.cpu + o) = 0;
+    return true;
+}
+
+// One method on the core (wndw false) or window channel, kicked on its own: the exception registers
+// (gv100_disp_exception: stat = type << 12 | mthd >> 2, data, code) then name the method the engine
+// objects to; acked as nouveau does. Near the end of the 4 KiB push buffer, a JUMP back to 0
+// (nv50_dmac_wind; GET is at the old position then, never 0).
+void NVBringup::dispMthd(bool wndw, uint32_t m, uint32_t v)
+{
+    GspState::DispHw &d = gsp_->disp;
+    NVDispMem &pb = wndw ? d.pbWndw : d.pbCore;
+    uint32_t &cur = wndw ? d.wndwCur : d.coreCur;
+    const uint32_t user = wndw ? 0x690000 : 0x680000, chid = wndw ? 1 : 0;
+    if ((cur + 2) * 4 + 8 > pb.size) {
+        dispW32(pb, cur * 4, 1u << 29);                     // OPCODE_JUMP, offset 0
+        bar1Flush();
+        cur = 0;
+        wr32(user, 0);
+        for (int i = 0; i < 1000 && rd32(user + 4) != 0; i++)
+            IODelay(10);
+    }
+    dispW32(pb, cur * 4, 0u << 29 | 1u << 18 | m);          // METHOD_OFFSET is bits 13:2: the byte offset as is
+    dispW32(pb, cur * 4 + 4, v);
+    cur += 2;
+    bar1Flush();                    // push buffer fetches are not coherent with BAR1
+    wr32(user, cur * 4);
+    for (int i = 0; i < 1000 && rd32(user + 4) != cur * 4; i++)
+        IODelay(10);
+    const uint32_t stat = rd32(0x611020 + chid * 12);
+    if ((stat >> 12) & 7) {
+        if (d.nErr++ < 12)
+            LOG("GSP: display: %s method 0x%04x data 0x%08x -> exception stat 0x%08x data 0x%08x code 0x%08x",
+                wndw ? "window" : "core", m, v, stat, rd32(0x611024 + chid * 12), rd32(0x611028 + chid * 12));
+        wr32(0x611020 + chid * 12, 0x90000000);
+    }
+}
+
+// Waits for the channel to have fetched everything up to PUT.
+bool NVBringup::dispKick(bool wndw)
+{
+    const uint32_t user = wndw ? 0x690000 : 0x680000;
+    for (int i = 0; i < 2000; i++) {
+        if (rd32(user + 4) == rd32(user))
+            return true;
+        IOSleep(1);
+    }
+    LOG("GSP: display: %s channel did not consume its push buffer: PUT 0x%x GET 0x%x", wndw ? "window" : "core",
+        rd32(user), rd32(user + 4));
+    return false;
+}
+
+// Core UPDATE (interlocked with the windows in windowMask), waiting for its notifier. A notifier that
+// stays unwritten is not fatal: the update may have run anyway.
+bool NVBringup::dispCoreUpdate(uint32_t windowMask)
+{
+    GspState::DispHw &d = gsp_->disp;
+    *(volatile uint32_t *)d.sync.cpu = 0;                                  // NOT_BEGUN
+    dispMthd(false, 0x20c, 0u | 0u << 4 | 1u << 12);                       // NOTIFIER_CONTROL: write, offset 0, enable
+    dispMthd(false, 0x218, 0);                                             // SET_INTERLOCK_FLAGS (cursors)
+    dispMthd(false, 0x21c, windowMask);                                    // SET_WINDOW_INTERLOCK_FLAGS
+    dispMthd(false, 0x200, 1);                                             // UPDATE
+    dispMthd(false, 0x20c, 0);                                             // NOTIFY disable
+    if (!dispKick(false))
+        return false;
+    for (int i = 0; i < 2000; i++) {
+        if ((*(volatile uint32_t *)d.sync.cpu >> 30) == 2)                 // NV_DISP_NOTIFIER _0 STATUS: FINISHED
+            return true;
+        IOSleep(1);
+    }
+    LOG("GSP: display: warning: core notifier not written (0x%08x); going on", *(volatile uint32_t *)d.sync.cpu);
+    IOSleep(100);
+    return true;
+}
+
+// The exception registers, the channels' PUT/GET, head 0's assembly and armed state and its raster position.
+void NVBringup::dispDump()
+{
+    for (uint32_t chid = 0; chid < 2; chid++)
+        LOG("GSP: display: exception chid %u: stat 0x%08x data 0x%08x code 0x%08x", chid, rd32(0x611020 + chid * 12),
+            rd32(0x611024 + chid * 12), rd32(0x611028 + chid * 12));
+    LOG("GSP: display: core PUT 0x%x GET 0x%x; window PUT 0x%x GET 0x%x", rd32(0x680000), rd32(0x680004),
+        rd32(0x690000), rd32(0x690004));
+    for (uint32_t pass = 0; pass < 2; pass++) {
+        // gv100_head_state: 0x682xxx is the core channel's assembly state, 0x68axxx the armed (active) one.
+        const uint32_t base = pass ? 0x68a000 : 0x682000;
+        LOG("GSP: display: head 0 %s: raster 0x%08x sync 0x%08x blankE 0x%08x blankS 0x%08x clk %u",
+            pass ? "armed" : "asm", rd32(base + 0x64), rd32(base + 0x68), rd32(base + 0x6c), rd32(base + 0x70),
+            rd32(base + 0x0c));
+    }
+    const uint32_t v0 = rd32(0x616330);
+    IOSleep(20);
+    LOG("GSP: display: head 0 raster line %u, 20 ms later %u", v0 & 0xffff, rd32(0x616330) & 0xffff);
+}
+
+// Once per GSP boot, after BAR1 is up: everything that doesn't depend on the display that is plugged in.
+bool NVBringup::dispInit()
+{
+    GspState *g = gsp_;
+    GspState::DispHw &d = g->disp;
     uint32_t st = 0;
+    if (d.ready)
+        return true;
+    if (!d.wanted || !g->hDisp || !g->dispInst)
+        return false;
     const char *what = "";
 #define FAIL(msg) do { what = msg; goto fail; } while (0)
-    struct Mem { uint64_t pa = 0, bar1 = 0, size = 0; IOMemoryMap *map = nullptr; volatile uint8_t *cpu = nullptr; };
-    Mem inst, pbCore, pbWndw, sync, fb, ilut, olut;
-    uint32_t hRoot = 0, hCoreObj = 0, hWndwObj = 0;
-    uint32_t head = 0, sorIdx = 0xffffffff;
-
-    // Mode: the EDID's first detailed timing descriptor (bytes 54..71).
-    const uint8_t *d = edid + 54;
-    const uint32_t pclkKhz = (uint32_t)(d[0] | d[1] << 8) * 10;
-    const uint32_t hact = d[2] | (uint32_t)(d[4] & 0xf0) << 4, hblank = d[3] | (uint32_t)(d[4] & 0x0f) << 8;
-    const uint32_t vact = d[5] | (uint32_t)(d[7] & 0xf0) << 4, vblank = d[6] | (uint32_t)(d[7] & 0x0f) << 8;
-    const uint32_t hso = d[8] | (uint32_t)(d[11] & 0xc0) << 2, hsw = d[9] | (uint32_t)(d[11] & 0x30) << 4;
-    const uint32_t vso = (d[10] >> 4) | (uint32_t)(d[11] & 0x0c) << 2, vsw = (d[10] & 0x0f) | (uint32_t)(d[11] & 0x03) << 4;
-    const uint32_t flags = d[17];
-    if (!pclkKhz || !hact || !vact || (flags & 0x80)) {      // no timing, or interlaced
-        LOG("GSP: modeset: EDID has no usable progressive detailed timing (pclk %u kHz %ux%u flags 0x%x)",
-            pclkKhz, hact, vact, flags);
-        return false;
-    }
-    const bool nhsync = !(flags & 0x02), nvsync = !(flags & 0x04);
-    const uint32_t htotal = hact + hblank, vtotal = vact + vblank;
-    const uint32_t hsyncs = hact + hso, vsyncs = vact + vso;
-    LOG("GSP: modeset: display 0x%x proto %u: %ux%u, pclk %u kHz, h %u/%u/%u/%u v %u/%u/%u/%u, hsync %c vsync %c",
-        displayId, rmProto, hact, vact, pclkKhz, hact, hso, hsw, htotal, vact, vso, vsw, vtotal,
-        nhsync ? '-' : '+', nvsync ? '-' : '+');
-    const uint32_t pitch = (hact * 4 + 255) & ~255u;
-
-    // VRAM blocks, CPU-mapped through BAR1 (the push buffers, display instance memory and the surface).
-    auto memAlloc = [&](Mem &m, uint64_t size, uint64_t pa) {
-        m.size = size;
-        m.pa = pa ? pa : nv_vram_alloc(g->vram, size, 0x10000);
-        if (!m.pa)
-            return false;
-        if (!bar1Map(m.pa, size, &m.bar1))
-            return false;
-        IODeviceMemory *bar1 = pci_->getDeviceMemoryWithIndex(1);
-        m.map = bar1 ? bar1->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapInhibitCache, m.bar1, size)
-                     : nullptr;
-        if (!m.map)
-            return false;
-        m.cpu = (volatile uint8_t *)m.map->getVirtualAddress();
-        for (uint64_t o = 0; o < size; o += 4)
-            *(volatile uint32_t *)(m.cpu + o) = 0;
-        return true;
-    };
-    auto w32 = [](Mem &m, uint32_t off, uint32_t v) { *(volatile uint32_t *)(m.cpu + off) = v; };
-    // On a failure: the display exception registers (gv100_disp_exception: stat = type << 12 | mthd >> 2),
-    // the channels' PUT/GET and the core notifier.
-    auto dump = [&]() {
-        for (uint32_t chid = 0; chid < 3; chid++)
-            LOG("GSP: modeset: exception chid %u: stat 0x%08x data 0x%08x code 0x%08x", chid,
-                rd32(0x611020 + chid * 12), rd32(0x611024 + chid * 12), rd32(0x611028 + chid * 12));
-        LOG("GSP: modeset: intr 0x%08x exc-other 0x%08x exc-winim 0x%08x exc-win 0x%08x", rd32(0x611ec0),
-            rd32(0x611854), rd32(0x611850), rd32(0x611858));
-        LOG("GSP: modeset: core PUT 0x%x GET 0x%x; window PUT 0x%x GET 0x%x", rd32(0x680000), rd32(0x680004),
-            rd32(0x690000), rd32(0x690004));
-        for (uint32_t pass = 0; pass < 2; pass++) {
-            // gv100_head_state: 0x682xxx is the core channel's assembly state, 0x68axxx the armed (active) one.
-            const uint32_t base = pass ? 0x68a000 : 0x682000;
-            LOG("GSP: modeset: head 0 %s: raster 0x%08x sync 0x%08x blankE 0x%08x blankS 0x%08x clk %u or 0x%08x",
-                pass ? "armed" : "asm", rd32(base + 0x64), rd32(base + 0x68), rd32(base + 0x6c), rd32(base + 0x70),
-                rd32(base + 0x0c), rd32(base + 0x04));
-        }
-        {
-            const uint32_t v0 = rd32(0x616330), h0 = rd32(0x616334);
-            IOSleep(20);
-            LOG("GSP: modeset: head 0 raster position v %u h %u, 20 ms later v %u", v0 & 0xffff, h0 & 0xffff,
-                rd32(0x616330) & 0xffff);
-        }
-        if (sync.cpu)
-            LOG("GSP: modeset: notifier %08x %08x %08x %08x", *(volatile uint32_t *)sync.cpu,
-                *(volatile uint32_t *)(sync.cpu + 4), *(volatile uint32_t *)(sync.cpu + 8),
-                *(volatile uint32_t *)(sync.cpu + 12));
-    };
-    if (!memAlloc(inst, 0x10000, g->dispInst) || !memAlloc(pbCore, 0x1000, 0) || !memAlloc(pbWndw, 0x1000, 0) ||
-        !memAlloc(sync, 0x1000, 0) || !memAlloc(ilut, 0x10000, 0) || !memAlloc(olut, 0x10000, 0) ||
-        !memAlloc(fb, (uint64_t)pitch * ((vact + 15) & ~15u), 0))
+    if (!dispMemAlloc(d.inst, 0x10000, g->dispInst) || !dispMemAlloc(d.pbCore, 0x1000, 0) ||
+        !dispMemAlloc(d.pbWndw, 0x1000, 0) || !dispMemAlloc(d.sync, 0x1000, 0) || !dispMemAlloc(d.ilut, 0x10000, 0) ||
+        !dispMemAlloc(d.olut, 0x10000, 0))
         FAIL("VRAM allocation or BAR1 mapping failed");
-
-    // Test pattern: eight colour bars, a white frame.
-    {
-        static const uint32_t bars[8] = { 0xffffff, 0xffff00, 0x00ffff, 0x00ff00, 0xff00ff, 0xff0000, 0x0000ff, 0x000000 };
-        for (uint32_t y = 0; y < vact; y++)
-            for (uint32_t x = 0; x < hact; x++) {
-                const bool frame = x < 16 || y < 16 || x >= hact - 16 || y >= vact - 16;
-                w32(fb, y * pitch + x * 4, frame ? 0xffffff : bars[x * 8 / hact]);
-            }
-    }
 
     // Input LUT: nvdisplay 3 needs one to convert a fixed-point surface to the pipe's FP16 (nvkms
     // EvoFlipC5Common). Identity, DIRECT10: a 0x20-byte VSS header, then 1024 entries of FP16 R, G, B
@@ -774,47 +824,40 @@ bool NVBringup::modesetDisplay(uint32_t displayId, uint32_t rmProto, const uint8
                 man = 0;
                 e++;
             }
-            return (uint16_t)((e + 15) << 10 | man);
+            return (uint16_t)((uint32_t)(e + 15) << 10 | man);
         };
         for (uint32_t i = 0; i <= 1024; i++) {
             const uint32_t v = unorm10ToFp16(i < 1024 ? i : 1023);
-            w32(ilut, 0x20 + i * 8 + 0, v | v << 16);       // R, G
-            w32(ilut, 0x20 + i * 8 + 4, v);                 // B
+            dispW32(d.ilut, 0x20 + i * 8 + 0, v | v << 16);   // R, G
+            dispW32(d.ilut, 0x20 + i * 8 + 4, v);             // B
         }
     }
-
     // Output LUT: nvdisplay 3 heads take one too (nouveau headc57d olut_identity, nvkms
     // EvoSetupIdentityOutputLutC5): a 0x20-byte VSS header, then 1024 entries of 16-bit fixed point
     // R, G, B (i << 6) and the last one repeated.
     for (uint32_t i = 0; i <= 1024; i++) {
         const uint32_t v = (i < 1024 ? i : 1023) << 6;
-        w32(olut, 0x20 + i * 8 + 0, v | v << 16);
-        w32(olut, 0x20 + i * 8 + 4, v);
+        dispW32(d.olut, 0x20 + i * 8 + 0, v | v << 16);
+        dispW32(d.olut, 0x20 + i * 8 + 4, v);
     }
 
     // Context DMAs and the RAMHT, in the display instance memory: the RAMHT is the first 0x2000 bytes
-    // (1024 entries of handle + context), then 24-byte gv100 DMA objects on 16-byte alignment.
+    // (1024 entries of handle + context), then 24-byte gv100 DMA objects on 16-byte alignment. The VRAM
+    // ones cover all of VRAM, so surfaces allocated on later hot-plugs are inside them.
     {
-        const uint32_t kHandleSync = 0xf0000000, kHandleVram = 0xf0000001, kHandleFb = 0xf0000002;
         const uint32_t instSync = 0x2000, instVram = 0x2020, instFb = 0x2040;
-        auto dmaObj = [&](uint32_t off, uint64_t start, uint64_t limit, uint32_t flags = 0x45) {
-            w32(inst, off + 0x00, flags);                   // 0x45: VRAM | RW | small pages, pitch kind
-            w32(inst, off + 0x04, (uint32_t)(start >> 8));
-            w32(inst, off + 0x08, (uint32_t)(start >> 40));
-            w32(inst, off + 0x0c, (uint32_t)(limit >> 8));
-            w32(inst, off + 0x10, (uint32_t)(limit >> 40));
+        auto dmaObj = [&](uint32_t off, uint64_t start, uint64_t limit, uint32_t flags) {
+            dispW32(d.inst, off + 0x00, flags);
+            dispW32(d.inst, off + 0x04, (uint32_t)(start >> 8));
+            dispW32(d.inst, off + 0x08, (uint32_t)(start >> 40));
+            dispW32(d.inst, off + 0x0c, (uint32_t)(limit >> 8));
+            dispW32(d.inst, off + 0x10, (uint32_t)(limit >> 40));
         };
-        dmaObj(instSync, sync.pa, sync.pa + 0xfff);
-        {
-            uint64_t end = fb.pa + fb.size;
-            if (ilut.pa + ilut.size > end)
-                end = ilut.pa + ilut.size;
-            if (olut.pa + olut.size > end)
-                end = olut.pa + olut.size;
-            dmaObj(instVram, 0, ((end + 0xfffff) & ~0xfffffull) - 1);
-            // Scanout (ISO) surfaces take a big-page context DMA (nv50_wndw_ctxdma_new: GF119_DMA_V0_PAGE_LP).
-            dmaObj(instFb, 0, ((end + 0xfffff) & ~0xfffffull) - 1, 0x05);
-        }
+        const uint64_t vramLimit = ((g->vram->limit + 1 + 0xfffff) & ~0xfffffull) - 1;
+        dmaObj(instSync, d.sync.pa, d.sync.pa + 0xfff, 0x45);  // VRAM | RW | small pages, pitch kind
+        dmaObj(instVram, 0, vramLimit, 0x45);
+        // Scanout (ISO) surfaces take a big-page context DMA (nv50_wndw_ctxdma_new: GF119_DMA_V0_PAGE_LP).
+        dmaObj(instFb, 0, vramLimit, 0x05);
         // nvkm_ramht_insert: hash(chid, handle) with linear probing; context = chid << 25 | client | inst << 9.
         bool used[1024] = {};
         auto ramhtInsert = [&](uint32_t chid, uint32_t handle, uint32_t instOff) {
@@ -826,277 +869,420 @@ bool NVBringup::modesetDisplay(uint32_t displayId, uint32_t rmProto, const uint8
             for (uint32_t n = 0; n < 1024; n++, hash = (hash + 1) & 1023)
                 if (!used[hash]) {
                     used[hash] = true;
-                    w32(inst, hash * 8 + 0, handle);
-                    w32(inst, hash * 8 + 4, chid << 25 | (g->hClient & 0x3fff) | instOff << 9);
+                    dispW32(d.inst, hash * 8 + 0, handle);
+                    dispW32(d.inst, hash * 8 + 4, chid << 25 | (g->hClient & 0x3fff) | instOff << 9);
                     return true;
                 }
             return false;
         };
         // chid.user: core 0, window n 1 + n.
-        if (!ramhtInsert(0, kHandleSync, instSync) || !ramhtInsert(0, kHandleVram, instVram) ||
-            !ramhtInsert(1, kHandleSync, instSync) || !ramhtInsert(1, kHandleVram, instVram) ||
-            !ramhtInsert(1, kHandleFb, instFb))
+        if (!ramhtInsert(0, kDispHandleSync, instSync) || !ramhtInsert(0, kDispHandleVram, instVram) ||
+            !ramhtInsert(1, kDispHandleSync, instSync) || !ramhtInsert(1, kDispHandleVram, instVram) ||
+            !ramhtInsert(1, kDispHandleFb, instFb))
             FAIL("RAMHT full");
-        // The RM may need the client handle's bit 13 free: the context ORs inst << 9 over it.
-        if (g->hClient & 0x2000)
-            LOG("GSP: modeset: warning: client handle 0x%x has bit 13 set, which collides with the DMA object offset", g->hClient);
+        if (g->hClient & 0x2000)        // the context ORs inst << 9 over the client handle's bit 13
+            LOG("GSP: display: warning: client handle 0x%x has bit 13 set, which collides with the DMA object offset",
+                g->hClient);
         bar1Flush();
-        LOG("GSP: modeset: RAMHT and DMA objects written; sync 0x%llx, surface 0x%llx (%u x %u, pitch %u)",
-            (unsigned long long)sync.pa, (unsigned long long)fb.pa, hact, vact, pitch);
+    }
 
-        // RM objects.
-        hRoot = g->nextHandle;
-        g->nextHandle += 8;
-        if (!gspRmAlloc(g->hClient, g->hDevice, hRoot, 0xc570 /* TU102_DISP */, nullptr, 0, &st)) {
-            LOG("GSP: modeset: TU102_DISP allocation failed (status 0x%x)", st);
-            FAIL("TU102_DISP allocation failed");
+    // RM objects: the display root and the two channels (r570 struct layouts).
+    d.hRoot = g->nextHandle;
+    g->nextHandle += 8;
+    if (!gspRmAlloc(g->hClient, g->hDevice, d.hRoot, 0xc570 /* TU102_DISP */, nullptr, 0, &st)) {
+        LOG("GSP: display: TU102_DISP allocation failed (status 0x%x)", st);
+        d.hRoot = 0;
+        FAIL("TU102_DISP allocation failed");
+    }
+    {
+        uint8_t man[8] = {};            // NV0073_CTRL_CMD_DP_SET_MANUAL_DISPLAYPORT: as r535_disp_oneinit
+        gspRmControl(g->hClient, g->hDisp, 0x731365, man, sizeof(man), &st);
+    }
+    for (int w = 0; w < 2; w++) {
+        const uint32_t hclass = w ? 0xc57e : 0xc57d;
+        NVDispMem &pb = w ? d.pbWndw : d.pbCore;
+        uint8_t cp[56] = {};            // NV2080_CTRL_INTERNAL_DISPLAY_CHANNEL_PUSHBUFFER (r570 layout)
+        put32(cp, 0, 2);                // ADDR_FBMEM
+        put64(cp, 8, pb.pa);
+        put64(cp, 16, pb.size - 1);
+        put32(cp, 28, hclass);
+        put32(cp, 32, 0);               // channel instance
+        cp[36] = 1;                     // valid
+        put32(cp, 40, 1);               // pbTargetAperture: PHYS_NVM
+        put32(cp, 44, 0);               // channelPBSize: 4 KiB
+        put32(cp, 48, 1);               // subDeviceId: BIT(0)
+        if (!gspRmControl(g->hIntClient, g->hIntSubdevice, 0x20800a58, cp, sizeof(cp), &st)) {
+            LOG("GSP: display: DISPLAY_CHANNEL_PUSHBUFFER class 0x%x failed (status 0x%x)", hclass, st);
+            FAIL("channel push buffer setup failed");
         }
-        {
-            uint8_t man[8] = {};         // NV0073_CTRL_CMD_DP_SET_MANUAL_DISPLAYPORT: as r535_disp_oneinit
-            gspRmControl(g->hClient, g->hDisp, 0x731365, man, sizeof(man), &st);
+        uint8_t args[40] = {};          // NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS (r570): instance 0, offset 0
+        put32(args, 32, 1);             // subDeviceId: BIT(0)
+        if (!gspRmAlloc(g->hClient, d.hRoot, hclass << 16, hclass, args, sizeof(args), &st)) {
+            LOG("GSP: display: channel class 0x%x allocation failed (status 0x%x)", hclass, st);
+            FAIL("channel allocation failed");
         }
-        auto chanAlloc = [&](uint32_t hclass, Mem &pb, uint32_t &hObj) {
-            uint8_t cp[56] = {};         // NV2080_CTRL_INTERNAL_DISPLAY_CHANNEL_PUSHBUFFER (r570 layout)
-            put32(cp, 0, 2);             // ADDR_FBMEM
-            put64(cp, 8, pb.pa);
-            put64(cp, 16, pb.size - 1);
-            put32(cp, 28, hclass);
-            put32(cp, 32, 0);            // channel instance
-            cp[36] = 1;                  // valid
-            put32(cp, 40, 1);            // pbTargetAperture: PHYS_NVM
-            put32(cp, 44, 0);            // channelPBSize: 4 KiB
-            put32(cp, 48, 1);            // subDeviceId: BIT(0)
-            if (!gspRmControl(g->hIntClient, g->hIntSubdevice, 0x20800a58, cp, sizeof(cp), &st)) {
-                LOG("GSP: modeset: DISPLAY_CHANNEL_PUSHBUFFER class 0x%x failed (status 0x%x)", hclass, st);
-                return false;
-            }
-            uint8_t args[40] = {};       // NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS (r570): channelInstance 0, offset 0
-            put32(args, 32, 1);          // subDeviceId: BIT(0)
-            hObj = hclass << 16;
-            if (!gspRmAlloc(g->hClient, hRoot, hObj, hclass, args, sizeof(args), &st)) {
-                LOG("GSP: modeset: channel class 0x%x allocation failed (status 0x%x)", hclass, st);
-                return false;
-            }
-            return true;
-        };
-        if (!chanAlloc(0xc57d, pbCore, hCoreObj))
-            FAIL("core channel allocation failed");
-        LOG("GSP: modeset: core channel allocated");
-        if (!chanAlloc(0xc57e, pbWndw, hWndwObj))
-            FAIL("window channel allocation failed");
-        LOG("GSP: modeset: window channel allocated");
+    }
+    d.coreCur = d.wndwCur = 0;
 
-        // SOR: DFP_ASSIGN_SOR for the display, as r535_outp_acquire.
-        {
-            uint8_t as[80] = {};
-            put32(as, 4, displayId);
-            if (!gspRmControl(g->hClient, g->hDisp, 0x731152, as, sizeof(as), &st)) {
-                LOG("GSP: modeset: DFP_ASSIGN_SOR failed (status 0x%x)", st);
-                FAIL("DFP_ASSIGN_SOR failed");
+    // Core init: notifier ctxdma and the usage bounds of the eight windows (corec57d_init).
+    dispMthd(false, 0x208, kDispHandleSync);
+    for (uint32_t i = 0; i < 8; i++) {
+        dispMthd(false, 0x1004 + i * 0x80, 0xf);                           // RGB packed 1/2/4/8 bpp
+        dispMthd(false, 0x1008 + i * 0x80, 0);
+        dispMthd(false, 0x1010 + i * 0x80, 0x7fff | 1u << 16 | 1u << 20);  // pixels/line, ILUT, 2 taps
+    }
+    if (!dispKick(false))
+        FAIL("core init not consumed");
+    d.ready = true;
+    LOG("GSP: display: engine ready (root, core and window channels); watching %u output(s)", d.nCand);
+    for (uint32_t i = 0; i < d.nCand; i++)
+        LOG("GSP: display:   0x%x (protocol %u)", d.candId[i], d.candProto[i]);
+    return true;
+fail:
+    LOG("GSP: display: init FAILED: %s", what);
+    setProperty("NVDisplayModeset", what);
+    if (d.hRoot)
+        dispDump();
+    return false;
+#undef FAIL
+}
+
+// Lights displayId with the EDID's first detailed timing: SOR, head, the surface (colour bars until
+// something draws there), window 0.
+bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t *edid)
+{
+    GspState *g = gsp_;
+    GspState::DispHw &d = g->disp;
+    uint32_t st = 0, sorIdx = ~0u;
+    const uint32_t head = 0;
+    const char *what = "";
+#define FAIL(msg) do { what = msg; goto fail; } while (0)
+    if (!d.ready)
+        return false;
+
+    // Mode: the EDID's first detailed timing descriptor (bytes 54..71).
+    {
+    const uint8_t *t = edid + 54;
+    const uint32_t pclkKhz = (uint32_t)(t[0] | t[1] << 8) * 10;
+    const uint32_t hact = t[2] | (uint32_t)(t[4] & 0xf0) << 4, hblank = t[3] | (uint32_t)(t[4] & 0x0f) << 8;
+    const uint32_t vact = t[5] | (uint32_t)(t[7] & 0xf0) << 4, vblank = t[6] | (uint32_t)(t[7] & 0x0f) << 8;
+    const uint32_t hso = t[8] | (uint32_t)(t[11] & 0xc0) << 2, hsw = t[9] | (uint32_t)(t[11] & 0x30) << 4;
+    const uint32_t vso = (t[10] >> 4) | (uint32_t)(t[11] & 0x0c) << 2, vsw = (t[10] & 0x0f) | (uint32_t)(t[11] & 0x03) << 4;
+    const uint32_t flags = t[17];
+    if (!pclkKhz || !hact || !vact || (flags & 0x80)) {        // no timing, or interlaced
+        LOG("GSP: display: EDID has no usable progressive detailed timing (pclk %u kHz %ux%u flags 0x%x)",
+            pclkKhz, hact, vact, flags);
+        FAIL("EDID has no usable timing");
+    }
+    const bool nhsync = !(flags & 0x02), nvsync = !(flags & 0x04);
+    const uint32_t htotal = hact + hblank, vtotal = vact + vblank;
+    const uint32_t hsyncs = hact + hso, vsyncs = vact + vso;
+    const uint32_t pitch = (hact * 4 + 255) & ~255u;
+    LOG("GSP: display: lighting 0x%x (protocol %u): %ux%u, pclk %u kHz, h %u/%u/%u/%u v %u/%u/%u/%u, "
+        "hsync %c vsync %c", displayId, rmProto, hact, vact, pclkKhz, hact, hso, hsw, htotal, vact, vso, vsw, vtotal,
+        nhsync ? '-' : '+', nvsync ? '-' : '+');
+
+    // The surface. A bigger mode gets a new one; the old one's VRAM stays allocated, since a user
+    // mapping of it (NVMAC_DISPLAY_MAP) may outlive this.
+    const uint64_t need = (uint64_t)pitch * ((vact + 15) & ~15u);
+    if (d.fb.size < need) {
+        NVDispMem nf;
+        if (!dispMemAlloc(nf, need, 0))
+            FAIL("no VRAM for the surface");
+        OSSafeReleaseNULL(d.fb.map);
+        d.fb = nf;
+    }
+    {
+        static const uint32_t bars[8] = { 0xffffff, 0xffff00, 0x00ffff, 0x00ff00, 0xff00ff, 0xff0000, 0x0000ff, 0x000000 };
+        for (uint32_t y = 0; y < vact; y++)
+            for (uint32_t x = 0; x < hact; x++) {
+                const bool frame = x < 16 || y < 16 || x >= hact - 16 || y >= vact - 16;
+                dispW32(d.fb, y * pitch + x * 4, frame ? 0xffffff : bars[x * 8 / hact]);
             }
-            for (uint32_t i = 0; i < 4; i++) {
-                uint32_t mask;
-                memcpy(&mask, as + 40 + i * 8, 4);
-                if (mask & displayId) {
-                    sorIdx = i;
-                    break;
-                }
-            }
-            LOG("GSP: modeset: display 0x%x -> SOR %d", displayId, (int)sorIdx);
-            if (sorIdx == 0xffffffff)
-                FAIL("no SOR assigned");
+        bar1Flush();
+    }
+
+    // SOR: DFP_ASSIGN_SOR for the display, as r535_outp_acquire.
+    {
+        uint8_t as[80] = {};
+        put32(as, 4, displayId);
+        if (!gspRmControl(g->hClient, g->hDisp, 0x731152, as, sizeof(as), &st)) {
+            LOG("GSP: display: DFP_ASSIGN_SOR failed (status 0x%x)", st);
+            FAIL("DFP_ASSIGN_SOR failed");
         }
-
-        // Channels: a push buffer, the PUT/GET registers in the BAR0 user region, and a kick that
-        // flushes BAR1 first (push buffer fetches are not coherent with it).
-        struct Chan { Mem *pb; uint32_t user; uint32_t cur; uint32_t chid; } core = { &pbCore, 0x680000, 0, 0 },
-                                                                              wndw = { &pbWndw, 0x690000, 0, 1 };
-        // Every method is kicked and checked on its own: the exception registers (stat: type << 12 | mthd >> 2,
-        // data, code) then name the first method the display engine objects to. Acked as nouveau does (0x90000000).
-        uint32_t nErr = 0, nRb = 0;
-        auto mthd = [&](Chan &c, uint32_t m, uint32_t v) {
-            w32(*c.pb, c.cur * 4, 0u << 29 | 1u << 18 | m);       // METHOD_OFFSET is bits 13:2: the byte offset as is
-            w32(*c.pb, c.cur * 4 + 4, v);
-            c.cur += 2;
-            bar1Flush();
-            wr32(c.user, c.cur * 4);
-            for (int i = 0; i < 1000 && rd32(c.user + 4) != c.cur * 4; i++)
-                IODelay(10);
-            IODelay(200);
-            // The channel's control region maps a method offset to its assembly-state register: read it back.
-            const uint32_t rb = rd32(c.user + m);
-            if (rb != v && nRb++ < 40)
-                LOG("GSP: modeset: %s method 0x%04x wrote 0x%08x, reads back 0x%08x", c.chid ? "window" : "core", m, v, rb);
-            const uint32_t stat = rd32(0x611020 + c.chid * 12);
-            if ((stat >> 12) & 7) {
-                if (nErr++ < 12)
-                    LOG("GSP: modeset: %s method 0x%04x data 0x%08x -> exception stat 0x%08x data 0x%08x code 0x%08x",
-                        c.chid ? "window" : "core", m, v, stat, rd32(0x611024 + c.chid * 12),
-                        rd32(0x611028 + c.chid * 12));
-                wr32(0x611020 + c.chid * 12, 0x90000000);
+        for (uint32_t i = 0; i < 4; i++) {
+            uint32_t mask;
+            memcpy(&mask, as + 40 + i * 8, 4);
+            if (mask & displayId) {
+                sorIdx = i;
+                break;
             }
-        };
-        auto kick = [&](Chan &c) {
-            bar1Flush();
-            wr32(c.user, c.cur * 4);
-            for (int i = 0; i < 2000; i++) {
-                if (rd32(c.user + 4) == c.cur * 4)
-                    return true;
-                IOSleep(1);
-            }
-            LOG("GSP: modeset: channel 0x%x did not consume its push buffer: PUT 0x%x GET 0x%x", c.user,
-                rd32(c.user), rd32(c.user + 4));
-            return false;
-        };
-        auto ntfyDone = [&]() {
-            for (int i = 0; i < 2000; i++) {
-                if ((*(volatile uint32_t *)sync.cpu >> 30) == 2)        // NV_DISP_NOTIFIER _0 STATUS: FINISHED
-                    return true;
-                IOSleep(1);
-            }
-            return false;
-        };
-        auto coreUpdate = [&](uint32_t windowMask) {
-            *(volatile uint32_t *)sync.cpu = 0;                                    // NOT_BEGUN
-            mthd(core, 0x20c, 0u | 0u << 4 | 1u << 12);                            // NOTIFIER_CONTROL: write, offset 0, enable
-            mthd(core, 0x218, 0);                                                  // SET_INTERLOCK_FLAGS (cursors)
-            mthd(core, 0x21c, windowMask);                                         // SET_WINDOW_INTERLOCK_FLAGS
-            mthd(core, 0x200, 1);                                                  // UPDATE
-            mthd(core, 0x20c, 0);                                                  // NOTIFY disable
-            if (!kick(core))
-                return false;
-            if (!ntfyDone()) {              // not fatal: the update may have run with the notifier unwritten
-                LOG("GSP: modeset: warning: core notifier not written (0x%08x); going on", *(volatile uint32_t *)sync.cpu);
-                IOSleep(100);
-            }
-            return true;
-        };
-
-        // Core init: notifier ctxdma and the usage bounds of the eight windows (corec57d_init).
-        mthd(core, 0x208, kHandleSync);
-        for (uint32_t i = 0; i < 8; i++) {
-            mthd(core, 0x1004 + i * 0x80, 0xf);                                    // RGB packed 1/2/4/8 bpp
-            mthd(core, 0x1008 + i * 0x80, 0);
-            mthd(core, 0x1010 + i * 0x80, 0x7fff | 1u << 16 | 1u << 20);          // pixels/line, ILUT, 2 taps
         }
-        if (!kick(core))
-            FAIL("core init not consumed");
-        LOG("GSP: modeset: core channel initialised");
+        if (sorIdx == ~0u)
+            FAIL("no SOR assigned");
+    }
 
-        // SOR control, head raster, clock, output resource (headc57d_*).
-        mthd(core, 0x300 + sorIdx * 0x20, rmProto << 8 | 1u << head);              // SOR_SET_CONTROL: protocol, owner head
-        mthd(core, 0x2020 + head * 0x400, displayId);                              // HEAD_SET_DISPLAY_ID
-        mthd(core, 0x204c + head * 0x400, hact | vact << 16);                      // viewport in
-        mthd(core, 0x2058 + head * 0x400, hact | vact << 16);                      // viewport out
-        mthd(core, 0x2064 + head * 0x400, htotal | vtotal << 16);                  // raster size
-        mthd(core, 0x2068 + head * 0x400, (hsw - 1) | (vsw - 1) << 16);            // sync end
+    // SOR control, head raster, clock, output resource, OLUT (headc57d_*), window ownership; UPDATE.
+    dispMthd(false, 0x300 + sorIdx * 0x20, rmProto << 8 | 1u << head);           // SOR_SET_CONTROL: protocol, owner
+    dispMthd(false, 0x2020 + head * 0x400, displayId);                            // HEAD_SET_DISPLAY_ID
+    dispMthd(false, 0x204c + head * 0x400, hact | vact << 16);                    // viewport in
+    dispMthd(false, 0x2058 + head * 0x400, hact | vact << 16);                    // viewport out
+    dispMthd(false, 0x2064 + head * 0x400, htotal | vtotal << 16);                // raster size
+    dispMthd(false, 0x2068 + head * 0x400, (hsw - 1) | (vsw - 1) << 16);          // sync end
+    {
         const uint32_t hblankE = htotal - hsyncs - 1, vblankE = vtotal - vsyncs - 1;
-        mthd(core, 0x206c + head * 0x400, hblankE | vblankE << 16);                // blank end
-        mthd(core, 0x2070 + head * 0x400, (hblankE + hact) | (vblankE + vact) << 16);   // blank start
-        mthd(core, 0x2074 + head * 0x400, 0u << 16 | 1);                           // blank2 end / start (undocumented, as nouveau)
-        mthd(core, 0x2008 + head * 0x400, 0);                                      // progressive
-        mthd(core, 0x200c + head * 0x400, pclkKhz * 1000);                         // pixel clock
-        mthd(core, 0x2028 + head * 0x400, pclkKhz * 1000);                         // pixel clock max
-        mthd(core, 0x2030 + head * 0x400, 4u | 1u << 4 | 1u << 8 | 1u << 12);      // head usage bounds
-        mthd(core, 0x2004 + head * 0x400, (nhsync ? 4u : 0) | (nvsync ? 8u : 0) | 4u << 4 | 0x3fu << 26);
-        mthd(core, 0x2000 + head * 0x400, 0);                                      // procamp: RGB, VESA range
-        mthd(core, 0x2280 + head * 0x400, (4u + 1025u) << 8 | 2u << 2 | 1u);      // OLUT: size, DIRECT10, interpolate
-        mthd(core, 0x2284 + head * 0x400, 0xffffffff);                             // OLUT FP norm scale
-        mthd(core, 0x2288 + head * 0x400, kHandleVram);                            // OLUT context DMA
-        mthd(core, 0x228c + head * 0x400, (uint32_t)(olut.pa >> 8));               // OLUT offset
-        // Window ownership (corec37d_wndw_owner): window i belongs to head i / 2. Its own update.
-        for (uint32_t i = 0; i < 8; i++)
-            mthd(core, 0x1000 + i * 0x80, i >> 1);
-        if (!coreUpdate(0))
-            FAIL("core update (head, SOR, window owner) did not complete");
-        LOG("GSP: modeset: core update done (notifier finished)");
+        dispMthd(false, 0x206c + head * 0x400, hblankE | vblankE << 16);          // blank end
+        dispMthd(false, 0x2070 + head * 0x400, (hblankE + hact) | (vblankE + vact) << 16);   // blank start
+    }
+    dispMthd(false, 0x2074 + head * 0x400, 0u << 16 | 1);                         // blank2 (undocumented, as nouveau)
+    dispMthd(false, 0x2008 + head * 0x400, 0);                                    // progressive
+    dispMthd(false, 0x200c + head * 0x400, pclkKhz * 1000);                       // pixel clock
+    dispMthd(false, 0x2028 + head * 0x400, pclkKhz * 1000);                       // pixel clock max
+    dispMthd(false, 0x2030 + head * 0x400, 4u | 1u << 4 | 1u << 8 | 1u << 12);    // head usage bounds
+    dispMthd(false, 0x2004 + head * 0x400, (nhsync ? 4u : 0) | (nvsync ? 8u : 0) | 4u << 4 | 0x3fu << 26);
+    dispMthd(false, 0x2000 + head * 0x400, 0);                                    // procamp: RGB, VESA range
+    dispMthd(false, 0x2280 + head * 0x400, (4u + 1025u) << 8 | 2u << 2 | 1u);     // OLUT: size, DIRECT10, interp
+    dispMthd(false, 0x2284 + head * 0x400, 0xffffffff);                           // OLUT FP norm scale
+    dispMthd(false, 0x2288 + head * 0x400, kDispHandleVram);                      // OLUT context DMA
+    dispMthd(false, 0x228c + head * 0x400, (uint32_t)(d.olut.pa >> 8));           // OLUT offset
+    for (uint32_t i = 0; i < 8; i++)                                              // window i -> head i / 2
+        dispMthd(false, 0x1000 + i * 0x80, i >> 1);
+    if (!dispCoreUpdate(0))
+        FAIL("core update (head, SOR, window owner) did not complete");
 
-        // Window 0: the surface (wndwc37e_image_set, blend_set), interlocked with the core.
-        mthd(wndw, 0x308, 1u | 0u << 4);                                           // present: interval 1, non-tearing
-        mthd(wndw, 0x224, hact | vact << 16);                                      // size
-        mthd(wndw, 0x228, 0u | 1u << 4);                                           // storage: pitch layout
-        mthd(wndw, 0x22c, 0xe6);                                                   // params: X8R8G8B8, RGB, no gamma
-        mthd(wndw, 0x230, pitch >> 6);                                             // planar storage 0: pitch
-        mthd(wndw, 0x240, kHandleFb);                                              // context DMA ISO 0
-        mthd(wndw, 0x260, (uint32_t)(fb.pa >> 8));                                 // offset 0
-        mthd(wndw, 0x290, 0);                                                      // point in
-        mthd(wndw, 0x298, hact | vact << 16);                                      // size in
-        mthd(wndw, 0x2a4, hact | vact << 16);                                      // size out
-        mthd(wndw, 0x2a8, 1u | 1u << 4);                                           // input scaler: 2 taps each way
+    // Window 0: the surface (wndwc37e_image_set, blend_set), interlocked with the core.
+    dispMthd(true, 0x308, 1u | 0u << 4);                                          // present: interval 1
+    dispMthd(true, 0x224, hact | vact << 16);                                     // size
+    dispMthd(true, 0x228, 0u | 1u << 4);                                          // storage: pitch layout
+    dispMthd(true, 0x22c, 0xe6);                                                  // params: X8R8G8B8
+    dispMthd(true, 0x230, pitch >> 6);                                            // planar storage 0: pitch
+    dispMthd(true, 0x240, kDispHandleFb);                                         // context DMA ISO 0
+    dispMthd(true, 0x260, (uint32_t)(d.fb.pa >> 8));                              // offset 0
+    dispMthd(true, 0x290, 0);                                                     // point in
+    dispMthd(true, 0x298, hact | vact << 16);                                     // size in
+    dispMthd(true, 0x2a4, hact | vact << 16);                                     // size out
+    dispMthd(true, 0x2a8, 1u | 1u << 4);                                          // input scaler: 2 taps
+    {
         static const uint32_t fmtIdentity[12] = { 0x10000, 0, 0, 0, 0, 0x10000, 0, 0, 0, 0, 0x10000, 0 };
         for (uint32_t i = 0; i < 12; i++)
-            mthd(wndw, 0x400 + i * 4, fmtIdentity[i]);                             // FMT matrix: identity (RGB)
-        mthd(wndw, 0x440, (4u + 1025u) << 8 | 2u << 2);                            // ILUT: size, DIRECT10, no interp
-        mthd(wndw, 0x444, kHandleVram);                                            // ILUT context DMA
-        mthd(wndw, 0x448, (uint32_t)(ilut.pa >> 8));                               // ILUT offset
-        mthd(wndw, 0x59c, 0);                                                      // CSC11 off (identity, as nvkms)
-        mthd(wndw, 0x2ec, 0u | 255u << 4);                                         // composition control: depth 255
-        mthd(wndw, 0x2f0, 255);                                                    // constant alpha K1
-        mthd(wndw, 0x2f4, 0x4422);                                                 // src K1, dst NEG_K1
-        mthd(wndw, 0x2f8, 0xffff0000);
-        mthd(wndw, 0x2fc, 0xffff0000);
-        mthd(wndw, 0x300, 0xffff0000);
-        mthd(wndw, 0x304, 0xffff0000);
-        mthd(wndw, 0x370, 1);                                                      // interlock with the core
-        mthd(wndw, 0x374, 1);                                                      // and window 0
-        mthd(wndw, 0x200, 1);                                                      // UPDATE
-        if (!kick(wndw))
-            FAIL("window push buffer not consumed");
-        if (!coreUpdate(1))
-            FAIL("interlocked core update did not complete");
-        LOG("GSP: modeset: window update done: scanning out %ux%u on head %u -> SOR %u", hact, vact, head, sorIdx);
-
+            dispMthd(true, 0x400 + i * 4, fmtIdentity[i]);                        // FMT matrix: identity (RGB)
     }
-    dump();
-    g->dispLit = true;              // keeps the idle power-off away while the display scans out
-    g->dispFbBar1 = fb.bar1;
-    g->dispFbSize = fb.size;
+    dispMthd(true, 0x440, (4u + 1025u) << 8 | 2u << 2);                           // ILUT: size, DIRECT10
+    dispMthd(true, 0x444, kDispHandleVram);                                       // ILUT context DMA
+    dispMthd(true, 0x448, (uint32_t)(d.ilut.pa >> 8));                            // ILUT offset
+    dispMthd(true, 0x59c, 0);                                                     // CSC11 off (identity)
+    dispMthd(true, 0x2ec, 0u | 255u << 4);                                        // composition: depth 255
+    dispMthd(true, 0x2f0, 255);                                                   // constant alpha K1
+    dispMthd(true, 0x2f4, 0x4422);                                                // src K1, dst NEG_K1
+    dispMthd(true, 0x2f8, 0xffff0000);
+    dispMthd(true, 0x2fc, 0xffff0000);
+    dispMthd(true, 0x300, 0xffff0000);
+    dispMthd(true, 0x304, 0xffff0000);
+    dispMthd(true, 0x370, 1);                                                     // interlock with the core
+    dispMthd(true, 0x374, 1);                                                     // and window 0
+    dispMthd(true, 0x200, 1);                                                     // UPDATE
+    if (!dispKick(true))
+        FAIL("window push buffer not consumed");
+    if (!dispCoreUpdate(1))
+        FAIL("interlocked core update did not complete");
+
+    d.litId = displayId;
+    d.sorIdx = sorIdx;
+    d.proto = rmProto;
+    memcpy(d.edid, edid, sizeof(d.edid));
+    d.w = hact;
+    d.h = vact;
+    d.pitch = pitch;
+    d.pclkKhz = pclkKhz;
+    d.htotal = htotal;
+    d.vtotal = vtotal;
+    d.hsyncStart = hsyncs;
+    d.hsyncWidth = hsw;
+    d.vsyncStart = vsyncs;
+    d.vsyncWidth = vsw;
+    d.syncFlags = (nhsync ? 1u : 0) | (nvsync ? 2u : 0);
+    g->dispLit = true;
+    g->dispFbBar1 = d.fb.bar1;
+    g->dispFbSize = d.fb.size;
     g->dispW = hact;
     g->dispH = vact;
     g->dispPitch = pitch;
+    LOG("GSP: display: 0x%x lit: %ux%u on head %u -> SOR %u, surface 0x%llx", displayId, hact, vact, head, sorIdx,
+        (unsigned long long)d.fb.pa);
     setProperty("NVDisplayModeset", "ok");
-    // For NVFramebuffer.kext (display/): the scanout surface as a physical BAR1 range, its mode and
-    // the sink's EDID, then the NVDisplayLit resource its personality matches.
-    if (IODeviceMemory *bar1 = pci_->getDeviceMemoryWithIndex(1)) {
-        OSDictionary *d = OSDictionary::withCapacity(10);
-        if (d) {
-            auto num = [&](const char *k, uint64_t v, unsigned bits) {
-                if (OSNumber *n = OSNumber::withNumber(v, bits)) {
-                    d->setObject(k, n);
-                    n->release();
-                }
-            };
-            num("PhysAddr", bar1->getPhysicalAddress() + fb.bar1, 64);
-            num("Size", fb.size, 64);
-            num("Width", hact, 32);
-            num("Height", vact, 32);
-            num("Pitch", pitch, 32);
-            num("PixelClockKHz", pclkKhz, 32);
-            num("HTotal", htotal, 32);
-            num("VTotal", vtotal, 32);
-            num("HSyncStart", hsyncs, 32);
-            num("HSyncWidth", hsw, 32);
-            num("VSyncStart", vsyncs, 32);
-            num("VSyncWidth", vsw, 32);
-            num("Flags", (nhsync ? 1u : 0) | (nvsync ? 2u : 0), 32);
-            num("DisplayID", displayId, 32);
-            if (OSData *e = OSData::withBytes(edid, 128)) {
-                d->setObject("EDID", e);
-                e->release();
-            }
-            setProperty("NVDisplayFB", d);
-            d->release();
-            publishResource("NVDisplayLit", this);
-        }
-    }
     return true;
+    }
 fail:
-    LOG("GSP: modeset: FAILED: %s", what);
-    if (hRoot)
-        dump();
+    LOG("GSP: display: lighting 0x%x FAILED: %s", displayId, what);
+    dispDump();
     setProperty("NVDisplayModeset", what);
     return false;
 #undef FAIL
+}
+
+// The lit display went away: window 0 and the SOR detached (wndwc37e_image_clr; SOR_SET_CONTROL owner none),
+// so the head scans out nothing. The surface stays allocated.
+void NVBringup::dispBlank()
+{
+    GspState *g = gsp_;
+    GspState::DispHw &d = g->disp;
+    if (!d.ready || !d.litId)
+        return;
+    dispMthd(true, 0x308, 0);                                                     // present control
+    dispMthd(true, 0x240, 0);                                                     // context DMA ISO 0: none
+    dispMthd(true, 0x370, 1);
+    dispMthd(true, 0x374, 1);
+    dispMthd(true, 0x200, 1);
+    dispKick(true);
+    if (d.sorIdx != ~0u)
+        dispMthd(false, 0x300 + d.sorIdx * 0x20, 0);                              // SOR_SET_CONTROL: no owner
+    dispCoreUpdate(1);
+    LOG("GSP: display: 0x%x unplugged: window 0 and SOR %u detached", d.litId, d.sorIdx);
+    d.litId = 0;
+    d.sorIdx = ~0u;
+    g->dispLit = false;
+    setProperty("NVDisplayModeset", "unplugged");
+}
+
+// The display's EDID base block (GSP-RM reads it over DDC).
+bool NVBringup::dispReadEdid(uint32_t displayId, uint8_t edid[128])
+{
+    GspState *g = gsp_;
+    uint32_t st = 0, n = 0;
+    uint8_t *ed = (uint8_t *)IOMallocZero(NV0073_EDID_SIZE);
+    if (!ed)
+        return false;
+    put32(ed, NV0073_EDID_displayId, displayId);
+    if (gspRmControl(g->hClient, g->hDisp, NV0073_CTRL_CMD_SPECIFIC_GET_EDID_V2_, ed, NV0073_EDID_SIZE, &st))
+        memcpy(&n, ed + NV0073_EDID_bufferSize, 4);
+    const bool ok = n >= 128 && n <= NV0073_EDID_MAX;
+    if (ok)
+        memcpy(edid, ed + NV0073_EDID_buffer, 128);
+    IOFree(ed, NV0073_EDID_SIZE);
+    return ok;
+}
+
+// From the GSP poller (gspLock_ held), every 100 ms; acts once a second. A change must hold for two
+// samples (HPD bounces while a cable goes in). Keeps the lit display while it stays connected, else
+// lights the first connected TMDS output.
+void NVBringup::dispHotplugTick()
+{
+    GspState *g = gsp_;
+    GspState::DispHw &d = g->disp;
+    if (!d.ready || !d.nCand || ++d.tick % 10)
+        return;
+    uint32_t mask = 0, st = 0, conn = 0;
+    for (uint32_t i = 0; i < d.nCand; i++)
+        mask |= d.candId[i];
+    uint8_t cs[NV0073_CONNECT_SIZE] = {};
+    put32(cs, NV0073_CONNECT_displayMask, mask);
+    if (!gspRmControl(g->hClient, g->hDisp, NV0073_CTRL_CMD_SYSTEM_GET_CONNECT_STATE_, cs, sizeof(cs), &st))
+        return;
+    memcpy(&conn, cs + NV0073_CONNECT_displayMask, 4);
+    uint32_t want = 0, wantProto = 0;
+    if (d.litId && (conn & d.litId)) {
+        want = d.litId;
+    } else {
+        for (uint32_t i = 0; i < d.nCand && !want; i++)
+            if (conn & d.candId[i]) {
+                want = d.candId[i];
+                wantProto = d.candProto[i];
+            }
+    }
+    if (!(conn & d.failId))
+        d.failId = 0;
+    if (want == d.litId || (want && want == d.failId)) {
+        d.pendCount = 0;
+        return;
+    }
+    if (want != d.pendId || !d.pendCount) {
+        d.pendId = want;
+        d.pendCount = 1;
+        return;
+    }
+    d.pendCount = 0;
+    const bool wasLit = d.litId != 0;
+    if (wasLit)
+        dispBlank();
+    if (want) {
+        uint8_t edid[128];
+        if (!dispReadEdid(want, edid)) {
+            LOG("GSP: display: 0x%x connected, but its EDID can't be read yet", want);     // tried again in 2 s
+            if (wasLit)
+                dispPublish();
+            return;
+        }
+        LOG("GSP: display: 0x%x connected", want);
+        if (!dispSetMode(want, wantProto, edid)) {
+            d.failId = want;
+            if (wasLit)
+                dispPublish();
+            return;
+        }
+    }
+    dispPublish();
+}
+
+// NVDisplayFB (the lit surface and mode, for nvvdisplay) or its absence, and NVDisplayGen, bumped on every
+// change so user space notices a replug with the same mode too.
+void NVBringup::dispPublish()
+{
+    GspState *g = gsp_;
+    dispGen_++;
+    setProperty("NVDisplayGen", dispGen_, 32);
+    IODeviceMemory *bar1 = pci_ ? pci_->getDeviceMemoryWithIndex(1) : nullptr;
+    if (!g || !g->disp.litId || !bar1) {
+        removeProperty("NVDisplayFB");
+        return;
+    }
+    GspState::DispHw &d = g->disp;
+    OSDictionary *dict = OSDictionary::withCapacity(16);
+    if (!dict)
+        return;
+    auto num = [&](const char *k, uint64_t v, unsigned bits) {
+        if (OSNumber *n = OSNumber::withNumber(v, bits)) {
+            dict->setObject(k, n);
+            n->release();
+        }
+    };
+    num("PhysAddr", bar1->getPhysicalAddress() + d.fb.bar1, 64);
+    num("Size", d.fb.size, 64);
+    num("Width", d.w, 32);
+    num("Height", d.h, 32);
+    num("Pitch", d.pitch, 32);
+    num("PixelClockKHz", d.pclkKhz, 32);
+    num("HTotal", d.htotal, 32);
+    num("VTotal", d.vtotal, 32);
+    num("HSyncStart", d.hsyncStart, 32);
+    num("HSyncWidth", d.hsyncWidth, 32);
+    num("VSyncStart", d.vsyncStart, 32);
+    num("VSyncWidth", d.vsyncWidth, 32);
+    num("Flags", d.syncFlags, 32);
+    num("DisplayID", d.litId, 32);
+    if (OSData *e = OSData::withBytes(d.edid, sizeof(d.edid))) {
+        dict->setObject("EDID", e);
+        e->release();
+    }
+    setProperty("NVDisplayFB", dict);
+    dict->release();
+}
+
+// GSP-RM is going down (sleep, idle, unload): the display engine with it. The kernel mappings go; the
+// VRAM goes with the heap. User space sees the display gone.
+void NVBringup::dispLost()
+{
+    GspState *g = gsp_;
+    if (!g || !g->disp.ready)
+        return;
+    GspState::DispHw &d = g->disp;
+    NVDispMem *mems[] = { &d.inst, &d.pbCore, &d.pbWndw, &d.sync, &d.ilut, &d.olut, &d.fb };
+    for (NVDispMem *m : mems)
+        OSSafeReleaseNULL(m->map);
+    d.ready = false;
+    d.litId = 0;
+    g->dispLit = false;
+    dispPublish();
+    setProperty("NVDisplayModeset", "GSP-RM unloaded");
 }
 
 // Item 4 (non-stall interrupts), step 1: read-only probe. Asks GSP-RM which interrupt vectors the
@@ -3308,7 +3494,10 @@ IOReturn NVBringup::gpuCall(GpuConn *c, uint32_t selector, IOExternalMethodArgum
             r = kIOReturnNotReady;
             break;
         }
+        if (c->dispMap && c->dispMapBar1 != g->dispFbBar1)
+            OSSafeReleaseNULL(c->dispMap);      // a new surface since (a bigger mode on replug)
         if (!c->dispMap) {
+            c->dispMapBar1 = g->dispFbBar1;
             IODeviceMemory *bar1 = pci_->getDeviceMemoryWithIndex(1);
             c->dispMap = bar1 ? bar1->createMappingInTask(c->task, 0, kIOMapAnywhere | kIOMapWriteCombineCache,
                                                           g->dispFbBar1, g->dispFbSize)

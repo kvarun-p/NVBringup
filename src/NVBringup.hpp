@@ -17,6 +17,9 @@
 #include "nv_fwsec.h"
 #include "nv_hal.h"
 
+// A VRAM block of the display engine's, CPU-mapped (uncached) through BAR1 (nvdisp=2).
+struct NVDispMem { uint64_t pa = 0, bar1 = 0, size = 0; IOMemoryMap *map = nullptr; volatile uint8_t *cpu = nullptr; };
+
 class NVBringup : public IOService {
     OSDeclareDefaultStructors(NVBringup)
 
@@ -221,7 +224,19 @@ private:
     bool     initGrGlobal();
     void     initNvdec();
     void     probeDisplay();
-    bool     modesetDisplay(uint32_t displayId, uint32_t rmProto, const uint8_t *edid);
+    bool     dispInit();
+    bool     dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t *edid);
+    void     dispBlank();
+    bool     dispReadEdid(uint32_t displayId, uint8_t edid[128]);
+    void     dispHotplugTick();
+    void     dispPublish();
+    void     dispLost();
+    void     dispMthd(bool wndw, uint32_t m, uint32_t v);
+    bool     dispKick(bool wndw);
+    bool     dispCoreUpdate(uint32_t windowMask);
+    void     dispDump();
+    bool     dispMemAlloc(NVDispMem &m, uint64_t size, uint64_t pa);
+    uint32_t dispGen_ = 0;          // NVDisplayGen: bumped whenever the lit display comes or goes
     void     queryGrInfo();
     void     probeIntr();               // read-only: CPU interrupt table and tree state
     bool     initBar1();

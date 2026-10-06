@@ -424,6 +424,7 @@ void NVBringup::gspPoll()
     }
     if (again) {
         updateStats();
+        dispHotplugTick();
         idleTick();
     }
     IOLockUnlock(gspLock_);
@@ -718,6 +719,7 @@ IOReturn NVBringup::unloadGspLocked(const char *why)
     }
     LOG("GSP: unloading (%s)", why);
     bool ok = true;
+    dispLost();
     intrHwOff();                    // stays wanted: back on after the next boot (wake)
 
     // User connections lose their contexts, memory and VA spaces (device lost); then our
@@ -1145,8 +1147,11 @@ bool NVBringup::createRmObjects()
         probeIntr();
         if (!initBar1())
             LOG("GSP: BAR1 unavailable: CPU-mappable VRAM disabled");
-        else if (g->dispModeId)
-            modesetDisplay(g->dispModeId, g->dispModeProto, g->dispModeEdid);
+        else if (g->disp.wanted && dispInit()) {
+            if (g->dispModeId)
+                dispSetMode(g->dispModeId, g->dispModeProto, g->dispModeEdid);
+            dispPublish();
+        }
     }
     if (ready && tests) {
         testScrub();

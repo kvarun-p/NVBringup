@@ -17,8 +17,16 @@ display/vdisplay/install.sh        # a LaunchAgent for this user; -u removes it
 
 It needs the Screen Recording permission, and the first run asks for it. Grant it to `nvvdisplay` in System Settings →
 Privacy & Security. The LaunchAgent retries every 10 s, so it starts once the permission is granted. It logs to
-`~/Library/Logs/nvvdisplay.log`. When no display is lit, it exits at once. CGDisplayStream is removed in macOS 15, so
-Sequoia and Tahoe will need ScreenCaptureKit instead.
+`~/Library/Logs/nvvdisplay.log`. CGDisplayStream is removed in macOS 15, so Sequoia and Tahoe will need
+ScreenCaptureKit instead. The permission is tied to the binary's ad-hoc signature, so after a rebuild and reinstall,
+switch it off and on again.
+
+Hot-plug: while GSP-RM runs with `nvdisp=2`, NVBringup checks the TMDS outputs' connect state once a second. A
+change must hold for 2 s before it acts. On plug-in it reads the EDID and lights the output at its preferred mode;
+on unplug it detaches window 0 and the SOR. Either way it bumps `NVDisplayGen`. nvvdisplay follows that counter: it
+removes the virtual display while nothing is lit, so macOS moves the windows back, and makes it again at the new
+monitor's mode. To be able to see a plug-in, `nvdisp=2` keeps the GPU powered even with no monitor, so the idle
+power-off never happens.
 
 ## NVFramebuffer.kext (does not work, kept for reference)
 
@@ -28,8 +36,8 @@ X8R8G8B8 surface in VRAM. This driver hands that surface to IOGraphics as the ap
 BAR1 range), with the one mode it was lit at, and the sink's EDID over DDC. There's no acceleration:
 WindowServer draws into the aperture with the CPU.
 
-- It attaches to IOResources and matches the `NVDisplayLit` resource, which NVBringup publishes only after a modeset
-  that scans out. Without `nvdisp=2` it never starts. It sits outside the GPU's PCI device for the same reason as
+- It attaches to IOResources and matches the `NVDisplayLit` resource. NVBringup published that resource after a
+  modeset that scans out, but since hot-plug it no longer does, so this kext doesn't start. It sits outside the GPU's PCI device for the same reason as
   NVMetalAccel (`accel/README.md`).
 - NVBringup's `NVDisplayFB` property carries everything it needs: the physical address and size of the surface,
   the mode, and the EDID. The two kexts share no symbols.
