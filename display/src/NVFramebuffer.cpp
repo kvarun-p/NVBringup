@@ -121,9 +121,32 @@ IOFixed1616 NVFramebuffer::refresh() const
 
 IOService *NVFramebuffer::probe(IOService *provider, SInt32 *score)
 {
-    if (!readDisplay(provider)) {
-        return nullptr;
+    // Under the PCI device (nvfb=1) matching runs once, when this kext's personalities arrive, which can be
+    // before NVBringup's modeset: wait for the NVDisplayLit resource here (IOResourceMatch would not retry).
+    uint32_t onPci = 0;
+    PE_parse_boot_argn("nvfb", &onPci, sizeof(onPci));
+    if (onPci && provider != getResourceService()) {
+        OSDictionary *m = IOService::serviceMatching("NVBringup");
+        IOService *gpu = m ? IOService::copyMatchingService(m) : nullptr;
+        if (m)
+            m->release();
+        const bool ours = gpu && gpu->getProvider() == provider;
+        if (gpu)
+            gpu->release();
+        if (!ours)
+            return nullptr;
+        OSDictionary *r = IOService::resourceMatching("NVDisplayLit");
+        IOService *lit = r ? IOService::waitForMatchingService(r, 60ull * 1000 * 1000 * 1000) : nullptr;
+        if (r)
+            r->release();
+        if (!lit) {
+            LOG("no lit display from NVBringup within 60 s");
+            return nullptr;
+        }
+        lit->release();
     }
+    if (!readDisplay(provider))
+        return nullptr;
     return IOFramebuffer::probe(provider, score);
 }
 

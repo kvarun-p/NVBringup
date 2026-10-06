@@ -50,8 +50,8 @@
 			<string>IOPCIDevice</string>
 			<key>IOPCIMatch</key>
 			<string>0x000010de&amp;0x0000ffff</string>
-			<key>IOResourceMatch</key>
-			<string>NVDisplayLit</string>
+			<!-- No IOResourceMatch: a PCI device is matched only once, when these personalities arrive,
+			     possibly before the modeset. probe() waits for NVDisplayLit instead. -->
 			<key>IOMatchCategory</key>
 			<string>NVFramebuffer</string>
 			<key>IOProbeScore</key>
