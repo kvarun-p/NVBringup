@@ -986,22 +986,24 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
     // The surface. A bigger mode gets a new one; the old one's VRAM stays allocated, since a user
     // mapping of it (NVMAC_DISPLAY_MAP) may outlive this.
     const uint64_t need = (uint64_t)pitch * ((vact + 15) & ~15u);
-    if (d.fb.size < need) {
-        NVDispMem nf;
-        if (!dispMemAlloc(nf, need, 0))
-            FAIL("no VRAM for the surface");
-        OSSafeReleaseNULL(d.fb.map);
-        d.fb = nf;
-    }
-    {
+    NVDispMem *bufs[] = { &d.fb, &d.fbB };    // two buffers: NVMAC_DISPLAY_FLIP swaps them at vblank
+    for (NVDispMem *b : bufs) {
+        if (b->size < need) {
+            NVDispMem nf;
+            if (!dispMemAlloc(nf, need, 0))
+                FAIL("no VRAM for the surface");
+            OSSafeReleaseNULL(b->map);
+            *b = nf;
+        }
         static const uint32_t bars[8] = { 0xffffff, 0xffff00, 0x00ffff, 0x00ff00, 0xff00ff, 0xff0000, 0x0000ff, 0x000000 };
         for (uint32_t y = 0; y < vact; y++)
             for (uint32_t x = 0; x < hact; x++) {
                 const bool frame = x < 16 || y < 16 || x >= hact - 16 || y >= vact - 16;
-                dispW32(d.fb, y * pitch + x * 4, frame ? 0xffffff : bars[x * 8 / hact]);
+                dispW32(*b, y * pitch + x * 4, frame ? 0xffffff : bars[x * 8 / hact]);
             }
-        bar1Flush();
     }
+    bar1Flush();
+    d.front = 0;
 
     // SOR: DFP_ASSIGN_SOR for the display, as r535_outp_acquire.
     {
@@ -1268,6 +1270,51 @@ void NVBringup::dispPublish()
     dict->release();
 }
 
+// NVMAC_DISPLAY_FLIP: window 0 to the other buffer, applied by the display engine at the next vblank
+// (PRESENT_CONTROL non-tearing). The window notifier, at 0x100 in the sync page, leaves NOT_BEGUN once the
+// flip has latched, i.e. the old buffer is no longer scanned out. The methods go in under gspLock_; the
+// wait (up to a frame) is outside it, through a retained mapping, so other GPU work isn't held up.
+IOReturn NVBringup::displayFlip(GpuConn *c, uint32_t buffer)
+{
+    if (buffer > 1)
+        return kIOReturnBadArgument;
+    IOLockLock(gspLock_);
+    GspState *g = gsp_;
+    if (!g || !g->booted || c->dead || !g->dispLit || !g->disp.ready) {
+        IOLockUnlock(gspLock_);
+        return kIOReturnNotReady;
+    }
+    GspState::DispHw &d = g->disp;
+    NVDispMem &f = buffer ? d.fbB : d.fb;
+    if (!f.pa || !d.sync.map) {
+        IOLockUnlock(gspLock_);
+        return kIOReturnNotReady;
+    }
+    IOMemoryMap *keep = d.sync.map;
+    keep->retain();
+    volatile uint32_t *ntfy = (volatile uint32_t *)(d.sync.cpu + 0x100);
+    ntfy[0] = 0;                                                                  // NOT_BEGUN
+    ntfy[1] = ntfy[2] = ntfy[3] = 0;
+    dispMthd(true, 0x21c, kDispHandleSync);                                       // CONTEXT_DMA_NOTIFIER
+    dispMthd(true, 0x220, 0x100u | 0u);                                           // NOTIFIER_CONTROL: write, 0x100
+    dispMthd(true, 0x260, (uint32_t)(f.pa >> 8));                                 // offset 0: the buffer
+    dispMthd(true, 0x370, 0);                                                     // not interlocked with the core
+    dispMthd(true, 0x374, 0);
+    dispMthd(true, 0x200, 1);                                                     // UPDATE
+    d.front = buffer;
+    IOLockUnlock(gspLock_);
+    IOReturn r = kIOReturnTimeout;
+    for (int i = 0; i < 100; i++) {         // a 0xffffffff read (GPU gone) ends it too
+        if (ntfy[0] >> 30) {
+            r = kIOReturnSuccess;
+            break;
+        }
+        IOSleep(1);
+    }
+    keep->release();
+    return r;
+}
+
 // GSP-RM is going down (sleep, idle, unload): the display engine with it. The kernel mappings go; the
 // VRAM goes with the heap. User space sees the display gone.
 void NVBringup::dispLost()
@@ -1276,7 +1323,7 @@ void NVBringup::dispLost()
     if (!g || !g->disp.ready)
         return;
     GspState::DispHw &d = g->disp;
-    NVDispMem *mems[] = { &d.inst, &d.pbCore, &d.pbWndw, &d.sync, &d.ilut, &d.olut, &d.fb };
+    NVDispMem *mems[] = { &d.inst, &d.pbCore, &d.pbWndw, &d.sync, &d.ilut, &d.olut, &d.fb, &d.fbB };
     for (NVDispMem *m : mems)
         OSSafeReleaseNULL(m->map);
     d.ready = false;
@@ -3320,6 +3367,10 @@ IOReturn NVBringup::gpuCall(GpuConn *c, uint32_t selector, IOExternalMethodArgum
         a->scalarOutput[0] = gpuTime();
         return kIOReturnSuccess;
     }
+    if (selector == NVMAC_DISPLAY_FLIP) {
+        NEED(1, 0);
+        return displayFlip(c, (uint32_t)a->scalarInput[0]);
+    }
     if (selector == NVMAC_SYNC_WAIT) {
         NEED(0, 1);
         uint8_t *b;
@@ -3516,11 +3567,13 @@ IOReturn NVBringup::gpuCall(GpuConn *c, uint32_t selector, IOExternalMethodArgum
         break;
     }
     case NVMAC_DISPLAY_MEM: {
-        if (a->scalarOutputCount != 5) {
+        const uint64_t buf = a->scalarInputCount ? a->scalarInput[0] : 0;
+        if (a->scalarOutputCount != 5 || a->scalarInputCount > 1 || buf > 1) {
             r = kIOReturnBadArgument;
             break;
         }
-        if (!g->dispLit || !g->disp.fb.pa) {
+        const NVDispMem &fbm = buf ? g->disp.fbB : g->disp.fb;
+        if (!g->dispLit || !fbm.pa) {
             r = kIOReturnNotReady;
             break;
         }
@@ -3533,8 +3586,8 @@ IOReturn NVBringup::gpuCall(GpuConn *c, uint32_t selector, IOExternalMethodArgum
             break;
         }
         m->flags = NVMAC_MEM_VRAM;
-        m->vram = g->disp.fb.pa;
-        m->size = g->disp.fb.size & ~0xfffull;      // exactly the surface: no neighbouring VRAM
+        m->vram = fbm.pa;
+        m->size = fbm.size & ~0xfffull;             // exactly the surface: no neighbouring VRAM
         m->kind = (uint8_t)userKind(0);
         m->borrowed = true;
         m->handle = slot + 1;

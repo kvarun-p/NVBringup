@@ -6,8 +6,10 @@
 // the frames WindowServer composes for it (CGDisplayStream), and copies each frame's dirty rectangles
 // into the surface the NVIDIA GPU scans out. The GPU's copy engine does the copies: each frame's IOSurface is
 // imported once (NVMAC_MEM_IMPORT) and the scanout surface bound (NVMAC_DISPLAY_MEM), so only the dirty
-// rectangles cross PCIe, as DMA. The CPU copies through a write-combined mapping (NVMAC_DISPLAY_MAP) instead if
-// any of that fails.
+// rectangles cross PCIe, as DMA. The display has two buffers: the copies go to the one not scanned out, which
+// then becomes visible at the next vblank (NVMAC_DISPLAY_FLIP), so no frame tears. That buffer missed the previous
+// frame, so each frame copies the previous frame's dirty rectangles too. The CPU copies through a write-combined
+// mapping (NVMAC_DISPLAY_MAP) instead if any of that fails, into the scanned-out buffer.
 // Hot-plug: NVBringup lights a monitor plugged in later and bumps NVDisplayGen on every connect and
 // disconnect; this follows it once a second, removing the virtual display while nothing is lit (so macOS
 // moves the windows back) and making it again, at the new monitor's mode, when one is.
@@ -146,6 +148,7 @@ static NSString *edidName(const Monitor *mon)
 enum { kSurfCache = 8 };
 static const uint64_t kPushSize = 64 << 10;
 static const uint64_t kSurfVaStride = 64ull << 20;       // per cached surface: up to 64 MiB (4K at 4 bytes/pixel)
+enum { kMaxRects = 512 };
 #define CLS_COPY 0xc5b5                                   // TURING_DMA_COPY_A
 #define SUBC     4                                        // the copy object's subchannel
 
@@ -169,8 +172,14 @@ static uint32_t *ceMthd(uint32_t *p, uint32_t method, uint32_t count, const uint
     uint64_t _frames, _rects, _bytes, _lastFrames, _gpuFrames;
     // Copy engine path (all on _q once started).
     BOOL _gpu;
-    uint32_t _ctx, _seqSync, _fbMem, _pushMem;
-    uint64_t _fbVa, _pushVa, _surfVaBase;
+    uint32_t _ctx, _seqSync, _fbMem[2], _pushMem;
+    uint64_t _fbVa[2], _pushVa, _surfVaBase;
+    BOOL _double;                   // two buffers, flipped (else copies go to the scanned-out one)
+    uint32_t _front;                // the buffer scanned out
+    int _fullFrames;                // copy whole frames until both buffers hold one
+    CGRect _prev[512];              // the previous frame's dirty rectangles (the back buffer lacks them)
+    size_t _nPrev;
+    BOOL _prevAll;
     uint32_t *_push;
     struct { IOSurfaceRef surf; uint32_t mem; uint64_t va, size, lastUse; } _cache[kSurfCache];
     uint64_t _useClock;
@@ -255,6 +264,10 @@ static uint32_t *ceMthd(uint32_t *p, uint32_t method, uint32_t count, const uint
             const size_t sw = IOSurfaceGetWidth(surf), sh = IOSurfaceGetHeight(surf);
             const CGRect bounds = CGRectMake(0, 0, MIN(sw, fbW), MIN(sh, fbH));
             if (!(me->_gpu && [me gpuCopy:surf rects:r count:n bounds:bounds])) {
+                if ([me cpuCopyNeedsFullFrame]) {
+                    r = &bounds;
+                    n = 1;
+                }
                 const uint8_t *src = IOSurfaceGetBaseAddress(surf);
                 const size_t srcPitch = IOSurfaceGetBytesPerRow(surf);
                 for (size_t i = 0; i < n; i++) {
@@ -320,12 +333,13 @@ static uint32_t *ceMthd(uint32_t *p, uint32_t method, uint32_t count, const uint
     uint32_t w = 0, h = 0, pitch = 0;
     int r;
     const uint64_t base = (info->va_start + 0x1fffff) & ~0x1fffffull;
-    _fbVa = base;
-    _pushVa = base + 0x40000000ull;             // 1 GiB up: the surface is far smaller
+    _fbVa[0] = base;
+    _fbVa[1] = base + 0x10000000ull;            // 256 MiB apart: a buffer is far smaller
+    _pushVa = base + 0x40000000ull;
     _surfVaBase = base + 0x80000000ull;
     void *push = NULL;
-    if ((r = nvmac_display_mem(_dev, &_fbMem, &fbSize, &w, &h, &pitch)) ||
-        (r = nvmac_bind(_dev, _fbVa, _fbMem, 0, fbSize)) ||
+    if ((r = nvmac_display_mem(_dev, 0, &_fbMem[0], &fbSize, &w, &h, &pitch)) ||
+        (r = nvmac_bind(_dev, _fbVa[0], _fbMem[0], 0, fbSize)) ||
         (r = nvmac_mem_alloc(_dev, kPushSize, 0, NVMAC_MEM_GART, 0, &_pushMem, NULL)) ||
         (r = nvmac_mem_map(_dev, _pushMem, &push, NULL)) ||
         (r = nvmac_bind(_dev, _pushVa, _pushMem, 0, kPushSize)) ||
@@ -338,6 +352,17 @@ static uint32_t *ceMthd(uint32_t *p, uint32_t method, uint32_t count, const uint
         return NO;
     }
     _push = push;
+    // The second buffer (NVBringup with NVMAC_DISPLAY_FLIP): tear-free flips.
+    uint64_t sizeB = 0;
+    uint32_t wB = 0, hB = 0, pitchB = 0;
+    _double = !nvmac_display_mem(_dev, 1, &_fbMem[1], &sizeB, &wB, &hB, &pitchB) && wB == w && hB == h &&
+              pitchB == pitch && !nvmac_bind(_dev, _fbVa[1], _fbMem[1], 0, sizeB);
+    _front = 0;
+    _fullFrames = 2;
+    _nPrev = 0;
+    _prevAll = YES;
+    if (!_double)
+        fprintf(stderr, "nvvdisplay: one display buffer only: frames may tear\n");
     return YES;
 }
 
@@ -390,10 +415,25 @@ static uint32_t *ceMthd(uint32_t *p, uint32_t method, uint32_t count, const uint
         return NO;
     const uint64_t src = _cache[slot].va, srcPitch = IOSurfaceGetBytesPerRow(surf);
     const CGRect all = bounds;
-    if (n > 512) {                              // a push buffer's worth: copy everything instead
+    // What to copy: this frame's damage, and with two buffers the previous frame's too (the back buffer
+    // last got the frame before that). Whole frames while the buffers fill, or when there are too many.
+    CGRect list[2 * kMaxRects];
+    const CGRect *cur = rects;
+    const size_t nCur = n;
+    if (_double && (_fullFrames > 0 || _prevAll || n + _nPrev > kMaxRects)) {
+        rects = &all;
+        n = 1;
+    } else if (_double) {
+        memcpy(list, cur, nCur * sizeof(CGRect));
+        memcpy(list + nCur, _prev, _nPrev * sizeof(CGRect));
+        rects = list;
+        n = nCur + _nPrev;
+    } else if (n > kMaxRects) {
         rects = &all;
         n = 1;
     }
+    const uint32_t target = _double ? 1 - _front : 0;
+    const uint64_t dstVa = _fbVa[target];
     uint32_t *p = _push;
     p = ceMthd(p, 0x000, 1, (uint32_t[]){ CLS_COPY });                        // SET_OBJECT
     uint64_t bytes = 0;
@@ -404,7 +444,7 @@ static uint32_t *ceMthd(uint32_t *p, uint32_t method, uint32_t count, const uint
             continue;
         const uint64_t x = (uint64_t)c.origin.x, y = (uint64_t)c.origin.y;
         const uint32_t w = (uint32_t)c.size.width, h = (uint32_t)c.size.height;
-        const uint64_t in = src + y * srcPitch + x * 4, out = _fbVa + y * _pitch + x * 4;
+        const uint64_t in = src + y * srcPitch + x * 4, out = dstVa + y * _pitch + x * 4;
         p = ceMthd(p, 0x400, 4, (uint32_t[]){ (uint32_t)(in >> 32), (uint32_t)in, (uint32_t)(out >> 32), (uint32_t)out });
         p = ceMthd(p, 0x410, 4, (uint32_t[]){ (uint32_t)srcPitch, _pitch, w * 4, h });   // PITCH_IN/OUT, LINE_LENGTH, COUNT
         // LAUNCH_DMA: non-pipelined, flush, pitch -> pitch, multi-line, virtual addresses
@@ -412,14 +452,29 @@ static uint32_t *ceMthd(uint32_t *p, uint32_t method, uint32_t count, const uint
         bytes += (uint64_t)w * h * 4;
         done++;
     }
-    if (!done)
+    if (!done && !_double)
         return YES;
-    struct nvmac_push push = { _pushVa, (uint32_t)((uint8_t *)p - (uint8_t *)_push), 0 };
-    uint64_t seqno = 0;
-    int r = nvmac_exec(_dev, _ctx, NULL, 0, &push, 1, NULL, 0, &seqno);
-    if (!r) {
-        struct nvmac_sync_point pt = { _seqSync, 0, seqno };
-        r = nvmac_sync_wait(_dev, &pt, 1, 1, 1000000000ull, NULL);
+    int r = 0;
+    if (done) {
+        struct nvmac_push push = { _pushVa, (uint32_t)((uint8_t *)p - (uint8_t *)_push), 0 };
+        uint64_t seqno = 0;
+        r = nvmac_exec(_dev, _ctx, NULL, 0, &push, 1, NULL, 0, &seqno);
+        if (!r) {
+            struct nvmac_sync_point pt = { _seqSync, 0, seqno };
+            r = nvmac_sync_wait(_dev, &pt, 1, 1, 1000000000ull, NULL);
+        }
+    }
+    if (!r && _double) {
+        // Show it from the next vblank; returns once the old front is free.
+        int fr = nvmac_display_flip(_dev, target);
+        if (fr && fr != kIOReturnTimeout)
+            r = fr;
+        _front = target;
+        if (_fullFrames > 0)
+            _fullFrames--;
+        _prevAll = nCur > kMaxRects;
+        _nPrev = _prevAll ? 0 : nCur;
+        memcpy(_prev, cur, _nPrev * sizeof(CGRect));
     }
     if (r) {
         fprintf(stderr, "nvvdisplay: copy engine failed (%s, 0x%x): the CPU copies from now on\n", nvmac_strerror(r), r);
@@ -429,6 +484,21 @@ static uint32_t *ceMthd(uint32_t *p, uint32_t method, uint32_t count, const uint
     _gpuFrames++;
     _rects += done;
     _bytes += bytes;
+    return YES;
+}
+
+// Before a CPU copy, which goes to buffer 0 (the one NVMAC_DISPLAY_MAP maps): show buffer 0 again if buffer 1 is
+// up, and copy it a whole frame then, as it missed the frames buffer 1 got. The GPU path refills both after.
+- (BOOL)cpuCopyNeedsFullFrame
+{
+    if (!_double)
+        return NO;
+    _fullFrames = 2;
+    _prevAll = YES;
+    if (_front == 0)
+        return NO;
+    nvmac_display_flip(_dev, 0);
+    _front = 0;
     return YES;
 }
 

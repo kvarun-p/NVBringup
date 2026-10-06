@@ -235,6 +235,7 @@ private:
     bool     dispKick(bool wndw);
     bool     dispCoreUpdate(uint32_t windowMask);
     void     dispDump();
+    IOReturn displayFlip(GpuConn *c, uint32_t buffer);
     bool     dispMemAlloc(NVDispMem &m, uint64_t size, uint64_t pa);
     uint32_t dispGen_ = 0;          // NVDisplayGen: bumped whenever the lit display comes or goes
     void     queryGrInfo();
