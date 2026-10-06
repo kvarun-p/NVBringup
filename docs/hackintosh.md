@@ -21,6 +21,10 @@ injected property). It matches NVIDIA's vendor ID and `probe()` reads the real c
 closed it only in `stop()`. `didTerminate` now shuts the hardware down and closes the device, so a
 provider going away can't hang boot.
 
+The injected class doesn't stand in the way of display output ([display.md](display.md)): with a framebuffer
+under the GPU, WindowServer adopted it as a display GPU regardless. The HDMI display works through a virtual
+display instead, which needs no change here.
+
 ## Dual boot
 
 See [power.md](power.md#shutdown-and-restart): the kext clears the GPU's protected region at

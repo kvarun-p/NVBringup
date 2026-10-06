@@ -24,6 +24,8 @@ ioreg -r -c NVBringup -d 1 | grep '"NVPower"'   # State, Mode, PowerOffs, PowerO
   wait takes 145–165 ms.
 - **Machines without `_OFF` plus `_ON` or `_PS0`** (most desktop cards) stay powered: the mode is
   fixed at on.
+- **With `nvdisp=2` (an HDMI display, [display.md](display.md)) the idle power-off never happens:** a lit display
+  counts as use, and with no monitor the GPU stays on to notice one being plugged in.
 - **Sleep, restart or shutdown with the GPU off:** it's powered on first, without GSP-RM, since
   the PCI family and the next OS expect a powered device; after wake it goes back off.
 

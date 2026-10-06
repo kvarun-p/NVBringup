@@ -357,6 +357,12 @@ static uint32_t *ceMthd(uint32_t *p, uint32_t method, uint32_t count, const uint
     uint32_t wB = 0, hB = 0, pitchB = 0;
     _double = !nvmac_display_mem(_dev, 1, &_fbMem[1], &sizeB, &wB, &hB, &pitchB) && wB == w && hB == h &&
               pitchB == pitch && !nvmac_bind(_dev, _fbVa[1], _fbMem[1], 0, sizeB);
+    // A kernel without flips ignores the buffer index above (and hands out buffer 0 again): a flip to the buffer
+    // already shown tells, and changes nothing on screen.
+    if (_double) {
+        const int fr = nvmac_display_flip(_dev, 0);
+        _double = !fr || fr == kIOReturnTimeout;
+    }
     _front = 0;
     _fullFrames = 2;
     _nPrev = 0;

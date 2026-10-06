@@ -38,6 +38,7 @@ on any of them; FWSEC and GSP-RM only run with the boot-arg `nvexperimental=1`. 
 | Driver | NVK, Mesa's Vulkan driver, with a macOS backend that talks to the kext through `libnvmac` | [nvbringup-mesa](https://github.com/kvarun-p/nvbringup-mesa), branch `main` |
 | Metal (optional) | nvmetal: a Metal driver on NVK, loaded by Metal.framework as `NVMetal.bundle`; it translates Metal shaders (AIR) for NVK's compiler | nvbringup-mesa, branch `main` |
 | Metal (optional) | `NVMetalAccel.kext`: an IOAccelerator that makes Metal.framework list the GPU and load `NVMetal.bundle` | this repository (`accel/`) |
+| Display (optional) | `nvvdisplay`: a macOS virtual display whose frames the copy engine moves to the HDMI port NVBringup lights | this repository (`display/`) |
 | Loader | Khronos Vulkan loader, which finds NVK through an ICD manifest | built from Khronos sources |
 | Apps | Any Vulkan compute program, for example llama.cpp | [llama.cpp fork](https://github.com/kvarun-p/llama.cpp/tree/nvk-tuning) (optional) |
 | UI | GPU Monitor: menu bar app and widget | this repository (`monitor/`) |
@@ -65,11 +66,19 @@ on any of them; FWSEC and GSP-RM only run with the boot-arg `nvexperimental=1`. 
   CAMetalLayer, which WindowServer composites on the Intel GPU (unmodified wgpu and MoltenVK
   apps run, for example vkcube). Only apps listed in an allow file get the GPU.
 - **H.264 video decode** through Vulkan Video (`NVK_EXPERIMENTAL=video`), on NVDEC.
+- **An HDMI monitor on the NVIDIA GPU (optional, `nvdisp=2`):** the kext lights the port over GSP-RM, and
+  `nvvdisplay` makes it a macOS screen. Arrangement, mirroring and full screen work, with tear-free flips,
+  hot-plug, and sleep and wake. The copy engine moves the frames (~55 frames/s at ~1.6 % CPU). See
+  [docs/display.md](docs/display.md).
 
 ## What it can't do
 
-- **No display output.** NVBringup drives no monitors. A display must come from another GPU,
-  such as the Intel iGPU on a laptop, the path the internal panel uses on Optimus laptops.
+- **Display output only through a virtual display** (optional step 9). The kext lights a TMDS
+  (HDMI/DVI) port on the NVIDIA GPU at the monitor's preferred mode. WindowServer still composes everything
+  on the Intel GPU, and `nvvdisplay` copies it across: no mode switching, no HDMI audio or InfoFrames (TVs
+  may need their input set to PC), and macOS 14 only (CGDisplayStream). A real framebuffer driver hangs
+  the boot, because macOS wants a Metal display pipeline for a GPU that drives a screen (see
+  [docs/display.md](docs/display.md)). DisplayPort is untested.
 - **No OpenGL, OpenCL or CUDA.** Metal only with the optional Metal step, and only for apps
   that opt in: macOS itself (WindowServer, system apps) keeps using the Intel GPU. Metal
   features Turing or NVK lack aren't there: mesh and object shaders, ray tracing, imageblocks and
@@ -285,6 +294,26 @@ monitor/build.sh     # builds and installs ~/Applications/GPU Monitor.app
 
 Enable "Launch at login" in its menu. Add the widget from the desktop's widget gallery.
 
+### 9. HDMI display (optional)
+
+For a monitor on a port the NVIDIA GPU drives (on the test laptop, HDMI). It keeps the GPU powered, even with no
+monitor connected, so that plugging one in can be noticed.
+
+1. Add `nvdisp=2` to the boot-args and reboot with the monitor connected. The port shows colour bars once
+   GSP-RM is up. `ioreg -r -c NVBringup -d 1 | grep NVDisplayModeset` should say `ok`.
+2. Build and install the helper for your user (no sudo; a LaunchAgent that starts at login):
+
+   ```bash
+   make -C display vdisplay
+   display/vdisplay/install.sh
+   ```
+
+3. Allow Screen Recording for `nvvdisplay` when asked (System Settings → Privacy & Security). It retries every 10
+   s and then adds the monitor as a display. Its log is `~/Library/Logs/nvvdisplay.log`.
+
+After rebuilding `nvvdisplay`, switch its Screen Recording permission off and on again: the permission is tied to
+the binary's ad-hoc signature. Details are in [display/README.md](display/README.md).
+
 ## Verify the installation
 
 ```bash
@@ -364,6 +393,7 @@ build. By hand:
 | `tools/nvgsp.cpp` or `tools/daemon/` | `make`, then `sudo tools/install_daemon.sh` |
 | `src/nv_uapi.h` or `tools/libnvmac.*` | also rebuild NVK with matching copies (nvbringup-mesa) |
 | `accel/` | `make -C accel`, copy the kext to `/Library/Extensions` (step 7), reboot |
+| `display/vdisplay/` | `make -C display vdisplay`, `display/vdisplay/install.sh`, grant Screen Recording again |
 | the Mesa build (NVMetal.bundle) | `sudo accel/tools/nvmetal_root_install.sh install <bundle>`, reboot |
 | `monitor/` | `monitor/build.sh` |
 
@@ -385,6 +415,8 @@ firmware and your Mesa and llama.cpp builds. By hand:
 5. Metal step: `sudo accel/tools/nvmetal_root_install.sh remove` (or `revert`), reboot; delete
    `/Library/Extensions/NVMetalAccel.kext` and the files in `/Library/Preferences/` named
    `io.github.kvarun-p.nvmetal.*`; remove `nvaccel=1` and restore `csr-active-config`.
+6. HDMI display: `display/vdisplay/install.sh -u`, remove `nvdisp=2`, and delete
+   `/Library/Extensions/NVFramebuffer.kext` if an earlier test installed it (`tools/uninstall.sh` doesn't).
 
 ## Boot-args
 
@@ -399,6 +431,9 @@ firmware and your Mesa and llama.cpp builds. By hand:
 | `nvtest=1` | Run the kext's boot-time self-tests |
 | `nvexperimental=1` | Let chips whose support is marked experimental run FWSEC and GSP-RM: Ampere GA10x and Ada, whose HAL has never run on hardware (see docs/firmware-and-boot.md) |
 | `nvaccel=1` | Start NVMetalAccel, so Metal.framework lists the GPU (Metal step) |
+| `nvdisp=1` | Read what GSP-RM knows about the display outputs (connect state, EDIDs) into the log and `NVDisplayProbe`; changes nothing |
+| `nvdisp=2` | Light a connected HDMI/DVI port at boot and on hot-plug, for `nvvdisplay` (step 9). Keeps the GPU powered |
+| `nvfb=1` | Experiment only, don't use: puts NVFramebuffer.kext under the GPU's PCI device, which hangs the boot (see docs/display.md) |
 | `nvkmapvram=1` | NVK keeps its push buffers and descriptors in CPU-mapped VRAM: faster generation (+15 % on a 0.5B model, +6 % on 3B), but each program run holds ~2.7 MiB of BAR1 until a restart; after ~42 runs it falls back to system memory (default speed). `desc` / `cmd:<n>` select parts; see [docs/bar1-cpu-mappings.md](docs/bar1-cpu-mappings.md) |
 
 ## Troubleshooting
@@ -420,6 +455,12 @@ firmware and your Mesa and llama.cpp builds. By hand:
   `NVMETAL_ALLOW=1`), and not be a system executable. `log show --last 5m --predicate
   'eventMessage CONTAINS "NVMetal"'` says why a process was refused. If the screen or an app
   misbehaves, the kill file (step 7) turns nvmetal off at once.
+- **HDMI monitor shows nothing, or only colour bars:** colour bars mean the port is lit and `nvvdisplay` isn't
+  running or isn't allowed to capture. Check `~/Library/Logs/nvvdisplay.log`. After a rebuild, switch its Screen
+  Recording permission off and on. No picture at all: check `ioreg -r -c NVBringup -d 1 | grep NVDisplay` for the
+  modeset result, and that the boot-args have `nvdisp=2`.
+- **The edges of the HDMI picture are cut off on a TV:** that's the TV's overscan. Set the TV input's device type
+  to PC, or its picture size to fit the screen.
 - **Known issue:** a debug-optimized NVK build can end a program with
   `Assertion failed: (cache->object_cache->entries == 0), function vk_pipeline_cache_destroy`.
   It happens at teardown, after the work is done, and doesn't affect results.
@@ -432,6 +473,7 @@ firmware and your Mesa and llama.cpp builds. By hand:
 | `tools/` | `nvgsp`, `nvtest`, `vktest`, `libnvmac` (C library over `nv_uapi.h`), `vbios_tool`, the boot daemon (`daemon/`, `install_daemon.sh`), `install.sh`, `uninstall.sh`, `verify_install.sh`, `run-llama.sh`, `gsp_test.sh` |
 | `accel/` | NVMetalAccel, the IOAccelerator kext for Metal, and `tools/nvmetal_root_install.sh` |
 | `monitor/` | GPU Monitor (SwiftUI menu bar app and WidgetKit widget) |
+| `display/` | `vdisplay/nvvdisplay` and its installer (the HDMI display), and NVFramebuffer.kext (an IOFramebuffer that doesn't work, kept with its findings) |
 | `docs/` | Task recipes ([howto](docs/howto.md)) and design decisions: what was chosen, the alternatives, and the measurements behind them ([index](docs/README.md)) |
 
 `src/nv_uapi.h` and `tools/libnvmac.*` are the kext's user-space ABI. The Mesa patches carry

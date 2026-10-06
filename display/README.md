@@ -47,8 +47,8 @@ BAR1 range), with the one mode it was lit at, and the sink's EDID over DDC. Ther
 WindowServer draws into the aperture with the CPU.
 
 - It attaches to IOResources and matches the `NVDisplayLit` resource. NVBringup published that resource after a
-  modeset that scans out, but since hot-plug it no longer does, so this kext doesn't start. It sits outside the GPU's PCI device for the same reason as
-  NVMetalAccel (`accel/README.md`).
+  modeset that scans out, but since hot-plug it no longer does, so this kext doesn't start. It sits outside the GPU's
+  PCI device for the same reason as NVMetalAccel (`accel/README.md`).
 - NVBringup's `NVDisplayFB` property carries everything it needs: the physical address and size of the surface,
   the mode, and the EDID. The two kexts share no symbols.
 - `make verify` checks all of NVFramebuffer's vtable slots against the kernel's IOFramebuffer. Run it after a macOS
@@ -62,8 +62,8 @@ What happened on hardware (2026-10-06):
   framebuffer, and boot hangs at the Apple logo. A display GPU needs its own Metal display pipeline (IOAccelDisplayPipe),
   as the accelerator test in `accel/README.md` also showed.
 
-Also not supported: mode changes, hot-plug, gamma, and sleep and wake. GSP-RM goes down with the GPU, and the
-framebuffer doesn't follow it yet.
+It never supported mode changes, hot-plug, gamma, or sleep and wake (nvvdisplay handles the last three).
+The design and the findings are in [docs/display.md](../docs/display.md).
 
 Loading: IOGraphicsFamily is in the system kernel collection, so OpenCore can't inject this kext. It has to go in the
 auxiliary collection, the same way as NVMetalAccel:

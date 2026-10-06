@@ -17,6 +17,7 @@ Installation and everyday use are in the top-level [README](../README.md). Here:
 | [bar1-cpu-mappings.md](bar1-cpu-mappings.md) | CPU mappings of VRAM that outlive a free: the kext fix, and where NVK puts CPU-mapped memory (`nvkmapvram`) |
 | [nvk-and-llama.md](nvk-and-llama.md) | The NVK port, the two NAK fixes for Turing, llama.cpp tuning |
 | [power.md](power.md) | Runtime power-off, sleep and wake, shutdown |
+| [display.md](display.md) | Lighting the HDMI port over GSP-RM (and what nvdisplay 3 needs), why an IOFramebuffer fails, the virtual display with copy-engine copies and tear-free flips, hot-plug |
 | [hackintosh.md](hackintosh.md) | Hiding the GPU from macOS graphics without breaking brightness; dual boot |
 
 Sources used throughout: NVIDIA's open-gpu-kernel-modules (r570.144, the authority for

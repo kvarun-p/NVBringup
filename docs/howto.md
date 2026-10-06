@@ -104,6 +104,21 @@ build/nvgsp power auto           # back to idle power-off
 boot-arg `nvidle=<seconds>` changes the idle time (`0` keeps it on). GPU Monitor has the same
 switch. Details: [power.md](power.md).
 
+## Use the HDMI port
+
+Setup is step 9 of the README; the design is in [display.md](display.md).
+
+```bash
+ioreg -r -c NVBringup -d 1 | grep -E '"NVDisplay(Modeset|Gen|Probe)"'   # lit? ("ok"), generation, outputs found
+tail -5 ~/Library/Logs/nvvdisplay.log          # frames/s, and how many the copy engine did
+launchctl kickstart -k gui/$(id -u)/io.github.kvarun-p.nvvdisplay       # restart the helper
+ioreg -a -r -c NVBringup -d 1 | plutil -extract 0.NVLog raw -o - - | grep 'display:'   # modesets, hot-plug
+```
+
+Unplugging the monitor removes the virtual display within about 2–3 s; plugging one in lights it at its preferred
+mode (colour bars until the helper takes over). If the log says "one display buffer only", the kext predates
+tear-free flips. If it says "the CPU copies", the copy engine path failed, and the reason is the line before.
+
 ## Let other users use the GPU
 
 By default only root and the user logged in at the console can open the GPU (like a Linux render
