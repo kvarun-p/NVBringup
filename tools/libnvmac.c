@@ -182,6 +182,25 @@ int nvmac_display_map(nvmac_dev *d, void **ptr, uint64_t *size, uint32_t *width,
     return r;
 }
 
+int nvmac_display_mem(nvmac_dev *d, uint32_t *mem, uint64_t *size, uint32_t *width, uint32_t *height,
+                      uint32_t *pitch)
+{
+    uint64_t out[5] = {0};
+    int r = scalar(d, NVMAC_DISPLAY_MEM, NULL, 0, out, 5);
+    if (!r) {
+        *mem = (uint32_t)out[0];
+        if (size)
+            *size = out[1];
+        if (width)
+            *width = (uint32_t)out[2];
+        if (height)
+            *height = (uint32_t)out[3];
+        if (pitch)
+            *pitch = (uint32_t)out[4];
+    }
+    return r;
+}
+
 int nvmac_mem_unmap(nvmac_dev *d, uint32_t mem)
 {
     uint64_t in = mem;

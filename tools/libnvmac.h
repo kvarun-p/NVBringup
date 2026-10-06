@@ -29,6 +29,10 @@ int nvmac_mem_map(nvmac_dev *d, uint32_t mem, void **ptr, uint64_t *size);
 // kIOReturnNotReady when no display is lit.
 int nvmac_display_map(nvmac_dev *d, void **ptr, uint64_t *size, uint32_t *width, uint32_t *height,
                       uint32_t *pitch);
+// The same surface as a VRAM memory object (pitch kind) to bind and copy into; nvmac_mem_free drops the
+// handle only. kIOReturnNotReady when no display is lit.
+int nvmac_display_mem(nvmac_dev *d, uint32_t *mem, uint64_t *size, uint32_t *width, uint32_t *height,
+                      uint32_t *pitch);
 int nvmac_mem_unmap(nvmac_dev *d, uint32_t mem);
 
 int nvmac_vm_bind(nvmac_dev *d, const struct nvmac_bind_op *ops, uint32_t count);

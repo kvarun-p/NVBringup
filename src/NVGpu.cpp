@@ -81,6 +81,7 @@ struct NVBringup::GpuMem {
     IOMemoryMap *userMap = nullptr;
     IOMemoryDescriptor *userMd = nullptr;   // NVMAC_MEM_IMPORT: the caller's pages, prepared (wired)
     uint8_t  kind = 0;
+    bool     borrowed = false;          // NVMAC_DISPLAY_MEM: the display's VRAM, not freed with the handle
     bool     cpuMapped = false;         // bar1Va may have a CPU duplicate (memMap'd, or a reused held
                                         // slice): memFree holds it, with an entry already promised
 };
@@ -2454,7 +2455,7 @@ void NVBringup::memFree(GpuConn *c, GpuMem *m, bool unbind)
         else
             bar1Unmap(m->bar1Va, m->bar1Size);
     }
-    if (m->vram)
+    if (m->vram && !m->borrowed)
         nv_vram_free(g->vram, m->vram);
     m->sys.free();
     if (m->userMd) {                    // unwire the caller's pages (after the DMA mapping is gone)
@@ -3509,6 +3510,37 @@ IOReturn NVBringup::gpuCall(GpuConn *c, uint32_t selector, IOExternalMethodArgum
         }
         a->scalarOutput[0] = c->dispMap->getAddress();
         a->scalarOutput[1] = g->dispFbSize;
+        a->scalarOutput[2] = g->dispW;
+        a->scalarOutput[3] = g->dispH;
+        a->scalarOutput[4] = g->dispPitch;
+        break;
+    }
+    case NVMAC_DISPLAY_MEM: {
+        if (a->scalarOutputCount != 5) {
+            r = kIOReturnBadArgument;
+            break;
+        }
+        if (!g->dispLit || !g->disp.fb.pa) {
+            r = kIOReturnNotReady;
+            break;
+        }
+        uint32_t slot;
+        if ((r = memSlot(c, &slot)) != kIOReturnSuccess)
+            break;
+        GpuMem *m = new GpuMem;
+        if (!m) {
+            r = kIOReturnNoMemory;
+            break;
+        }
+        m->flags = NVMAC_MEM_VRAM;
+        m->vram = g->disp.fb.pa;
+        m->size = g->disp.fb.size & ~0xfffull;      // exactly the surface: no neighbouring VRAM
+        m->kind = (uint8_t)userKind(0);
+        m->borrowed = true;
+        m->handle = slot + 1;
+        c->mems[slot] = m;
+        a->scalarOutput[0] = m->handle;
+        a->scalarOutput[1] = m->size;
         a->scalarOutput[2] = g->dispW;
         a->scalarOutput[3] = g->dispH;
         a->scalarOutput[4] = g->dispPitch;

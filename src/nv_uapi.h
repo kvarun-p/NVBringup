@@ -86,6 +86,10 @@ enum nvmac_selector {
     NVMAC_DISPLAY_MAP,      // scalar out: address, size, width, height, pitch of the surface the lit display
                             //   (boot-arg nvdisp=2) scans out, X8R8G8B8 pitch-linear, mapped write-combined
                             //   (one mapping per connection). kIOReturnNotReady if no display is lit.
+    NVMAC_DISPLAY_MEM,      // scalar out: handle, size, width, height, pitch: that surface as a VRAM memory
+                            //   object of the connection (pitch kind), for VM_BIND and copy-engine writes.
+                            //   MEM_FREE drops the handle; the VRAM stays the display's. kIOReturnNotReady
+                            //   if no display is lit.
     NVMAC_SELECTOR_COUNT
 };
 

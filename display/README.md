@@ -7,8 +7,13 @@ GSP-RM and scans out one pitch-linear X8R8G8B8 surface in VRAM. This directory g
 
 `vdisplay/nvvdisplay` creates a macOS virtual display (CGVirtualDisplay, the private API DeskPad and
 BetterDisplay use) with the monitor's EDID name and mode. It takes the frames WindowServer composes for that display
-(CGDisplayStream, cursor included) and copies each frame's dirty rectangles with the CPU into the scanout surface,
-which NVBringup maps into it (`NVMAC_DISPLAY_MAP`, `nvmac_display_map` in libnvmac).
+(CGDisplayStream, cursor included) and copies each frame's dirty rectangles into the scanout surface. The GPU's copy
+engine does the copies: each frame's IOSurface is imported once (`NVMAC_MEM_IMPORT`, at most 8 cached) and the
+scanout surface bound as a VRAM object (`NVMAC_DISPLAY_MEM`), so only dirty rectangles cross PCIe, as DMA. If any of
+that fails, the CPU copies through a write-combined mapping instead (`NVMAC_DISPLAY_MAP`). The log says which.
+
+Sleep and wake: GSP-RM goes down before sleep, so the display is reported gone. After wake NVBringup boots GSP-RM again,
+which relights the output, and nvvdisplay makes the virtual display again.
 
 ```
 make -C display vdisplay
