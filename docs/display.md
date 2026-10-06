@@ -6,7 +6,7 @@ port to the NVIDIA GPU: display `0x400`, TMDS, SOR 0. The Intel iGPU drives only
 
 In short, the kext lights the port over GSP-RM and scans out a buffer in VRAM. A user-space helper,
 `nvvdisplay` (`display/vdisplay/`), creates a macOS virtual display and copies what WindowServer draws there
-into that buffer with the GPU's copy engine, flipping two buffers at vblank. Usage is in
+into that buffer with the GPU's copy engine, flipping three buffers at vblank. Usage is in
 [display/README.md](../display/README.md); installation is step 9 of the top-level README.
 
 ## Lighting the port (the kext)
@@ -94,18 +94,34 @@ dirty rectangles, and puts them in the scanout buffer:
   dirty rectangle, waited for before the surface is unlocked. Measured: every frame by the copy engine, up to
   ~55 frames/s and ~180 MB/s, with `nvvdisplay` at ~1.6 % CPU and 4 MB. The first, CPU-copy version used ~2 % at
   3–13 frames/s.
-- **No tearing:** two buffers. The copies go to the one not scanned out, then `NVMAC_DISPLAY_FLIP` points window 0
-  at it from the next vblank. It returns once the window notifier (at 0x100 in the display's sync page) leaves
-  NOT_BEGUN, so the old buffer is free. The flip's wait, up to a frame, runs outside `gspLock_`, so other GPU work
-  isn't held up. The back buffer missed the previous frame, so each frame also copies the previous frame's dirty
-  rectangles, and whole frames until both buffers are filled.
-  **Completion:** on hardware the notifier never leaves NOT_BEGUN (its context DMA and control read back as set,
-  in both the assembly and armed state; the cause is unknown). So the kernel also counts a flip done once window
-  0's armed offset register (0x690a60: nvkm's `.prev`, 0x800 above the assembly state at 0x690000 + method)
-  holds the new buffer. Measured 2026-10-07: 2092 flips, all by the armed state, none timed out, 5–7 ms each (the
-  wait for vblank); ~48–55 frames/s. `NVDisplayFlips` counts the outcomes; `NVDisplayFlipDiag` holds the
-  notifier and window state of the first flips not done by the notifier. Before this, every flip waited the
-  100 ms out (<10 frames/s); `nvvdisplay` still goes back to one buffer after 3 timed-out flips in a row.
+- **No tearing:** three buffers. A frame is copied into one neither scanned out nor being flipped to, then
+  `NVMAC_DISPLAY_FLIP` points window 0 at it. Flips run on their own queue, so copies go on while one waits;
+  a copied frame still waiting for its flip is taken over by a newer one. Each buffer remembers which frame it
+  holds and gets the dirty rectangles of every frame since (a history of 8, else the whole frame). Frames
+  ScreenCaptureKit delivers while a copy runs wait in a one-frame mailbox, a newer one replacing a waiting one
+  with its damage merged, so no backlog builds up.
+- **When a flip is done:** the window notifier (0x100 in the display's sync page) never leaves NOT_BEGUN on
+  hardware, although its context DMA and control read back as set in both the assembly and the armed state; the
+  cause is unknown. Window 0's armed offset (0x690a60: nvkm's `.prev`, 0x800 above the assembly state at
+  0x690000 + method) is set as soon as the UPDATE arrives, anywhere in the frame (`NVDisplayFlipLines` records the
+  raster line), and becomes active only at the next vblank. Returning then let `nvvdisplay` write the buffer
+  still scanned out: tearing while scrolling. So once the offset is armed, the kernel waits until head 0's raster
+  line (0x616330) has passed through a vblank and is active again; a flip armed inside a vblank waits for the
+  next. The wait runs outside `gspLock_`. `NVDisplayFlips` counts how flips completed; `NVDisplayFlipDiag` holds the
+  state of the first flips the notifier didn't complete.
+- **History, measured on hardware:**
+
+  | Version | Result |
+  |---|---|
+  | Wait for the notifier | Every flip waited the 100 ms timeout: <10 frames/s |
+  | Done once armed | 5–7 ms per flip, ~50 frames/s, tearing |
+  | Wait for the vblank, two buffers | No tearing, flips 11–13 ms, copies blocked meanwhile: frames queued, and a short lag every 2–3 s |
+  | Three buffers, flips on their own queue | No tearing, 30–40 frames/s while scrolling, all frames by the copy engine |
+
+  What's left is about one frame dropped or doubled every few seconds. The virtual display's 60 Hz and the
+  monitor's 60 Hz come from different clocks and drift against each other; showing every frame would mean timing
+  the virtual display from the monitor's vblank. `nvvdisplay` still goes back to one buffer after 3 flips in a row
+  time out, or a failed one.
 - **Fallback:** if anything on the GPU path fails, the CPU copies through a write-combined mapping of buffer 0
   (`NVMAC_DISPLAY_MAP`), after flipping back to it.
 - **Hot-plug:** it follows `NVDisplayGen` once a second. It removes the virtual display while nothing is lit (macOS

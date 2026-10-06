@@ -12,9 +12,11 @@ engine does the copies: each frame's IOSurface is imported once (`NVMAC_MEM_IMPO
 scanout surface bound as a VRAM object (`NVMAC_DISPLAY_MEM`), so only dirty rectangles cross PCIe, as DMA. If any of
 that fails, the CPU copies through a write-combined mapping instead (`NVMAC_DISPLAY_MAP`). The log says which.
 
-No tearing: the display has two buffers. The copy engine writes the one not scanned out, then `NVMAC_DISPLAY_FLIP`
-makes it visible from the next vblank and returns once the old one is free (the window notifier). The back buffer
-missed the previous frame, so each frame also copies the previous frame's dirty rectangles. The flip waits outside
+No tearing: the display has three buffers. The copy engine writes one that's neither scanned out nor being flipped
+to, and `NVMAC_DISPLAY_FLIP`, on its own queue, makes it visible from the next vblank and returns once the old one
+is out of scanout. Each buffer gets the dirty rectangles of every frame since the one it holds. A newer frame takes
+over a buffer still waiting for its flip, so the screen shows the newest frame. About one frame is dropped or
+doubled every few seconds, because the virtual display's 60 Hz drifts against the monitor's. The flip waits outside
 `gspLock_`, so other GPU work isn't held up by it.
 
 Sleep and wake: GSP-RM goes down before sleep, so the display is reported gone. After wake NVBringup boots GSP-RM again,
