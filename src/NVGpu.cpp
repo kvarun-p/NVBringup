@@ -1035,6 +1035,8 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
     {
         const uint32_t hblankE = htotal - hsyncs - 1, vblankE = vtotal - vsyncs - 1;
         dispMthd(false, 0x206c + head * 0x400, hblankE | vblankE << 16);          // blank end
+        d.vbE = vblankE;
+        d.vbS = vblankE + vact;
         dispMthd(false, 0x2070 + head * 0x400, (hblankE + hact) | (vblankE + vact) << 16);   // blank start
     }
     dispMthd(false, 0x2074 + head * 0x400, 0u << 16 | 1);                         // blank2 (undocumented, as nouveau)
@@ -1303,21 +1305,41 @@ IOReturn NVBringup::displayFlip(GpuConn *c, uint32_t buffer)
     dispMthd(true, 0x200, 1);                                                     // UPDATE
     d.front = buffer;
     IOLockUnlock(gspLock_);
-    // Done once the notifier leaves NOT_BEGUN, or once window 0's armed (active) offset is the new buffer:
-    // 0x690000 + method is the window channel's assembly state, + 0x800 the armed one (nvkm
-    // gv100_disp_wndw_mthd, .prev).
+    // Latched once the notifier leaves NOT_BEGUN, or once window 0's armed offset is the new buffer: 0x690000 +
+    // method is the window channel's assembly state, + 0x800 the armed one (nvkm gv100_disp_wndw_mthd, .prev).
+    // Armed is what the next vblank makes active, so then the raster has to pass a whole vblank too: only after
+    // that is the old buffer out of scanout. Head 0's line is 0x616330 (gv100_head_rgpos); the active lines
+    // lie between blank end and blank start, the vblank around the wrap to 0.
     const uint32_t want = (uint32_t)(f.pa >> 8);
     IOReturn r = kIOReturnTimeout;
-    int how = 0;                            // 1 notifier, 2 armed state
+    int how = 0;                            // 1 notifier, 2 armed state; 3 armed, no vblank seen
+    int latched = 0;
+    uint32_t prev = ~0u, waited = 0, latchLine = ~0u;
+    bool active0 = false, sawBlank = false;
     for (int i = 0; i < 100 && !how; i++) { // a 0xffffffff read (GPU gone) ends it too
-        if (ntfy[0] >> 30)
-            how = 1;
-        else {
-            IOLockLock(gspLock_);
-            if (gsp_ && gsp_->booted && gsp_->disp.ready && rd32(0x690a60) == want)
-                how = 2;
-            IOLockUnlock(gspLock_);
+        IOLockLock(gspLock_);
+        const bool up = gsp_ && gsp_->booted && gsp_->disp.ready;
+        if (up && !latched)
+            latched = (ntfy[0] >> 30) ? 1 : rd32(0x690a60) == want ? 2 : 0;
+        if (up && latched) {
+            const uint32_t v = rd32(0x616330) & 0xffff;
+            const bool active = v > gsp_->disp.vbE && v <= gsp_->disp.vbS;
+            if (latchLine == ~0u)
+                latchLine = v;
+            if (!active)
+                sawBlank = active0;         // a vblank after an active line seen since latching
+            else if (!active0)
+                active0 = true;             // latched in a vblank: count from the next active line
+            else if (sawBlank || v < prev)  // active again after a vblank, or wrapped past one between samples
+                how = latched;
+            if (active)
+                prev = v;
+            if (!how && ++waited > 25)      // the raster doesn't seem to move: take the armed state as is
+                how = 3;
         }
+        IOLockUnlock(gspLock_);
+        if (!up)
+            break;
         if (!how)
             IOSleep(1);
     }
@@ -1327,21 +1349,32 @@ IOReturn NVBringup::displayFlip(GpuConn *c, uint32_t buffer)
     if (gsp_ && gsp_->booted && gsp_->disp.ready) {
         GspState::DispHw &dd = gsp_->disp;
         dd.flipBy[how]++;
-        if (how != 1 && dd.flipLogged < 3) {     // what the notifier and the window state say
+        // The raster line when the flip was seen latched, for the first flips: spread over the frame if
+        // latching is the UPDATE's arrival, near the vblank if it's the vblank itself.
+        if (dd.nLatch < 24 && latchLine != ~0u) {
+            dd.latchLine[dd.nLatch++] = (uint16_t)latchLine;
+            char l[24 * 6 + 64];
+            int o = snprintf(l, sizeof(l), "active %u-%u:", dd.vbE + 1, dd.vbS);
+            for (uint32_t k = 0; k < dd.nLatch && o < (int)sizeof(l) - 6; k++)
+                o += snprintf(l + o, sizeof(l) - (size_t)o, " %u", dd.latchLine[k]);
+            setProperty("NVDisplayFlipLines", l);
+        }
+        if (how != 1 && how != 2 && dd.flipLogged < 3) {     // what the notifier and the window state say
             dd.flipLogged++;
             char msg[256];
             snprintf(msg, sizeof(msg),
                      "flip to %u by %s: ntfy %08x %08x %08x %08x; offset asy %08x armed %08x (want %08x); "
                      "ntfy ctl asy %08x/%08x armed %08x/%08x; exc %08x %08x %08x; PUT %x GET %x",
-                     buffer, how ? "armed state" : "nothing (timeout)", ntfy[0], ntfy[1], ntfy[2], ntfy[3],
+                     buffer, how ? "armed state, no vblank seen" : "nothing (timeout)", ntfy[0], ntfy[1], ntfy[2], ntfy[3],
                      rd32(0x690260), rd32(0x690a60), want, rd32(0x69021c), rd32(0x690220), rd32(0x690a1c),
                      rd32(0x690a20), rd32(0x61102c), rd32(0x611030), rd32(0x611034), rd32(0x690000),
                      rd32(0x690004));
             LOG("GSP: display: %s", msg);
             setProperty("NVDisplayFlipDiag", msg);
         }
-        char counts[96];
-        snprintf(counts, sizeof(counts), "notifier %u, armed state %u, timed out %u", dd.flipBy[1], dd.flipBy[2], dd.flipBy[0]);
+        char counts[128];
+        snprintf(counts, sizeof(counts), "notifier %u, armed state %u, armed without vblank %u, timed out %u",
+                 dd.flipBy[1], dd.flipBy[2], dd.flipBy[3], dd.flipBy[0]);
         setProperty("NVDisplayFlips", counts);
     }
     IOLockUnlock(gspLock_);
