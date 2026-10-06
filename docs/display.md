@@ -99,6 +99,12 @@ dirty rectangles, and puts them in the scanout buffer:
   NOT_BEGUN, so the old buffer is free. The flip's wait, up to a frame, runs outside `gspLock_`, so other GPU work
   isn't held up. The back buffer missed the previous frame, so each frame also copies the previous frame's dirty
   rectangles, and whole frames until both buffers are filled.
+  **Not working yet (2026-10-06):** on hardware the notifier never leaves NOT_BEGUN, so every flip waited the
+  kernel's 100 ms out (~120 ms measured), capping the screen below 10 frames/s. After 3 flips in a row time out,
+  `nvvdisplay` goes back to one buffer (copies into the scanned-out one, ~50–55 frames/s, may tear). The kernel
+  now also counts a flip done once window 0's armed offset register (0x690a60, nvkm's `.prev` = 0x800 above the
+  assembly state) holds the new buffer, and records the notifier and window state of the first timeouts in
+  `NVDisplayFlipDiag` (counts in `NVDisplayFlips`). Untested.
 - **Fallback:** if anything on the GPU path fails, the CPU copies through a write-combined mapping of buffer 0
   (`NVMAC_DISPLAY_MAP`), after flipping back to it.
 - **Hot-plug:** it follows `NVDisplayGen` once a second. It removes the virtual display while nothing is lit (macOS

@@ -188,6 +188,8 @@ static uint32_t *ceMthd(uint32_t *p, uint32_t method, uint32_t count, const uint
     dispatch_queue_t _q;
     BOOL _active;                   // on _q: copies allowed (cleared before the surface is unmapped)
     uint64_t _frames, _rects, _bytes, _lastFrames, _gpuFrames;
+    uint64_t _lastGpuFrames;
+    uint64_t _flips, _flipTimeouts, _flipNs, _copyNs;     // since the last report
     // Copy engine path (all on _q once started).
     BOOL _gpu;
     uint32_t _ctx, _seqSync, _fbMem[2], _pushMem;
@@ -195,6 +197,8 @@ static uint32_t *ceMthd(uint32_t *p, uint32_t method, uint32_t count, const uint
     BOOL _double;                   // two buffers, flipped (else copies go to the scanned-out one)
     uint32_t _front;                // the buffer scanned out
     int _fullFrames;                // copy whole frames until both buffers hold one
+    int _flipStuck;                 // flips in a row that timed out
+    BOOL _single;                   // gave up on flips: the next single-buffer frame is copied whole
     CGRect _prev[512];              // the previous frame's dirty rectangles (the back buffer lacks them)
     size_t _nPrev;
     BOOL _prevAll;
@@ -594,7 +598,8 @@ static uint32_t *ceMthd(uint32_t *p, uint32_t method, uint32_t count, const uint
         memcpy(list + nCur, _prev, _nPrev * sizeof(CGRect));
         rects = list;
         n = nCur + _nPrev;
-    } else if (n > kMaxRects) {
+    } else if (n > kMaxRects || _single) {
+        _single = NO;
         rects = &all;
         n = 1;
     }
@@ -622,6 +627,7 @@ static uint32_t *ceMthd(uint32_t *p, uint32_t method, uint32_t count, const uint
         return YES;
     int r = 0;
     if (done) {
+        const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         struct nvmac_push push = { _pushVa, (uint32_t)((uint8_t *)p - (uint8_t *)_push), 0 };
         uint64_t seqno = 0;
         r = nvmac_exec(_dev, _ctx, NULL, 0, &push, 1, NULL, 0, &seqno);
@@ -629,10 +635,16 @@ static uint32_t *ceMthd(uint32_t *p, uint32_t method, uint32_t count, const uint
             struct nvmac_sync_point pt = { _seqSync, 0, seqno };
             r = nvmac_sync_wait(_dev, &pt, 1, 1, 1000000000ull, NULL);
         }
+        _copyNs += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
     }
     if (!r && _double) {
         // Show it from the next vblank; returns once the old front is free.
+        const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         int fr = nvmac_display_flip(_dev, target);
+        _flipNs += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+        _flips++;
+        _flipTimeouts += fr == kIOReturnTimeout;
+        _flipStuck = fr == kIOReturnTimeout ? _flipStuck + 1 : 0;
         if (fr && fr != kIOReturnTimeout)
             r = fr;
         _front = target;
@@ -641,6 +653,15 @@ static uint32_t *ceMthd(uint32_t *p, uint32_t method, uint32_t count, const uint
         _prevAll = nCur > kMaxRects;
         _nPrev = _prevAll ? 0 : nCur;
         memcpy(_prev, cur, _nPrev * sizeof(CGRect));
+        // The flip's completion never shows (each waits the kernel's 100 ms out): one buffer, as without flips.
+        if (_flipStuck >= 3) {
+            fprintf(stderr, "nvvdisplay: flips never report completion: one display buffer from now on (frames may "
+                            "tear)\n");
+            nvmac_display_flip(_dev, 0);
+            _front = 0;
+            _double = NO;
+            _single = YES;
+        }
     }
     if (r) {
         fprintf(stderr, "nvvdisplay: copy engine failed (%s, 0x%x): the CPU copies from now on\n", nvmac_strerror(r), r);
@@ -672,7 +693,7 @@ static uint32_t *ceMthd(uint32_t *p, uint32_t method, uint32_t count, const uint
 {
     if (!_q)
         return;
-    __block uint64_t f = 0, rc = 0, b = 0, gf = 0;
+    __block uint64_t f = 0, rc = 0, b = 0, gf = 0, fl = 0, fto = 0, fns = 0, cns = 0;
     __block BOOL gpu = NO;
     dispatch_sync(_q, ^{
         f = self->_frames;
@@ -680,11 +701,21 @@ static uint32_t *ceMthd(uint32_t *p, uint32_t method, uint32_t count, const uint
         b = self->_bytes;
         gf = self->_gpuFrames;
         gpu = self->_gpu;
+        fl = self->_flips;
+        fto = self->_flipTimeouts;
+        fns = self->_flipNs;
+        cns = self->_copyNs;
+        self->_flips = self->_flipTimeouts = self->_flipNs = self->_copyNs = 0;
     });
     printf("nvvdisplay: %llu frames (%.1f/s), %llu rects, %.1f MB copied; %llu by the copy engine%s\n", f,
            (f - _lastFrames) / 10.0, rc, b / 1e6, gf, gpu ? "" : " (CPU copies now)");
+    const uint64_t gpuNow = gf - _lastGpuFrames;
+    if (fl || gpuNow)
+        printf("nvvdisplay:   copies %.2f ms each; %llu flips, %.2f ms each, %llu timed out\n",
+               gpuNow ? cns / 1e6 / gpuNow : 0.0, fl, fl ? fns / 1e6 / fl : 0.0, fto);
     fflush(stdout);
     _lastFrames = f;
+    _lastGpuFrames = gf;
 }
 @end
 
