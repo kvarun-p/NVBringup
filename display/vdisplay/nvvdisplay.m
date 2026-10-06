@@ -28,6 +28,8 @@
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 #include <signal.h>
+#include <os/lock.h>
+#include <pthread.h>
 #include "libnvmac.h"
 
 // ---- CGVirtualDisplay (private, CoreGraphics) --------------------------------------------------------
@@ -166,6 +168,7 @@ enum { kSurfCache = 8 };
 static const uint64_t kPushSize = 64 << 10;
 static const uint64_t kSurfVaStride = 64ull << 20;       // per cached surface: up to 64 MiB (4K at 4 bytes/pixel)
 enum { kMaxRects = 512 };
+enum { kMaxBuf = 3, kHist = 8 };
 #define CLS_COPY 0xc5b5                                   // TURING_DMA_COPY_A
 #define SUBC     4                                        // the copy object's subchannel
 
@@ -186,22 +189,39 @@ static uint32_t *ceMthd(uint32_t *p, uint32_t method, uint32_t count, const uint
     CGDisplayStreamRef _stream;     // capture: one of these
     SCStream *_scStream;
     dispatch_queue_t _q;
+    // ScreenCaptureKit frames arrive on _cq and wait here for _q; a newer frame replaces a waiting one, its
+    // dirty rectangles merged, so the copies always take the newest frame instead of working down a backlog.
+    dispatch_queue_t _cq;
+    os_unfair_lock _pendLock;
+    CMSampleBufferRef _pendSb;
+    CGRect _pend[512];
+    size_t _nPend;
+    BOOL _pendAll, _draining;
+    uint64_t _skipped;
     BOOL _active;                   // on _q: copies allowed (cleared before the surface is unmapped)
     uint64_t _frames, _rects, _bytes, _lastFrames, _gpuFrames;
     uint64_t _lastGpuFrames;
-    uint64_t _flips, _flipTimeouts, _flipNs, _copyNs;     // since the last report
-    // Copy engine path (all on _q once started).
+    uint64_t _copyNs;               // since the last report
+    // Copy engine path (on _q once started).
     BOOL _gpu;
-    uint32_t _ctx, _seqSync, _fbMem[2], _pushMem;
-    uint64_t _fbVa[2], _pushVa, _surfVaBase;
-    BOOL _double;                   // two buffers, flipped (else copies go to the scanned-out one)
-    uint32_t _front;                // the buffer scanned out
-    int _fullFrames;                // copy whole frames until both buffers hold one
+    uint32_t _ctx, _seqSync, _fbMem[kMaxBuf], _pushMem;
+    uint64_t _fbVa[kMaxBuf], _pushVa, _surfVaBase;
+    // The display's buffers (1: no flips, copies go to the scanned-out one; 2 or 3: flipped). Each holds some
+    // frame (_bufSeq, 0: not a captured one); bringing it up to date copies the damage of every frame since,
+    // from the history of the last kHist frames.
+    int _nbuf;
+    uint64_t _seq, _bufSeq[kMaxBuf];
+    struct { CGRect r[512]; size_t n; BOOL all; } _hist[kHist];
+    // Flips run on _fq so copies go on while one waits for its vblank. Under _fm: the buffer shown, the one
+    // being flipped to, the one copied and waiting for a flip (a newer frame takes it over); -1: none.
+    dispatch_queue_t _fq;
+    pthread_mutex_t _fm;
+    pthread_cond_t _fc;
+    BOOL _fmInit;
+    int _shown, _inflight, _ready;
+    BOOL _flipping, _flipsBroken;
     int _flipStuck;                 // flips in a row that timed out
-    BOOL _single;                   // gave up on flips: the next single-buffer frame is copied whole
-    CGRect _prev[512];              // the previous frame's dirty rectangles (the back buffer lacks them)
-    size_t _nPrev;
-    BOOL _prevAll;
+    uint64_t _flips, _flipTimeouts, _flipNs;   // since the last report
     uint32_t *_push;
     struct { IOSurfaceRef surf; uint32_t mem; uint64_t va, size, lastUse; } _cache[kSurfCache];
     uint64_t _useClock;
@@ -278,7 +298,7 @@ static uint32_t *ceMthd(uint32_t *p, uint32_t method, uint32_t count, const uint
 }
 
 // ScreenCaptureKit: the virtual display as an SCDisplay (it shows up shortly after it's made), streamed at
-// its own size and rate. Frames arrive on _q (stream:didOutputSampleBuffer:ofType:).
+// its own size and rate. Frames arrive on _cq (stream:didOutputSampleBuffer:ofType:) and are copied on _q.
 - (BOOL)startScreenCaptureKit:(CGDirectDisplayID)did hz:(double)hz
 {
     SCDisplay *display = nil;
@@ -323,7 +343,9 @@ static uint32_t *ceMthd(uint32_t *p, uint32_t method, uint32_t count, const uint
     cfg.captureResolution = SCCaptureResolutionNominal;
     _scStream = [[SCStream alloc] initWithFilter:filter configuration:cfg delegate:self];
     NSError *error = nil;
-    if (![_scStream addStreamOutput:self type:SCStreamOutputTypeScreen sampleHandlerQueue:_q error:&error]) {
+    _cq = dispatch_queue_create("nvvdisplay.capture", DISPATCH_QUEUE_SERIAL);
+    _pendLock = OS_UNFAIR_LOCK_INIT;
+    if (![_scStream addStreamOutput:self type:SCStreamOutputTypeScreen sampleHandlerQueue:_cq error:&error]) {
         fprintf(stderr, "nvvdisplay: ScreenCaptureKit: %s\n", error.localizedDescription.UTF8String);
         _scStream = nil;
         return NO;
@@ -372,9 +394,50 @@ static uint32_t *ceMthd(uint32_t *p, uint32_t method, uint32_t count, const uint
         if (!CGRectIsNull(r))
             rects[n++] = r;
     }
-    if (all)
-        n = 0;                              // the whole frame
-    [self frame:surf rects:rects count:n];
+    if (!n)
+        all = YES;                          // the whole frame
+    os_unfair_lock_lock(&_pendLock);
+    if (_pendSb) {                          // not copied yet: this one replaces it, damage and all
+        CFRelease(_pendSb);
+        _skipped++;
+    }
+    _pendSb = (CMSampleBufferRef)CFRetain(sb);
+    if (all || _nPend + n > kMaxRects)
+        _pendAll = YES;
+    else {
+        memcpy(_pend + _nPend, rects, n * sizeof(CGRect));
+        _nPend += n;
+    }
+    const BOOL kick = !_draining;
+    _draining = YES;
+    os_unfair_lock_unlock(&_pendLock);
+    if (kick)
+        dispatch_async(_q, ^{ [self drain]; });
+}
+
+// On _q: copies the waiting frame until none is left.
+- (void)drain
+{
+    CGRect rects[kMaxRects];
+    for (;;) {
+        os_unfair_lock_lock(&_pendLock);
+        CMSampleBufferRef sb = _pendSb;
+        const size_t n = _pendAll ? 0 : _nPend;
+        memcpy(rects, _pend, n * sizeof(CGRect));
+        _pendSb = NULL;
+        _nPend = 0;
+        _pendAll = NO;
+        if (!sb)
+            _draining = NO;
+        os_unfair_lock_unlock(&_pendLock);
+        if (!sb)
+            return;
+        CVImageBufferRef img = CMSampleBufferGetImageBuffer(sb);
+        IOSurfaceRef surf = img ? CVPixelBufferGetIOSurface(img) : NULL;
+        if (surf && _active)
+            [self frame:surf rects:rects count:n];
+        CFRelease(sb);
+    }
 }
 
 - (void)stream:(SCStream *)stream didStopWithError:(NSError *)error
@@ -463,8 +526,15 @@ static uint32_t *ceMthd(uint32_t *p, uint32_t method, uint32_t count, const uint
         dispatch_sync(_q, ^{ self->_active = NO; });     // no copy into the surface from here on
     }
     [self stopScreenCaptureKit];
+    if (_cq)
+        dispatch_sync(_cq, ^{});        // no capture handler running, so no more drains get queued
     if (_q)
         dispatch_sync(_q, ^{});         // no frame handler running
+    if (_pendSb) {
+        CFRelease(_pendSb);
+        _pendSb = NULL;
+    }
+    _cq = nil;
     if (_stream) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -473,6 +543,14 @@ static uint32_t *ceMthd(uint32_t *p, uint32_t method, uint32_t count, const uint
         dispatch_sync(_q, ^{});
         CFRelease(_stream);
         _stream = NULL;
+    }
+    if (_fq)
+        dispatch_sync(_fq, ^{});        // no flip running
+    _fq = nil;
+    if (_fmInit) {
+        pthread_cond_destroy(&_fc);
+        pthread_mutex_destroy(&_fm);
+        _fmInit = NO;
     }
     _vd = nil;                      // the virtual display goes away with its last reference
     for (int i = 0; i < kSurfCache; i++)
@@ -497,8 +575,8 @@ static uint32_t *ceMthd(uint32_t *p, uint32_t method, uint32_t count, const uint
     uint32_t w = 0, h = 0, pitch = 0;
     int r;
     const uint64_t base = (info->va_start + 0x1fffff) & ~0x1fffffull;
-    _fbVa[0] = base;
-    _fbVa[1] = base + 0x10000000ull;            // 256 MiB apart: a buffer is far smaller
+    for (int b = 0; b < kMaxBuf; b++)
+        _fbVa[b] = base + (uint64_t)b * 0x10000000ull;      // 256 MiB apart: a buffer is far smaller
     _pushVa = base + 0x40000000ull;
     _surfVaBase = base + 0x80000000ull;
     void *push = NULL;
@@ -516,24 +594,114 @@ static uint32_t *ceMthd(uint32_t *p, uint32_t method, uint32_t count, const uint
         return NO;
     }
     _push = push;
-    // The second buffer (NVBringup with NVMAC_DISPLAY_FLIP): tear-free flips.
-    uint64_t sizeB = 0;
-    uint32_t wB = 0, hB = 0, pitchB = 0;
-    _double = !nvmac_display_mem(_dev, 1, &_fbMem[1], &sizeB, &wB, &hB, &pitchB) && wB == w && hB == h &&
-              pitchB == pitch && !nvmac_bind(_dev, _fbVa[1], _fbMem[1], 0, sizeB);
+    // More buffers: 1 with NVMAC_DISPLAY_FLIP, 2 since the third buffer (older kernels reject the index).
+    _nbuf = 1;
+    for (int b = 1; b < kMaxBuf; b++) {
+        uint64_t sz = 0;
+        uint32_t wb = 0, hb = 0, pb = 0;
+        if (nvmac_display_mem(_dev, (uint32_t)b, &_fbMem[b], &sz, &wb, &hb, &pb) || wb != w || hb != h ||
+            pb != pitch || nvmac_bind(_dev, _fbVa[b], _fbMem[b], 0, sz))
+            break;
+        _nbuf = b + 1;
+    }
     // A kernel without flips ignores the buffer index above (and hands out buffer 0 again): a flip to the buffer
     // already shown tells, and changes nothing on screen.
-    if (_double) {
+    if (_nbuf > 1) {
         const int fr = nvmac_display_flip(_dev, 0);
-        _double = !fr || fr == kIOReturnTimeout;
+        if (fr && fr != kIOReturnTimeout)
+            _nbuf = 1;
     }
-    _front = 0;
-    _fullFrames = 2;
-    _nPrev = 0;
-    _prevAll = YES;
-    if (!_double)
+    _shown = 0;
+    _inflight = _ready = -1;
+    _seq = 0;
+    memset(_bufSeq, 0, sizeof(_bufSeq));
+    if (_nbuf > 1) {
+        _fq = dispatch_queue_create("nvvdisplay.flip", DISPATCH_QUEUE_SERIAL);
+        pthread_mutex_init(&_fm, NULL);
+        pthread_cond_init(&_fc, NULL);
+        _fmInit = YES;
+    }
+    if (_nbuf == 1)
         fprintf(stderr, "nvvdisplay: one display buffer only: frames may tear\n");
+    else
+        printf("nvvdisplay: %d display buffers, flipped at vblank\n", _nbuf);
     return YES;
+}
+
+// On _fq: flips to the waiting buffer until none waits. Each flip returns once the display shows it.
+- (void)flipLoop
+{
+    for (;;) {
+        pthread_mutex_lock(&_fm);
+        if (_ready < 0 || _flipsBroken) {
+            _flipping = NO;
+            pthread_cond_broadcast(&_fc);
+            pthread_mutex_unlock(&_fm);
+            return;
+        }
+        const int b = _ready;
+        _ready = -1;
+        _inflight = b;
+        pthread_mutex_unlock(&_fm);
+        const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        const int fr = nvmac_display_flip(_dev, (uint32_t)b);
+        const uint64_t ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+        pthread_mutex_lock(&_fm);
+        _flips++;
+        _flipNs += ns;
+        _flipTimeouts += fr == kIOReturnTimeout;
+        _flipStuck = fr == kIOReturnTimeout ? _flipStuck + 1 : 0;
+        if (!fr || fr == kIOReturnTimeout)
+            _shown = b;
+        _inflight = -1;
+        if ((fr && fr != kIOReturnTimeout) || _flipStuck >= 3) {
+            fprintf(stderr, "nvvdisplay: %s: one display buffer from now on (frames may tear)\n",
+                    fr == kIOReturnTimeout ? "flips never report completion" : "a flip failed");
+            _flipsBroken = YES;
+        }
+        pthread_cond_broadcast(&_fc);
+        pthread_mutex_unlock(&_fm);
+    }
+}
+
+// Back to one buffer, buffer 0 (the one NVMAC_DISPLAY_MAP maps), shown: after flips broke, and before CPU copies.
+- (void)singleBuffer
+{
+    if (_nbuf == 1)
+        return;
+    pthread_mutex_lock(&_fm);
+    _flipsBroken = YES;
+    while (_flipping)
+        pthread_cond_wait(&_fc, &_fm);
+    pthread_mutex_unlock(&_fm);
+    if (_shown != 0)
+        nvmac_display_flip(_dev, 0);
+    _shown = 0;
+    _ready = -1;
+    _nbuf = 1;
+}
+
+// Which buffer the next frame goes into: one neither shown nor being flipped to, or the one waiting for a flip
+// (its frame is replaced before anyone saw it). With two buffers, that may mean waiting for a flip to finish.
+- (int)acquireBuffer
+{
+    if (_nbuf == 1)
+        return 0;
+    pthread_mutex_lock(&_fm);
+    int b = -1;
+    while (b < 0 && !_flipsBroken) {
+        for (int i = 0; i < _nbuf && b < 0; i++)
+            if (i != _shown && i != _inflight && i != _ready)
+                b = i;
+        if (b < 0 && _ready >= 0) {
+            b = _ready;
+            _ready = -1;
+        }
+        if (b < 0 && pthread_cond_timedwait_relative_np(&_fc, &_fm, &(struct timespec){ 0, 300000000 }) == ETIMEDOUT)
+            _flipsBroken = YES;
+    }
+    pthread_mutex_unlock(&_fm);
+    return b;
 }
 
 // The cache slot holding surf, imported on first sight (the stream reuses a small pool of surfaces).
@@ -584,47 +752,53 @@ static uint32_t *ceMthd(uint32_t *p, uint32_t method, uint32_t count, const uint
     if (slot < 0)
         return NO;
     const uint64_t src = _cache[slot].va, srcPitch = IOSurfaceGetBytesPerRow(surf);
-    const CGRect all = bounds;
-    // What to copy: this frame's damage, and with two buffers the previous frame's too (the back buffer
-    // last got the frame before that). Whole frames while the buffers fill, or when there are too many.
-    CGRect list[2 * kMaxRects];
-    const CGRect *cur = rects;
-    const size_t nCur = n;
-    if (_double && (_fullFrames > 0 || _prevAll || n + _nPrev > kMaxRects)) {
-        rects = &all;
-        n = 1;
-    } else if (_double) {
-        memcpy(list, cur, nCur * sizeof(CGRect));
-        memcpy(list + nCur, _prev, _nPrev * sizeof(CGRect));
-        rects = list;
-        n = nCur + _nPrev;
-    } else if (n > kMaxRects || _single) {
-        _single = NO;
-        rects = &all;
-        n = 1;
+    // This frame's damage, kept for the buffers that don't have it yet.
+    const uint64_t seq = ++_seq;
+    typeof(_hist[0]) *h = &_hist[seq % kHist];
+    h->all = n > kMaxRects;
+    h->n = h->all ? 0 : n;
+    memcpy(h->r, rects, h->n * sizeof(CGRect));
+    int target = [self acquireBuffer];
+    if (target < 0) {
+        [self singleBuffer];
+        target = 0;
     }
-    const uint32_t target = _double ? 1 - _front : 0;
+    // What the target lacks: the damage of every frame after the one it holds, or all of it.
+    static CGRect list[kHist * kMaxRects];
+    size_t nl = 0;
+    BOOL whole = !_bufSeq[target] || seq - _bufSeq[target] > kHist;
+    for (uint64_t k = _bufSeq[target] + 1; !whole && k <= seq; k++) {
+        const typeof(_hist[0]) *hk = &_hist[k % kHist];
+        if (hk->all || nl + hk->n > kMaxRects)
+            whole = YES;
+        else {
+            memcpy(list + nl, hk->r, hk->n * sizeof(CGRect));
+            nl += hk->n;
+        }
+    }
+    if (whole) {
+        list[0] = bounds;
+        nl = 1;
+    }
     const uint64_t dstVa = _fbVa[target];
     uint32_t *p = _push;
     p = ceMthd(p, 0x000, 1, (uint32_t[]){ CLS_COPY });                        // SET_OBJECT
     uint64_t bytes = 0;
     size_t done = 0;
-    for (size_t i = 0; i < n; i++) {
-        CGRect c = CGRectIntegral(CGRectIntersection(rects[i], bounds));
+    for (size_t i = 0; i < nl; i++) {
+        CGRect c = CGRectIntegral(CGRectIntersection(list[i], bounds));
         if (CGRectIsEmpty(c))
             continue;
         const uint64_t x = (uint64_t)c.origin.x, y = (uint64_t)c.origin.y;
-        const uint32_t w = (uint32_t)c.size.width, h = (uint32_t)c.size.height;
+        const uint32_t w = (uint32_t)c.size.width, hh = (uint32_t)c.size.height;
         const uint64_t in = src + y * srcPitch + x * 4, out = dstVa + y * _pitch + x * 4;
         p = ceMthd(p, 0x400, 4, (uint32_t[]){ (uint32_t)(in >> 32), (uint32_t)in, (uint32_t)(out >> 32), (uint32_t)out });
-        p = ceMthd(p, 0x410, 4, (uint32_t[]){ (uint32_t)srcPitch, _pitch, w * 4, h });   // PITCH_IN/OUT, LINE_LENGTH, COUNT
+        p = ceMthd(p, 0x410, 4, (uint32_t[]){ (uint32_t)srcPitch, _pitch, w * 4, hh });  // PITCH_IN/OUT, LINE_LENGTH, COUNT
         // LAUNCH_DMA: non-pipelined, flush, pitch -> pitch, multi-line, virtual addresses
         p = ceMthd(p, 0x300, 1, (uint32_t[]){ 2u | 1u << 2 | 1u << 7 | 1u << 8 | 1u << 9 });
-        bytes += (uint64_t)w * h * 4;
+        bytes += (uint64_t)w * hh * 4;
         done++;
     }
-    if (!done && !_double)
-        return YES;
     int r = 0;
     if (done) {
         const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
@@ -637,36 +811,22 @@ static uint32_t *ceMthd(uint32_t *p, uint32_t method, uint32_t count, const uint
         }
         _copyNs += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
     }
-    if (!r && _double) {
-        // Show it from the next vblank; returns once the old front is free.
-        const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-        int fr = nvmac_display_flip(_dev, target);
-        _flipNs += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
-        _flips++;
-        _flipTimeouts += fr == kIOReturnTimeout;
-        _flipStuck = fr == kIOReturnTimeout ? _flipStuck + 1 : 0;
-        if (fr && fr != kIOReturnTimeout)
-            r = fr;
-        _front = target;
-        if (_fullFrames > 0)
-            _fullFrames--;
-        _prevAll = nCur > kMaxRects;
-        _nPrev = _prevAll ? 0 : nCur;
-        memcpy(_prev, cur, _nPrev * sizeof(CGRect));
-        // The flip's completion never shows (each waits the kernel's 100 ms out): one buffer, as without flips.
-        if (_flipStuck >= 3) {
-            fprintf(stderr, "nvvdisplay: flips never report completion: one display buffer from now on (frames may "
-                            "tear)\n");
-            nvmac_display_flip(_dev, 0);
-            _front = 0;
-            _double = NO;
-            _single = YES;
-        }
-    }
     if (r) {
+        _bufSeq[target] = 0;            // partly written
         fprintf(stderr, "nvvdisplay: copy engine failed (%s, 0x%x): the CPU copies from now on\n", nvmac_strerror(r), r);
         _gpu = NO;
         return NO;
+    }
+    _bufSeq[target] = seq;
+    if (_nbuf > 1) {                    // flip to it, on _fq
+        pthread_mutex_lock(&_fm);
+        _ready = target;
+        const BOOL kick = !_flipping && !_flipsBroken;
+        if (kick)
+            _flipping = YES;
+        pthread_mutex_unlock(&_fm);
+        if (kick)
+            dispatch_async(_fq, ^{ [self flipLoop]; });
     }
     _gpuFrames++;
     _rects += done;
@@ -674,26 +834,22 @@ static uint32_t *ceMthd(uint32_t *p, uint32_t method, uint32_t count, const uint
     return YES;
 }
 
-// Before a CPU copy, which goes to buffer 0 (the one NVMAC_DISPLAY_MAP maps): show buffer 0 again if buffer 1 is
-// up, and copy it a whole frame then, as it missed the frames buffer 1 got. The GPU path refills both after.
+// Before a CPU copy, which goes to buffer 0 (the one NVMAC_DISPLAY_MAP maps) on screen: one buffer from now on,
+// and a whole frame if buffer 0 doesn't hold the previous one.
 - (BOOL)cpuCopyNeedsFullFrame
 {
-    if (!_double)
-        return NO;
-    _fullFrames = 2;
-    _prevAll = YES;
-    if (_front == 0)
-        return NO;
-    nvmac_display_flip(_dev, 0);
-    _front = 0;
-    return YES;
+    [self singleBuffer];
+    const BOOL full = _bufSeq[0] != _seq;
+    _bufSeq[0] = ++_seq;
+    return full;
 }
 
 - (void)report
 {
     if (!_q)
         return;
-    __block uint64_t f = 0, rc = 0, b = 0, gf = 0, fl = 0, fto = 0, fns = 0, cns = 0;
+    __block uint64_t f = 0, rc = 0, b = 0, gf = 0, fl = 0, fto = 0, fns = 0, cns = 0, sk = 0;
+    __block int nbuf = 1;
     __block BOOL gpu = NO;
     dispatch_sync(_q, ^{
         f = self->_frames;
@@ -701,18 +857,29 @@ static uint32_t *ceMthd(uint32_t *p, uint32_t method, uint32_t count, const uint
         b = self->_bytes;
         gf = self->_gpuFrames;
         gpu = self->_gpu;
-        fl = self->_flips;
-        fto = self->_flipTimeouts;
-        fns = self->_flipNs;
+        nbuf = self->_nbuf;
         cns = self->_copyNs;
-        self->_flips = self->_flipTimeouts = self->_flipNs = self->_copyNs = 0;
+        self->_copyNs = 0;
+        if (self->_fmInit) {
+            pthread_mutex_lock(&self->_fm);
+            fl = self->_flips;
+            fto = self->_flipTimeouts;
+            fns = self->_flipNs;
+            self->_flips = self->_flipTimeouts = self->_flipNs = 0;
+            pthread_mutex_unlock(&self->_fm);
+        }
+        os_unfair_lock_lock(&self->_pendLock);
+        sk = self->_skipped;
+        self->_skipped = 0;
+        os_unfair_lock_unlock(&self->_pendLock);
     });
     printf("nvvdisplay: %llu frames (%.1f/s), %llu rects, %.1f MB copied; %llu by the copy engine%s\n", f,
            (f - _lastFrames) / 10.0, rc, b / 1e6, gf, gpu ? "" : " (CPU copies now)");
     const uint64_t gpuNow = gf - _lastGpuFrames;
     if (fl || gpuNow)
-        printf("nvvdisplay:   copies %.2f ms each; %llu flips, %.2f ms each, %llu timed out\n",
-               gpuNow ? cns / 1e6 / gpuNow : 0.0, fl, fl ? fns / 1e6 / fl : 0.0, fto);
+        printf("nvvdisplay:   copies %.2f ms each; %d buffers, %llu flips, %.2f ms each, %llu timed out; %llu "
+               "frames replaced by newer ones\n", gpuNow ? cns / 1e6 / gpuNow : 0.0, nbuf, fl, fl ? fns / 1e6 / fl : 0.0,
+               fto, sk);
     fflush(stdout);
     _lastFrames = f;
     _lastGpuFrames = gf;
