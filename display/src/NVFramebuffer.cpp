@@ -14,6 +14,7 @@
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSDictionary.h>
+#include <pexpert/pexpert.h>
 
 #define LOG(fmt, ...) IOLog("NVFramebuffer: " fmt "\n", ##__VA_ARGS__)
 
@@ -30,7 +31,7 @@ class NVFramebuffer : public IOFramebuffer {
     uint8_t edid_[128] = {};
     bool haveEdid_ = false;
 
-    bool readDisplay();
+    bool readDisplay(IOService *provider);
     IOFixed1616 refresh() const;
 
 public:
@@ -66,7 +67,8 @@ public:
 OSDefineMetaClassAndStructors(NVFramebuffer, IOFramebuffer)
 
 // NVBringup's NVDisplayFB property: the scanout surface and the mode it was lit at.
-bool NVFramebuffer::readDisplay()
+// provider: IOResources (default), or with boot-arg nvfb=1 the NVIDIA PCI device NVBringup drives.
+bool NVFramebuffer::readDisplay(IOService *provider)
 {
     OSDictionary *m = IOService::serviceMatching("NVBringup");
     IOService *gpu = m ? IOService::copyMatchingService(m) : nullptr;
@@ -74,6 +76,14 @@ bool NVFramebuffer::readDisplay()
         m->release();
     if (!gpu)
         return false;
+    uint32_t onPci = 0;
+    PE_parse_boot_argn("nvfb", &onPci, sizeof(onPci));
+    const bool wantPci = onPci != 0;
+    const bool isPci = provider != getResourceService();
+    if (wantPci != isPci || (isPci && gpu->getProvider() != provider)) {
+        gpu->release();
+        return false;
+    }
     bool ok = false;
     if (OSDictionary *d = OSDynamicCast(OSDictionary, gpu->getProperty("NVDisplayFB"))) {
         auto num = [&](const char *k) -> uint64_t {
@@ -111,8 +121,7 @@ IOFixed1616 NVFramebuffer::refresh() const
 
 IOService *NVFramebuffer::probe(IOService *provider, SInt32 *score)
 {
-    if (!readDisplay()) {
-        LOG("no lit display from NVBringup");
+    if (!readDisplay(provider)) {
         return nullptr;
     }
     return IOFramebuffer::probe(provider, score);
@@ -126,7 +135,8 @@ bool NVFramebuffer::start(IOService *provider)
         LOG("IOFramebuffer::start failed");
         return false;
     }
-    LOG("started: %ux%u @ %u.%02u Hz, pitch %u, surface 0x%llx (%llu bytes), EDID %s", width_, height_,
+    LOG("started on %s: %ux%u @ %u.%02u Hz, pitch %u, surface 0x%llx (%llu bytes), EDID %s", provider->getName(),
+        width_, height_,
         refresh() >> 16, ((refresh() & 0xffff) * 100) >> 16, pitch_, phys_, size_, haveEdid_ ? "yes" : "no");
     return true;
 }

@@ -38,6 +38,25 @@
 			<key>IOProbeScore</key>
 			<integer>1000</integer>
 		</dict>
+		<!-- Under the GPU's PCI device instead (boot-arg nvfb=1): where WindowServer's GPUWrangler looks for a
+		     GPU's framebuffers. probe() takes exactly one of the two personalities. -->
+		<key>NVFramebufferPCI</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>io.github.kvarun-p.nvframebuffer</string>
+			<key>IOClass</key>
+			<string>NVFramebuffer</string>
+			<key>IOProviderClass</key>
+			<string>IOPCIDevice</string>
+			<key>IOPCIMatch</key>
+			<string>0x000010de&amp;0x0000ffff</string>
+			<key>IOResourceMatch</key>
+			<string>NVDisplayLit</string>
+			<key>IOMatchCategory</key>
+			<string>NVFramebuffer</string>
+			<key>IOProbeScore</key>
+			<integer>1000</integer>
+		</dict>
 	</dict>
 	<key>OSBundleLibraries</key>
 	<dict>
