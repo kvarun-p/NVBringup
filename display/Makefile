@@ -1,6 +1,7 @@
 # Builds NVFramebuffer.kext (the IOFramebuffer for the display NVBringup lights), Command Line Tools only.
 #   make           the kext
 #   make verify    checks every vtable slot of NVFramebuffer against the kernel's IOFramebuffer
+#   make vdisplay  build/nvvdisplay, the virtual display that feeds the HDMI monitor (vdisplay/)
 #   make check     resolves the kext's symbols against the running kernel (no load)
 
 NAME     := NVFramebuffer
@@ -21,8 +22,16 @@ LDFLAGS   := $(ARCHFLAGS) -nostdlib -Xlinker -kext -Xlinker -export_dynamic \
 
 OBJS := $(BUILD)/NVFramebuffer.o $(BUILD)/kmod_info.o
 
-.PHONY: all verify check clean
-all: $(KEXT)
+.PHONY: all verify check vdisplay clean
+VDISPLAY := $(BUILD)/nvvdisplay
+all: $(KEXT) $(VDISPLAY)
+
+vdisplay: $(VDISPLAY)
+
+$(VDISPLAY): vdisplay/nvvdisplay.m ../tools/libnvmac.c ../tools/libnvmac.h ../src/nv_uapi.h | $(BUILD)
+	clang -fobjc-arc -O2 -Wall -Wextra -Wno-unused-parameter -I../tools -I../src vdisplay/nvvdisplay.m ../tools/libnvmac.c \
+		-framework Foundation -framework CoreGraphics -framework IOSurface -framework IOKit -o $@
+	codesign --force --sign - --identifier io.github.kvarun-p.nvvdisplay $@
 
 $(BUILD)/%.o: src/%.cpp | $(BUILD)
 	clang++ $(CXXFLAGS) -c $< -o $@

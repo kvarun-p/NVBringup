@@ -115,6 +115,7 @@ struct NVBringup::GpuConn {
     DmaBuf   syncs;
     uint8_t  syncUsed[NVMAC_SYNC_COUNT] = {};   // 1 = user sync, 2 = context seqno
     IOMemoryMap *syncMap = nullptr;
+    IOMemoryMap *dispMap = nullptr;     // NVMAC_DISPLAY_MAP
     volatile bool dead = false;         // no GPU state: closed, failed, or GSP-RM gone
     volatile bool anyLost = false;      // a context of this connection was lost (device lost)
 };
@@ -1048,6 +1049,11 @@ bool NVBringup::modesetDisplay(uint32_t displayId, uint32_t rmProto, const uint8
     }
     dump();
     g->dispLit = true;              // keeps the idle power-off away while the display scans out
+    g->dispFbBar1 = fb.bar1;
+    g->dispFbSize = fb.size;
+    g->dispW = hact;
+    g->dispH = vact;
+    g->dispPitch = pitch;
     setProperty("NVDisplayModeset", "ok");
     // For NVFramebuffer.kext (display/): the scanout surface as a physical BAR1 range, its mode and
     // the sink's EDID, then the NVDisplayLit resource its personality matches.
@@ -2009,6 +2015,7 @@ void NVBringup::gpuTeardown(GpuConn *c, const char *why)
             nMem++;
         }
     OSSafeReleaseNULL(c->syncMap);
+    OSSafeReleaseNULL(c->dispMap);
     uint32_t st = 0;
     if (g && g->hClient && c->pd3)
         gspRmFree(g->hClient, g->hDevice, c->hVas, &st);
@@ -3290,6 +3297,32 @@ IOReturn NVBringup::gpuCall(GpuConn *c, uint32_t selector, IOExternalMethodArgum
                 break;
         }
         wakeWaiters();
+        break;
+    }
+    case NVMAC_DISPLAY_MAP: {
+        if (a->scalarOutputCount != 5) {
+            r = kIOReturnBadArgument;
+            break;
+        }
+        if (!g->dispLit) {
+            r = kIOReturnNotReady;
+            break;
+        }
+        if (!c->dispMap) {
+            IODeviceMemory *bar1 = pci_->getDeviceMemoryWithIndex(1);
+            c->dispMap = bar1 ? bar1->createMappingInTask(c->task, 0, kIOMapAnywhere | kIOMapWriteCombineCache,
+                                                          g->dispFbBar1, g->dispFbSize)
+                              : nullptr;
+        }
+        if (!c->dispMap) {
+            r = kIOReturnVMError;
+            break;
+        }
+        a->scalarOutput[0] = c->dispMap->getAddress();
+        a->scalarOutput[1] = g->dispFbSize;
+        a->scalarOutput[2] = g->dispW;
+        a->scalarOutput[3] = g->dispH;
+        a->scalarOutput[4] = g->dispPitch;
         break;
     }
     case NVMAC_MAP_SYNC_PAGE: {

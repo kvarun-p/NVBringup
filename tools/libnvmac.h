@@ -25,6 +25,10 @@ int nvmac_mem_alloc(nvmac_dev *d, uint64_t size, uint64_t align, uint32_t flags,
 int nvmac_mem_free(nvmac_dev *d, uint32_t mem);
 int nvmac_mem_import(nvmac_dev *d, void *ptr, uint64_t size, uint32_t *mem, uint64_t *size_out);
 int nvmac_mem_map(nvmac_dev *d, uint32_t mem, void **ptr, uint64_t *size);
+// The surface the lit HDMI display scans out (boot-arg nvdisp=2): X8R8G8B8, pitch-linear, write-combined.
+// kIOReturnNotReady when no display is lit.
+int nvmac_display_map(nvmac_dev *d, void **ptr, uint64_t *size, uint32_t *width, uint32_t *height,
+                      uint32_t *pitch);
 int nvmac_mem_unmap(nvmac_dev *d, uint32_t mem);
 
 int nvmac_vm_bind(nvmac_dev *d, const struct nvmac_bind_op *ops, uint32_t count);

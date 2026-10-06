@@ -201,6 +201,8 @@ struct NVBringup::GspState {
     uint32_t dispModeId = 0, dispModeProto = 0;   // nvdisp=2: the output and EDID modesetDisplay uses
     uint8_t  dispModeEdid[128] = {};
     bool     dispLit = false;          // a modeset scans out: the GPU stays powered
+    uint64_t dispFbBar1 = 0, dispFbSize = 0;   // the scanout surface: BAR1 offset and size
+    uint32_t dispW = 0, dispH = 0, dispPitch = 0;
     uint16_t tpcCount = 0;
     uint8_t  gpcCount = 0, smPerTpc = 0, maxWarps = 0, sm = 0;
     GpuConn *conns[kMaxConns] = {};

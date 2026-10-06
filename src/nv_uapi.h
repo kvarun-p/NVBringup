@@ -83,6 +83,9 @@ enum nvmac_selector {
                             //   memory); out: handle, size. The pages are wired until MEM_FREE (or the
                             //   connection closes) and bound like GART memory; MEM_MAP is refused (the
                             //   caller has it mapped). Only if nvmac_info.features has NVMAC_FEATURE_IMPORT.
+    NVMAC_DISPLAY_MAP,      // scalar out: address, size, width, height, pitch of the surface the lit display
+                            //   (boot-arg nvdisp=2) scans out, X8R8G8B8 pitch-linear, mapped write-combined
+                            //   (one mapping per connection). kIOReturnNotReady if no display is lit.
     NVMAC_SELECTOR_COUNT
 };
 
