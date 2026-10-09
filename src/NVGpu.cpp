@@ -517,7 +517,11 @@ void NVBringup::probeDisplay()
 {
     GspState *g = gsp_;
     uint32_t arm = 0, st = 0;
-    if (!PE_parse_boot_argn("nvdisp", &arm, sizeof(arm)) || (arm != 1 && arm != 2))
+    PE_parse_boot_argn("nvdisp", &arm, sizeof(arm));
+    // The display pipe (dispPipeArmed_) needs the engine up at boot, lit or not: it counts as nvdisp=2.
+    if (dispPipeArmed_)
+        arm = 2;
+    if (arm != 1 && arm != 2)
         return;
     uint32_t modeId = 0, modeProto = 0;     // nvdisp=2: the first connected TMDS output and its EDID
     uint8_t modeEdid[128] = {};
@@ -936,6 +940,32 @@ bool NVBringup::dispInit()
     }
     if (!dispKick(false))
         FAIL("core init not consumed");
+
+    // The mode and the scanout surface while nothing is lit: the last lit mode (it survives dispBlank and a GSP
+    // reload), else CEA-861 1920x1080@60 (VIC 16: 2200x1125 total, 148.5 MHz, positive syncs). dispSetMode
+    // allocates the surface at a modeset; this one exists from here, so the nub has its address and size.
+    // dispLost reset d.fb, so after a reload it is a new allocation.
+    if (!d.htotal) {
+        d.w = 1920;
+        d.h = 1080;
+        d.pitch = (d.w * 4 + 255) & ~255u;
+        d.pclkKhz = 148500;
+        d.htotal = 2200;
+        d.vtotal = 1125;
+        d.hsyncStart = 1920 + 88;
+        d.hsyncWidth = 44;
+        d.vsyncStart = 1080 + 4;
+        d.vsyncWidth = 5;
+        d.syncFlags = 0;
+    }
+    {
+        const uint64_t need = (uint64_t)d.pitch * ((d.h + 15) & ~15u);
+        NVDispMem nf;
+        if (!dispMemAlloc(nf, need, 0))
+            FAIL("no VRAM for the scanout surface");
+        OSSafeReleaseNULL(d.fb.map);
+        d.fb = nf;
+    }
     d.ready = true;
     LOG("GSP: display: engine ready (root, core and window channels); watching %u output(s)", d.nCand);
     for (uint32_t i = 0; i < d.nCand; i++)
@@ -1097,6 +1127,7 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
     d.sorIdx = sorIdx;
     d.proto = rmProto;
     memcpy(d.edid, edid, sizeof(d.edid));
+    d.edidValid = true;
     d.w = hact;
     d.h = vact;
     d.pitch = pitch;
@@ -1239,9 +1270,11 @@ void NVBringup::dispPublish()
     dispGen_++;
     setProperty("NVDisplayGen", dispGen_, 32);
     IODeviceMemory *bar1 = pci_ ? pci_->getDeviceMemoryWithIndex(1) : nullptr;
-    if (!g || !g->disp.litId || !bar1) {
+    // Armed, the nub is up whenever the engine is (lit or not, Online says which); otherwise only while lit.
+    const bool up = g && (g->disp.litId || (dispPipeArmed_ && g->disp.ready));
+    if (!up || !bar1) {
         removeProperty("NVDisplayFB");
-        dispNubWant(nullptr);
+        dispNubWant(nullptr, false);
         return;
     }
     GspState::DispHw &d = g->disp;
@@ -1270,22 +1303,30 @@ void NVBringup::dispPublish()
     num("VSyncWidth", d.vsyncWidth, 32);
     num("Flags", d.syncFlags, 32);
     num("DisplayID", d.litId, 32);
-    if (OSData *e = OSData::withBytes(d.edid, sizeof(d.edid))) {
-        dict->setObject("EDID", e);
-        e->release();
+    if (d.edidValid) {              // the last lit display's: it stays while unlit (Online false)
+        if (OSData *e = OSData::withBytes(d.edid, sizeof(d.edid))) {
+            dict->setObject("EDID", e);
+            e->release();
+        }
     }
     setProperty("NVDisplayFB", dict);
-    dispNubWant(dict);
+    dispNubWant(dict, d.litId != 0);
     dict->release();
 }
 
 // NVFramebuffer's provider: a nub under the GPU's PCI device (NVBringup's provider), so NVFramebuffer is a client
 // at depth 2 of it. Published while a display is lit, carrying NVDisplayFB. NVFramebuffer (display/) matches it
 // as soon as it appears, so nothing waits for the modeset, and a replug or unplug replaces or removes it.
+// Armed (dispPipeArmed_): published once the display engine is up, lit or not, carrying Online too. A change
+// updates its NVDisplayFB and Online and sends kNVDisplayMsgState to its clients, instead of replacing it.
 class NVDisplayNub : public IOService {
     OSDeclareDefaultStructors(NVDisplayNub)
 };
 OSDefineMetaClassAndStructors(NVDisplayNub, IOService)
+
+// The message to NVFramebuffer's message(): the nub's NVDisplayFB or Online changed ('NVDB'; display/src/NVFramebuffer.cpp
+// has the same value).
+static const UInt32 kNVDisplayMsgState = 0x4e564442;
 
 // NVFramebuffer instead of nvvdisplay: boot-arg nvfb=1, or for one boot the NVRAM variable nvfb-once
 // (`sudo nvram nvfb-once=1`), deleted here the first time a display is lit, so a boot that hangs on the
@@ -1335,13 +1376,15 @@ bool NVBringup::nvramOneShot(const char *name)
     return true;
 }
 
-// Records the nub's state for dispNubSync: fb is the lit display's NVDisplayFB, nullptr none. Caller holds gspLock_.
-void NVBringup::dispNubWant(OSDictionary *fb)
+// Records the nub's state for dispNubSync: fb is NVDisplayFB, nullptr none; online says a display is lit. Caller
+// holds gspLock_.
+void NVBringup::dispNubWant(OSDictionary *fb, bool online)
 {
     if (fb)
         fb->retain();
     OSSafeReleaseNULL(dispWant_);
     dispWant_ = fb;
+    dispWantOnline_ = online;
     dispWantGen_++;
 }
 
@@ -1349,7 +1392,8 @@ void NVBringup::dispNubWant(OSDictionary *fb)
 // and terminate() run IORegistry matching and the clients' start() and stop() on this thread, and a client that
 // calls back into NVBringup (through a user client, or the IOAccelerator family's gate) takes gspLock_, which
 // deadlocks if it is held here. dispNubLock_ orders the applies; each one catches up to the newest generation,
-// so a rapid unplug and replug ends on the last state.
+// so a rapid unplug and replug ends on the last state. Armed, a nub that is up is updated in place (properties,
+// then the message to NVFramebuffer), so an unplug or replug never terminates it; messageClients runs here too.
 void NVBringup::dispNubSync()
 {
     if (!dispNubLock_ || !gspLock_)
@@ -1358,6 +1402,7 @@ void NVBringup::dispNubSync()
     for (;;) {
         IOLockLock(gspLock_);
         OSDictionary *want = dispWant_;
+        const bool online = dispWantOnline_;
         const uint32_t gen = dispWantGen_;
         if (want)
             want->retain();
@@ -1366,24 +1411,34 @@ void NVBringup::dispNubSync()
             OSSafeReleaseNULL(want);
             break;
         }
-        if (dispNub_) {
-            dispNub_->terminate();
-            OSSafeReleaseNULL(dispNub_);
-        }
-        if (want && pci_ && fbWanted()) {
-            NVDisplayNub *n = OSTypeAlloc(NVDisplayNub);
-            if (n && !n->init())
-                OSSafeReleaseNULL(n);
-            if (n) {
-                n->setProperty("NVDisplayFB", want);
-                if (dispPipeArmed_)
-                    n->setProperty("NVDisplayPipeArmed", kOSBooleanTrue);
-                if (n->attach(pci_)) {
-                    n->registerService();
-                    dispNub_ = n;
-                    LOG("display: published NVDisplayNub for NVFramebuffer");
-                } else {
-                    n->release();
+        if (dispPipeArmed_ && dispNub_ && want) {
+            // Armed: the nub stays. A change of display or mode is its properties, and NVFramebuffer is told.
+            dispNub_->setProperty("NVDisplayFB", want);
+            dispNub_->setProperty("Online", online ? kOSBooleanTrue : kOSBooleanFalse);
+            dispNub_->messageClients(kNVDisplayMsgState);
+            LOG("display: NVDisplayNub updated (online %s)", online ? "yes" : "no");
+        } else {
+            if (dispNub_) {
+                dispNub_->terminate();
+                OSSafeReleaseNULL(dispNub_);
+            }
+            if (want && pci_ && fbWanted()) {
+                NVDisplayNub *n = OSTypeAlloc(NVDisplayNub);
+                if (n && !n->init())
+                    OSSafeReleaseNULL(n);
+                if (n) {
+                    n->setProperty("NVDisplayFB", want);
+                    if (dispPipeArmed_) {
+                        n->setProperty("NVDisplayPipeArmed", kOSBooleanTrue);
+                        n->setProperty("Online", online ? kOSBooleanTrue : kOSBooleanFalse);
+                    }
+                    if (n->attach(pci_)) {
+                        n->registerService();
+                        dispNub_ = n;
+                        LOG("display: published NVDisplayNub for NVFramebuffer");
+                    } else {
+                        n->release();
+                    }
                 }
             }
         }
@@ -1399,7 +1454,7 @@ void NVBringup::dispNubStop()
 {
     if (gspLock_) {
         IOLockLock(gspLock_);
-        dispNubWant(nullptr);
+        dispNubWant(nullptr, false);
         IOLockUnlock(gspLock_);
     }
     dispNubSync();
@@ -1526,6 +1581,11 @@ void NVBringup::dispLost()
     NVDispMem *mems[] = { &d.inst, &d.pbCore, &d.pbWndw, &d.sync, &d.ilut, &d.olut, &d.fb, &d.fbB, &d.fbC };
     for (NVDispMem *m : mems)
         OSSafeReleaseNULL(m->map);
+    // The scanout surfaces are in the VRAM heap, which is rebuilt at the next boot: forgotten here, so that
+    // dispInit and dispSetMode allocate them again instead of writing through the released mappings.
+    NVDispMem *surfaces[] = { &d.fb, &d.fbB, &d.fbC };
+    for (NVDispMem *m : surfaces)
+        *m = NVDispMem();
     d.ready = false;
     d.litId = 0;
     g->dispLit = false;

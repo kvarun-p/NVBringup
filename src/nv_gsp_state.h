@@ -222,6 +222,7 @@ struct NVBringup::GspState {
         uint32_t nErr = 0;
         // The lit mode (dispSetMode): the EDID's preferred timing and the surface layout.
         uint8_t  edid[128] = {};
+        bool     edidValid = false;     // edid is a lit display's (dispSetMode)
         uint32_t proto = 0, w = 0, h = 0, pitch = 0, pclkKhz = 0, htotal = 0, vtotal = 0;
         uint32_t hsyncStart = 0, hsyncWidth = 0, vsyncStart = 0, vsyncWidth = 0, syncFlags = 0;
     } disp;

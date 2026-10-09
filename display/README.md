@@ -55,6 +55,13 @@ WindowServer draws into the aperture with the CPU. The vertical blank comes from
   lights the display). Uninstall nvvdisplay first. The driver reads nothing from NVBringup itself, only the nub.
 - The nub's `NVDisplayFB` property carries everything it needs: the physical address and size of the surface,
   the mode, and the EDID. The two kexts share no symbols.
+- Armed (`nvdpipe=1` or `nvdpipe-once`): the nub is up from boot, lit or not, with `Online` false until a display
+  lights. Its `NVDisplayFB` is the last lit mode, else 1920x1080@60. A plug or unplug changes `Online` and
+  `NVDisplayFB` on the same nub and sends it `kMsgState` ('NVDB', the value NVBringup's `kNVDisplayMsgState` also
+  uses). `kConnectionEnable` follows `Online`, `kConnectionCheckEnable` stays on, `kConnectionChanged` is raised until
+  IOGraphics acknowledges it, and a change fires the connect interrupt (`kIOFBConnectInterruptType`) so IOGraphics
+  senses the connection again. The aperture stays valid while offline; a new surface gets a new aperture. Not yet
+  tested on hardware.
 - Timing for the display pipe: `IOFBCurrentPixelCount` (htotal x vtotal) and `IOFBCurrentPixelClock` (Hz) are
   published on the framebuffer when the mode is set. The VBL timer delivers `'vbl '` through
   `registerForInterruptType` / `setInterruptState` at absolute deadlines of one frame, and `getVBLTime` returns

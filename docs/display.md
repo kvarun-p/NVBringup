@@ -89,6 +89,18 @@ Turning it on: boot-arg `nvfb=1`, or for one boot `sudo nvram nvfb-once=1`, whic
 display, so a boot that hangs is followed by a normal one. Uninstall `nvvdisplay` first: both would use the scanout
 buffers.
 
+**Framebuffer at boot (display pipe, `nvdpipe=1` or `nvdpipe-once`):** WindowServer maps a GPU's framebuffers only
+when it enumerates the GPU, so a framebuffer that exists only while lit misses a later hot-plug. Armed, NVBringup
+publishes `NVDisplayNub` as soon as the display engine is up (`dispInit`), lit or not. The nub carries `NVDisplayFB`
+(the last lit mode, else CEA-861 1920x1080@60, with the scanout surface allocated at `dispInit` so it has an address
+while unlit) and `Online`. A plug or unplug updates `Online` and `NVDisplayFB` on that nub in place and sends it a
+message (`kNVDisplayMsgState`, 'NVDB'), and it is not terminated or republished. NVFramebuffer answers through the
+IOFramebuffer connection attributes: `kConnectionEnable` is `Online`, `kConnectionCheckEnable` stays on,
+`kConnectionChanged` is raised until IOGraphics acknowledges it, and a change fires the connect interrupt
+(`kIOFBConnectInterruptType`) so IOGraphics senses the connection again. The aperture stays valid while offline. A
+mode that needs a bigger surface gets a new aperture. Sleep still tears the nub down and republishes it at wake. Not
+yet tested on hardware.
+
 ### What works: a virtual display (`nvvdisplay`)
 
 `nvvdisplay` creates a virtual display (CGVirtualDisplay, the private CoreGraphics API DeskPad and BetterDisplay

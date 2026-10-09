@@ -24,7 +24,8 @@
 		     or, for one boot, the NVRAM variable nvfb-once / nvdpipe-once. The nub is a client of the GPU's
 		     IOPCIDevice (NVBringup is another client of the same device, and owns the nub), so it sits one
 		     level below the PCI device, where IOAccelDisplayMachine and GPUWrangler look for framebuffers.
-		     The nub carries NVDisplayFB. -->
+		     The nub carries NVDisplayFB. Armed with nvdpipe, the nub is up from boot (lit or not) and carries
+		     Online too; NVBringup updates it in place on a hot-plug (kNVDisplayMsgState). -->
 
 		<key>NVFramebuffer</key>
 		<dict>

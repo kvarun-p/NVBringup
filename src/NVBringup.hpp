@@ -238,9 +238,11 @@ private:
     IOReturn displayFlip(GpuConn *c, uint32_t buffer);
     bool     dispMemAlloc(NVDispMem &m, uint64_t size, uint64_t pa);
     uint32_t dispGen_ = 0;          // NVDisplayGen: bumped whenever the lit display comes or goes
-    IOService *dispNub_ = nullptr;  // NVDisplayNub, NVFramebuffer's provider, while a display is lit (under pci_)
+    IOService *dispNub_ = nullptr;  // NVDisplayNub, NVFramebuffer's provider (under pci_): while a display is lit,
+                                    // or armed while the engine is up (then it stays and is updated, not replaced)
     // The nub is published outside gspLock_ (dispNubSync): dispPublish records the wanted state under it.
     OSDictionary *dispWant_ = nullptr;          // NVDisplayFB of the lit display, nullptr: none (gspLock_)
+    bool     dispWantOnline_ = false;           // a display is lit: the nub's Online (gspLock_)
     uint32_t dispWantGen_ = 0;                  // bumped by every dispNubWant (gspLock_)
     uint32_t dispNubGen_ = 0;                   // the generation dispNub_ was applied for (dispNubLock_)
     IOLock   *dispNubLock_ = nullptr;           // orders dispNubSync; taken before gspLock_, never under it
@@ -248,7 +250,7 @@ private:
     int      fbWanted_ = -1;        // -1: not decided yet (see fbWanted)
     bool     fbWanted();
     bool     nvramOneShot(const char *name);    // reads and deletes an NVRAM one-shot; true if it was set
-    void     dispNubWant(OSDictionary *fb);     // gspLock_ held
+    void     dispNubWant(OSDictionary *fb, bool online);   // gspLock_ held
     void     dispNubSync();                     // gspLock_ not held
     void     dispNubStop();                     // shutdownHw: the nub goes with the device
     void     queryGrInfo();

@@ -8,6 +8,12 @@
 // OpenCore-injected kext (NVBringup) can't link against. The two share no symbols: NVBringup's
 // NVDisplayFB property carries everything this needs.
 //
+// Hot-plug (boot-arg nvdpipe=1): NVBringup keeps its nub up while the display engine runs, lit or not, and
+// reports the display on it as Online and its mode as NVDisplayFB, changing both in place and sending
+// kMsgState. Online is IOFramebuffer's kConnectionEnable (no display while it's off), and a change raises the
+// connect interrupt (kIOFBConnectInterruptType), which makes IOGraphics sense the connection again. The
+// aperture stays valid while offline.
+//
 // The vertical blanking interrupt WindowServer paces its frames by comes from a timer at the mode's
 // refresh rate, not from the display engine.
 
@@ -44,6 +50,7 @@ class NVFramebuffer : public IOFramebuffer {
     bool haveEdid_ = false;
     Interrupt vbl_, connect_;           // guarded by vblLock_
     thread_call_t vblCall_ = nullptr;   // allocated in start, freed in free; armed while vblActive_
+    IOLock *applyLock_ = nullptr;       // orders applyNub (start, and the nub's messages); never held across IOGraphics
     IOSimpleLock *vblLock_ = nullptr;   // guards vbl_, connect_, vblActive_, vblBusy_, vblNext_, vblLast_
     bool vblActive_ = false;            // the timer rearms only while this is set
     int vblBusy_ = 0;                   // vblFire calls past their entry check (stop waits for them to leave)
@@ -51,8 +58,16 @@ class NVFramebuffer : public IOFramebuffer {
     uint64_t vblLast_ = 0;              // deadline of the last vertical blank fired, for getVBLTime
     uint64_t vblCount_ = 0;             // vertical blanks fired by the timer (published as NVFBVblanks)
     uint64_t vblPublishAt_ = 0;         // absolute time after which NVFBVblanks is published again
+    IOService *nub_ = nullptr;          // NVBringup's NVDisplayNub, the provider: set in start, cleared in stop
+    OSDictionary *seen_ = nullptr;      // the NVDisplayFB applied last (retained): an equal one is no change
+    bool online_ = true;                // NVDisplayNub's Online, true when absent (a nub from before the pipe)
+    bool changed_ = false;              // a change IOGraphics has not acknowledged (kConnectionChanged)
 
-    bool readDisplay(IOService *provider);
+    static constexpr UInt32 kMsgState = 0x4e564442;     // NVBringup's kNVDisplayMsgState ('NVDB'), the nub's change
+
+    bool readDisplay(OSDictionary *d);
+    bool applyNub();
+    void raiseConnect();
     IOFixed1616 refresh() const;
     uint64_t framePeriod() const;
     void publishTiming();
@@ -64,6 +79,7 @@ public:
     bool start(IOService *provider) override;
     void stop(IOService *provider) override;
     void free() override;
+    IOReturn message(UInt32 type, IOService *provider, void *argument = 0) override;
 
     IOReturn enableController() override;
     bool isConsoleDevice() override;
@@ -98,36 +114,121 @@ public:
 
 OSDefineMetaClassAndStructors(NVFramebuffer, IOFramebuffer)
 
-// NVBringup's NVDisplayFB, on the NVDisplayNub it publishes while a display is lit: the scanout surface and
-// the mode it was lit at.
-bool NVFramebuffer::readDisplay(IOService *provider)
+// NVBringup's NVDisplayFB: the scanout surface and the mode it was lit at (or the fallback, while unlit).
+// Nothing is assigned unless the whole dictionary is usable, so a bad update leaves the last mode in place.
+// No locks: a caller that runs with the framebuffer up holds vblLock_ (applyNub).
+bool NVFramebuffer::readDisplay(OSDictionary *d)
 {
-    OSDictionary *d = OSDynamicCast(OSDictionary, provider->getProperty("NVDisplayFB"));
     if (!d)
         return false;
     auto num = [&](const char *k) -> uint64_t {
         OSNumber *n = OSDynamicCast(OSNumber, d->getObject(k));
         return n ? n->unsigned64BitValue() : 0;
     };
-    phys_ = num("PhysAddr");
-    size_ = num("Size");
-    width_ = (uint32_t)num("Width");
-    height_ = (uint32_t)num("Height");
-    pitch_ = (uint32_t)num("Pitch");
+    const uint64_t phys = num("PhysAddr"), size = num("Size");
+    const uint32_t width = (uint32_t)num("Width"), height = (uint32_t)num("Height"), pitch = (uint32_t)num("Pitch");
+    const uint32_t htotal = (uint32_t)num("HTotal"), vtotal = (uint32_t)num("VTotal");
+    if (!phys || !width || !height || pitch < width * 4 || size < (uint64_t)pitch * height || !htotal || !vtotal)
+        return false;
+    phys_ = phys;
+    size_ = size;
+    width_ = width;
+    height_ = height;
+    pitch_ = pitch;
     pclkKhz_ = (uint32_t)num("PixelClockKHz");
-    htotal_ = (uint32_t)num("HTotal");
-    vtotal_ = (uint32_t)num("VTotal");
+    htotal_ = htotal;
+    vtotal_ = vtotal;
     hsyncStart_ = (uint32_t)num("HSyncStart");
     hsyncWidth_ = (uint32_t)num("HSyncWidth");
     vsyncStart_ = (uint32_t)num("VSyncStart");
     vsyncWidth_ = (uint32_t)num("VSyncWidth");
     syncFlags_ = (uint32_t)num("Flags");
+    haveEdid_ = false;
     if (OSData *e = OSDynamicCast(OSData, d->getObject("EDID")); e && e->getLength() >= sizeof(edid_)) {
         memcpy(edid_, e->getBytesNoCopy(), sizeof(edid_));
         haveEdid_ = true;
     }
-    return phys_ && width_ && height_ && pitch_ >= width_ * 4 && size_ >= (uint64_t)pitch_ * height_ &&
-           htotal_ && vtotal_;
+    return true;
+}
+
+// NVBringup's Online. A nub without it is one from before the display pipe, which exists only while lit.
+static bool nubOnline(IOService *nub)
+{
+    OSBoolean *b = OSDynamicCast(OSBoolean, nub->getProperty("Online"));
+    return b ? b->getValue() : true;
+}
+
+// Takes the nub's state (NVDisplayFB and Online) as it is now: at start, and on each message from NVBringup
+// (outside its gspLock_). Returns true when the aperture, the mode or Online changed; the caller raises the connect
+// interrupt then, outside applyLock_ (IOGraphics's handler may call back in, as kConnectionChanged).
+bool NVFramebuffer::applyNub()
+{
+    if (!nub_ || !vblLock_ || !applyLock_)
+        return false;
+    IOLockLock(applyLock_);
+    bool changed = false;
+    OSDictionary *d = OSDynamicCast(OSDictionary, nub_->getProperty("NVDisplayFB"));
+    const bool online = nubOnline(nub_);
+    if (d && !(seen_ && online == online_ && d->isEqualTo(seen_))) {
+        const uint64_t oldPhys = phys_, oldSize = size_;
+        IOSimpleLockLock(vblLock_);
+        const bool ok = readDisplay(d);
+        if (ok)
+            online_ = online;
+        IOSimpleLockUnlock(vblLock_);
+        if (!ok) {
+            LOG("NVDisplayFB unusable: keeping the last mode");
+        } else {
+            changed = true;
+            if (phys_ != oldPhys || size_ != oldSize) {  // a new surface: IOGraphics gets a new aperture
+                IODeviceMemory *fresh = IODeviceMemory::withRange(phys_, size_), *old = nullptr;
+                if (fresh) {
+                    IOSimpleLockLock(vblLock_);
+                    old = aperture_;
+                    aperture_ = fresh;
+                    IOSimpleLockUnlock(vblLock_);
+                    OSSafeReleaseNULL(old);
+                } else {
+                    LOG("no aperture for the new surface 0x%llx: the old one stays", (unsigned long long)phys_);
+                }
+            }
+            publishTiming();
+            if (seen_)
+                seen_->release();
+            seen_ = d;
+            d->retain();
+            LOG("nub: %ux%u @ %u.%02u Hz, pitch %u, surface 0x%llx, online %s", width_, height_,
+                refresh() >> 16, ((refresh() & 0xffff) * 100) >> 16, pitch_, (unsigned long long)phys_,
+                online ? "yes" : "no");
+        }
+    }
+    IOLockUnlock(applyLock_);
+    return changed;
+}
+
+// The connect interrupt (kIOFBConnectInterruptType): IOGraphics senses the connection again. kConnectionChanged stays
+// set until IOGraphics acknowledges it. No lock is held while the handler runs.
+void NVFramebuffer::raiseConnect()
+{
+    IOSimpleLockLock(vblLock_);
+    changed_ = true;
+    const IOFBInterruptProc proc = connect_.enabled ? connect_.proc : nullptr;
+    OSObject *target = connect_.target;
+    void *ref = connect_.ref;
+    IOSimpleLockUnlock(vblLock_);
+    if (proc)
+        proc(target, ref);
+}
+
+// NVBringup's nub sends kMsgState to its clients after changing NVDisplayFB or Online (dispNubSync).
+IOReturn NVFramebuffer::message(UInt32 type, IOService *provider, void *argument)
+{
+    if (type == kMsgState && provider == nub_) {
+        if (applyNub())
+            raiseConnect();
+        return kIOReturnSuccess;
+    }
+    return IOFramebuffer::message(type, provider, argument);
 }
 
 IOFixed1616 NVFramebuffer::refresh() const
@@ -150,7 +251,7 @@ uint64_t NVFramebuffer::framePeriod() const
 
 IOService *NVFramebuffer::probe(IOService *provider, SInt32 *score)
 {
-    if (!readDisplay(provider))
+    if (!readDisplay(OSDynamicCast(OSDictionary, provider->getProperty("NVDisplayFB"))))
         return nullptr;
     return IOFramebuffer::probe(provider, score);
 }
@@ -164,7 +265,14 @@ bool NVFramebuffer::start(IOService *provider)
     if (!vblCall_ && !(vblCall_ = thread_call_allocate_with_options(vblFire, this, THREAD_CALL_PRIORITY_HIGH,
                                                                     THREAD_CALL_OPTIONS_ONCE)))
         return false;
+    if (!applyLock_ && !(applyLock_ = IOLockAlloc()))
+        return false;
+    // NVBringup's state (Online, the mode) before the base start, which may probe the connection. A message from the
+    // nub before this point is not lost: it applies the same NVDisplayFB.
+    nub_ = provider;
+    applyNub();                     // no connect interrupt: IOGraphics hasn't registered for it yet
     if (!IOFramebuffer::start(provider)) {
+        nub_ = nullptr;
         LOG("IOFramebuffer::start failed");
         return false;
     }
@@ -179,9 +287,9 @@ bool NVFramebuffer::start(IOService *provider)
     vblActive_ = true;
     IOSimpleLockUnlock(vblLock_);
     thread_call_enter_delayed(vblCall_, vblNext_);
-    LOG("started on %s: %ux%u @ %u.%02u Hz, pitch %u, surface 0x%llx (%llu bytes), EDID %s", provider->getName(),
-        width_, height_,
-        refresh() >> 16, ((refresh() & 0xffff) * 100) >> 16, pitch_, phys_, size_, haveEdid_ ? "yes" : "no");
+    LOG("started on %s: %ux%u @ %u.%02u Hz, pitch %u, surface 0x%llx (%llu bytes), EDID %s, online %s",
+        provider->getName(), width_, height_, refresh() >> 16, ((refresh() & 0xffff) * 100) >> 16, pitch_,
+        (unsigned long long)phys_, (unsigned long long)size_, haveEdid_ ? "yes" : "no", online_ ? "yes" : "no");
     return true;
 }
 
@@ -192,6 +300,7 @@ void NVFramebuffer::stop(IOService *provider)
     IOSimpleLockLock(vblLock_);
     vblActive_ = false;
     IOSimpleLockUnlock(vblLock_);
+    nub_ = nullptr;                 // no more messages: NVBringup terminates the nub only from its dispNubSync
     thread_call_cancel(vblCall_);
     for (;;) {
         IOSimpleLockLock(vblLock_);
@@ -214,10 +323,15 @@ void NVFramebuffer::free()
         IOSimpleLockFree(vblLock_);
         vblLock_ = nullptr;
     }
+    if (applyLock_) {
+        IOLockFree(applyLock_);
+        applyLock_ = nullptr;
+    }
     if (aperture_) {
         aperture_->release();
         aperture_ = nullptr;
     }
+    OSSafeReleaseNULL(seen_);
     IOFramebuffer::free();
 }
 
@@ -313,10 +427,14 @@ bool NVFramebuffer::isConsoleDevice()
 
 IODeviceMemory *NVFramebuffer::getApertureRange(IOPixelAperture aperture)
 {
-    if (aperture != kIOFBSystemAperture || !aperture_)
+    if (aperture != kIOFBSystemAperture || !vblLock_)
         return nullptr;
-    aperture_->retain();            // the caller releases it
-    return aperture_;
+    IOSimpleLockLock(vblLock_);     // applyNub swaps it on a new surface
+    IODeviceMemory *a = aperture_;
+    if (a)
+        a->retain();                // the caller releases it
+    IOSimpleLockUnlock(vblLock_);
+    return a;
 }
 
 IODeviceMemory *NVFramebuffer::getVRAMRange()
@@ -472,10 +590,17 @@ IOReturn NVFramebuffer::getAttributeForConnection(IOIndex connect, IOSelect attr
     if (connect != 0)
         return kIOReturnBadArgument;
     switch (attribute) {
-    case kConnectionEnable:
     case kConnectionCheckEnable:
         if (value)
-            *value = 1;             // lit, and stays connected (no hot-plug yet)
+            *value = 1;             // sensing stays on, or a hot-plug never reaches IOGraphics
+        return kIOReturnSuccess;
+    case kConnectionEnable:
+        if (value)
+            *value = online_ ? 1 : 0;   // a display is lit (Online); off, IOGraphics sees no display
+        return kIOReturnSuccess;
+    case kConnectionChanged:
+        if (value)
+            *value = changed_ ? 1 : 0;  // a change since IOGraphics last acknowledged it
         return kIOReturnSuccess;
     case kConnectionFlags:
         if (value)
@@ -515,6 +640,16 @@ IOReturn NVFramebuffer::setAttributeForConnection(IOIndex connect, IOSelect attr
     case kConnectionControllerColorDepth:
     case kConnectionFlags:
         return kIOReturnSuccess;
+    case kConnectionChanged:
+        if (value) {
+            if (applyNub())         // IOGraphics asks for a fresh read of the nub: a change found here is raised,
+                raiseConnect();     // and a repeat request finds nothing new, so it doesn't loop
+        } else {
+            IOSimpleLockLock(vblLock_);
+            changed_ = false;       // acknowledged
+            IOSimpleLockUnlock(vblLock_);
+        }
+        return kIOReturnSuccess;
     default:
         return IOFramebuffer::setAttributeForConnection(connect, attribute, value);
     }
@@ -522,7 +657,7 @@ IOReturn NVFramebuffer::setAttributeForConnection(IOIndex connect, IOSelect attr
 
 bool NVFramebuffer::hasDDCConnect(IOIndex connect)
 {
-    return connect == 0 && haveEdid_;
+    return connect == 0 && haveEdid_ && online_;
 }
 
 IOReturn NVFramebuffer::getDDCBlock(IOIndex connect, UInt32 blockNumber, IOSelect blockType,
@@ -538,7 +673,7 @@ IOReturn NVFramebuffer::getDDCBlock(IOIndex connect, UInt32 blockNumber, IOSelec
     return kIOReturnSuccess;
 }
 
-// VBL: called by vblFire at the mode's refresh rate. Connect: kept, but never called (no hot-plug yet).
+// VBL: called by vblFire at the mode's refresh rate. Connect: called by raiseConnect when Online or the mode changes.
 IOReturn NVFramebuffer::registerForInterruptType(IOSelect type, IOFBInterruptProc proc, OSObject *target, void *ref,
                                                  void **interruptRef)
 {

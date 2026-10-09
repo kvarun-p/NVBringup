@@ -50,7 +50,9 @@
 		     PCI device, so NVBringup's NVDisplayNub and NVFramebuffer sit at depth <= 2 under it (S0-1). Starts
 		     only while NVBringup on this device has NVDisplayPipeArmed = true (probe()). Probe score 1000 is well
 		     below NVBringup's 30000, so NVBringup has started and set the gate first.
-		     No MetalPluginName / MetalPluginClassName here: S1 runs without Metal (S2 adds them). -->
+		     It carries the Metal keys too: CoreDisplay needs an MTLDevice for the accelerator that owns a display's
+		     pipe (MTLCopyDeviceForRegistryID), so WindowServer loads NVMetal.bundle for it. NVDisplayPipeMode tells
+		     the bundle this is the display-pipe accelerator, the only one it admits WindowServer on. -->
 		<key>NVMetalDisplayPipe</key>
 		<dict>
 			<key>CFBundleIdentifier</key>
@@ -69,6 +71,12 @@
 			<string>IOAccelerator</string>
 			<key>IOAccelRevision</key>
 			<integer>2</integer>
+			<key>MetalPluginName</key>
+			<string>NVMetal</string>
+			<key>MetalPluginClassName</key>
+			<string>NVMetalDevice</string>
+			<key>NVDisplayPipeMode</key>
+			<true/>
 			<!-- read by IOAcceleratorFamily2's copyCapabilities; IOPresentment refuses the pipe without it -->
 			<key>IOAccelDisplayPipeCapabilities</key>
 			<dict>
