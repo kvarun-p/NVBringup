@@ -275,12 +275,17 @@ IOService *NVMetalAccelerator::probe(IOService *provider, SInt32 *score)
         return nullptr;
     if (OSDynamicCast(IOPCIDevice, provider)) {
         // The display-pipe personality: only while NVBringup on this same device has its gate armed.
-        if (!gateArmed(provider))
+        const bool armed = gateArmed(provider);
+        LOG("probe on %s: display-pipe gate %s", provider->getName(), armed ? "armed" : "not armed");
+        if (!armed)
             return nullptr;
         mode_ = kModeDisplayPipe;
     } else {
         // The IOResources personality (nvaccel=1): it steps aside while the display-pipe gate is armed.
-        if (!enabled() || gateArmed(nullptr) || !have_gpu())
+        const bool on = enabled(), armed = gateArmed(nullptr), gpu = have_gpu();
+        LOG("probe on %s: nvaccel=1 %s, display-pipe gate %s, GPU %s", provider->getName(), on ? "yes" : "no",
+            armed ? "armed (stepping aside)" : "not armed", gpu ? "present" : "absent");
+        if (!on || armed || !gpu)
             return nullptr;
         mode_ = kModeResources;
     }
