@@ -25,6 +25,7 @@ struct IOTimingInformation;
 struct semaphore;
 struct task;
 class IOAccelAllocationInfo;
+class IOAccelChannel2;
 class IOAccelClientSharedRO;
 class IOAccelClientSharedRW;
 class IOAccelCommandDescriptor;
@@ -36,9 +37,12 @@ class IOAccelEvent;
 class IOAccelEventMachine2;
 class IOAccelEventMachineFast2;
 class IOAccelEventQueue;
+class IOAccelGetResourceInfoReturnData;
 class IOAccelMemory;
 class IOAccelMemoryMap;
+class IOAccelNewResourceArgs;
 class IOAccelResource2;
+class IOAccelResourcePrivate;
 class IOAccelShared2;
 class IOAccelSurface;
 class IOAccelSysMemory;
@@ -85,7 +89,7 @@ public:
 	/* 279 */ virtual n_ret createSysMemory();
 	/* 280 */ virtual n_ret createVidMemory(IOAccelShared2*, IOAccelResource2*, unsigned long long, void*);
 	/* 281 */ virtual n_ret createMemoryMap(IOAccelTask*, IOAccelMemory*, unsigned int);
-	/* 282 */ virtual n_ret createResource(IOAccelShared2*, unsigned int);
+	/* 282 */ virtual IOAccelResource2 * createResource(IOAccelShared2*, unsigned int);
 	/* 283 */ virtual n_ret createCommandDescriptor();
 	/* 284 */ virtual n_ret deleteCommandDescriptor(IOAccelCommandDescriptor*);
 	/* 285 */ virtual n_ret newBlockFence();
@@ -514,6 +518,218 @@ static_assert(sizeof(IOFramebuffer) == 0x1d0, "IOFramebuffer size");
 #define NVA_FWD_DEFS_IOFramebuffer \
 	/* none */
 
+class IOAccelResource2 : public OSObject {
+	OSDeclareAbstractStructors(IOAccelResource2)
+public:
+	/*   3 */ virtual int getRetainCount() const override;
+	/*   4 */ virtual void retain() const override;
+	/*   5 */ virtual void release() const override;
+	/*  18 */ virtual void free() override;
+	/*  35 */ virtual n_ret initSurfaceBuffer(IOAccelSurface*, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int);
+	/*  36 */ virtual n_ret allocMemory(IOAccelShared2*);
+	/*  37 */ virtual n_ret allocDataBufferMemory(IOAccelShared2*, bool, unsigned int);
+	/*  38 */ virtual n_ret allocFallbackMemory();
+	/*  39 */ virtual n_ret init(IOGraphicsAccelerator2*, IOAccelShared2*, unsigned int);
+	/*  40 */ virtual n_ret initialize(IOAccelNewResourceArgs*, unsigned long long);
+	/*  41 */ virtual n_ret initClientShared(IOAccelClientSharedRO*, IOAccelClientSharedRW*);
+	/*  42 */ virtual n_ret termClientShared(IOAccelClientSharedRO*, IOAccelClientSharedRW*);
+	/*  43 */ virtual n_ret copyResourcePrivate(IOAccelResourcePrivate*);
+	/*  44 */ virtual n_ret sharedRelease(IOAccelShared2*);
+	/*  45 */ virtual n_ret dirtyLevel(unsigned int, unsigned int);
+	/*  46 */ virtual n_ret prepare();
+	/*  47 */ virtual n_ret complete();
+	/*  48 */ virtual n_ret load();
+	/*  49 */ virtual n_ret unload();
+	/*  50 */ virtual n_ret addToChannel(IOAccelChannel2*, unsigned int);
+	/*  51 */ virtual n_ret removeFromChannel(IOAccelChannel2*);
+	/*  52 */ virtual n_ret fallback();
+	/*  53 */ virtual n_ret getResourceInfo(IOAccelGetResourceInfoReturnData*, unsigned int*);
+	/*  54 */ virtual n_ret pageon(IOAccelEvent*, bool);
+	/*  55 */ virtual n_ret pageon(IOAccelEvent*, bool, unsigned long long);
+	/*  56 */ virtual n_ret pageoff(IOAccelEvent*, bool, bool*);
+	/*  57 */ virtual n_ret pageoff(IOAccelEvent*, bool, bool*, unsigned long long);
+	/*  58 */ virtual n_ret rebuildPagingBuffer() = 0;
+	/*  59 */ virtual n_ret getMemoryAllocParameter();
+	/*  60 */ virtual n_ret getLevelOffset(unsigned char, unsigned char, int*) = 0;
+	/*  61 */ virtual n_ret getBackingLevelOffset(unsigned char, unsigned char, int*) = 0;
+	/*  62 */ virtual n_ret calculateIOSurfaceDeviceCacheVRAMBytes(unsigned long long*, unsigned long long*) = 0;
+	/*  63 */ virtual n_ret addToAperture() = 0;
+	/*  64 */ virtual n_ret removeFromAperture() = 0;
+	/*  65 */ virtual n_ret getApertureMemoryDescriptor(unsigned long long*) = 0;
+	/*  66 */ virtual n_ret dirtyFaceLevels(unsigned int, unsigned int);
+	/*  67 */ virtual n_ret dirtyBufferRange(unsigned int, unsigned int);
+	/*  68 */ virtual n_ret zeroVidMemory(IOAccelEvent*, unsigned long long);
+	/*  69 */ virtual n_ret scrubEvents();
+	/*  70 */ virtual n_ret dirtyBufferRange(unsigned long long, unsigned long long);
+	/*  71 */ virtual n_ret dirtyVendorCommand(unsigned int, unsigned long long);
+	/*  72 */ virtual n_ret _RESERVEDIOAccelResource2();
+	/*  73 */ virtual n_ret _RESERVEDIOAccelResource3();
+	/*  74 */ virtual n_ret _RESERVEDIOAccelResource4();
+	/*  75 */ virtual n_ret _RESERVEDIOAccelResource5();
+	/*  76 */ virtual n_ret pageoffIfNeeded(unsigned int, unsigned int);
+	/*  77 */ virtual n_ret pageonIfNeeded();
+	/*  78 */ virtual n_ret gartEvent();
+	uint8_t _nva_data[0x180 - sizeof(OSObject)];   // the family's own fields
+};
+static_assert(sizeof(IOAccelResource2) == 0x180, "IOAccelResource2 size");
+#define NVA_IOAccelResource2_SLOTS 79
+
+#define NVA_FWD_DEFS_IOAccelResource2 \
+	__attribute__((naked)) int IOAccelResource2::getRetainCount() const { __asm__("movq __ZTV16IOAccelResource2@GOTPCREL(%rip), %rax\n\tjmpq *40(%rax)"); } \
+	__attribute__((naked)) n_ret IOAccelResource2::pageon(IOAccelEvent* a0, bool a1) { __asm__("movq __ZTV16IOAccelResource2@GOTPCREL(%rip), %rax\n\tjmpq *448(%rax)"); } \
+	__attribute__((naked)) n_ret IOAccelResource2::pageon(IOAccelEvent* a0, bool a1, unsigned long long a2) { __asm__("movq __ZTV16IOAccelResource2@GOTPCREL(%rip), %rax\n\tjmpq *456(%rax)"); } \
+	__attribute__((naked)) n_ret IOAccelResource2::pageoff(IOAccelEvent* a0, bool a1, bool* a2) { __asm__("movq __ZTV16IOAccelResource2@GOTPCREL(%rip), %rax\n\tjmpq *464(%rax)"); } \
+	__attribute__((naked)) n_ret IOAccelResource2::pageoff(IOAccelEvent* a0, bool a1, bool* a2, unsigned long long a3) { __asm__("movq __ZTV16IOAccelResource2@GOTPCREL(%rip), %rax\n\tjmpq *472(%rax)"); } \
+	__attribute__((naked)) n_ret IOAccelResource2::getMemoryAllocParameter() { __asm__("movq __ZTV16IOAccelResource2@GOTPCREL(%rip), %rax\n\tjmpq *488(%rax)"); }
+
+class IOAccelMemory : public OSObject {
+	OSDeclareAbstractStructors(IOAccelMemory)
+public:
+	/*   5 */ virtual void release() const override;
+	/*  18 */ virtual void free() override;
+	/*  35 */ virtual n_ret init(IOGraphicsAccelerator2*);
+	/*  36 */ virtual n_ret getLength() const;
+	/*  37 */ virtual n_ret getDirtySize() const = 0;
+	/*  38 */ virtual n_ret getResidentSize() const = 0;
+	/*  39 */ virtual n_ret createMappingInTask(IOAccelTask*, unsigned int);
+	/*  40 */ virtual n_ret createMappingInTaskAtAddressLength(IOAccelTask*, unsigned int, unsigned long long, unsigned long long);
+	/*  41 */ virtual n_ret prepare();
+	/*  42 */ virtual n_ret complete();
+	/*  43 */ virtual n_ret getPhysicalSegment(unsigned long long, unsigned long long*) = 0;
+	/*  44 */ virtual n_ret setPurgeable(unsigned int, unsigned int*) = 0;
+	/*  45 */ virtual n_ret setTag(unsigned int) = 0;
+	/*  46 */ virtual n_ret getTag() = 0;
+	/*  47 */ virtual n_ret matchForReuse(void*, unsigned long long) = 0;
+	/*  48 */ virtual n_ret _RESERVEDIOAccelMemory0();
+	/*  49 */ virtual n_ret _RESERVEDIOAccelMemory1();
+	/*  50 */ virtual n_ret _RESERVEDIOAccelMemory2();
+	/*  51 */ virtual n_ret _RESERVEDIOAccelMemory3();
+	/*  52 */ virtual n_ret _RESERVEDIOAccelMemory4();
+	/*  53 */ virtual n_ret _RESERVEDIOAccelMemory5();
+	/*  54 */ virtual n_ret wire() = 0;
+	/*  55 */ virtual n_ret unwire() = 0;
+	/*  56 */ virtual n_ret orphanIt();
+	/*  57 */ virtual n_ret unorphanIt(IOAccelShared2*);
+	/*  58 */ virtual n_ret increment_wire_count() = 0;
+	/*  59 */ virtual n_ret decrement_wire_count() = 0;
+	uint8_t _nva_data[0xb0 - sizeof(OSObject)];   // the family's own fields
+};
+static_assert(sizeof(IOAccelMemory) == 0xb0, "IOAccelMemory size");
+#define NVA_IOAccelMemory_SLOTS 60
+
+#define NVA_FWD_DEFS_IOAccelMemory \
+	__attribute__((naked)) n_ret IOAccelMemory::getLength() const { __asm__("movq __ZTV13IOAccelMemory@GOTPCREL(%rip), %rax\n\tjmpq *304(%rax)"); }
+
+class IOAccelSysMemory : public IOAccelMemory {
+	OSDeclareAbstractStructors(IOAccelSysMemory)
+public:
+	/*  18 */ virtual void free() override;
+	/*  35 */ virtual n_ret init(IOGraphicsAccelerator2*) override;
+	/*  36 */ virtual n_ret getLength() const override;
+	/*  37 */ virtual n_ret getDirtySize() const override;
+	/*  38 */ virtual n_ret getResidentSize() const override;
+	/*  42 */ virtual n_ret complete() override;
+	/*  43 */ virtual n_ret getPhysicalSegment(unsigned long long, unsigned long long*) override;
+	/*  44 */ virtual n_ret setPurgeable(unsigned int, unsigned int*) override;
+	/*  45 */ virtual n_ret setTag(unsigned int) override;
+	/*  46 */ virtual n_ret getTag() override;
+	/*  47 */ virtual n_ret matchForReuse(void*, unsigned long long) override;
+	/*  54 */ virtual n_ret wire() override;
+	/*  55 */ virtual n_ret unwire() override;
+	/*  56 */ virtual n_ret orphanIt() override;
+	/*  57 */ virtual n_ret unorphanIt(IOAccelShared2*) override;
+	/*  58 */ virtual n_ret increment_wire_count() override;
+	/*  59 */ virtual n_ret decrement_wire_count() override;
+	/*  60 */ virtual n_ret _RESERVEDIOAccelSysMemory0();
+	/*  61 */ virtual n_ret _RESERVEDIOAccelSysMemory1();
+	/*  62 */ virtual n_ret _RESERVEDIOAccelSysMemory2();
+	/*  63 */ virtual n_ret _RESERVEDIOAccelSysMemory3();
+	/*  64 */ virtual n_ret _RESERVEDIOAccelSysMemory4();
+	/*  65 */ virtual n_ret _RESERVEDIOAccelSysMemory5();
+	uint8_t _nva_data[0x198 - sizeof(IOAccelMemory)];   // the family's own fields
+};
+static_assert(sizeof(IOAccelSysMemory) == 0x198, "IOAccelSysMemory size");
+#define NVA_IOAccelSysMemory_SLOTS 66
+
+#define NVA_FWD_DEFS_IOAccelSysMemory \
+	__attribute__((naked)) n_ret IOAccelSysMemory::getLength() const { __asm__("movq __ZTV16IOAccelSysMemory@GOTPCREL(%rip), %rax\n\tjmpq *304(%rax)"); } \
+	__attribute__((naked)) n_ret IOAccelSysMemory::setTag(unsigned int a0) { __asm__("movq __ZTV16IOAccelSysMemory@GOTPCREL(%rip), %rax\n\tjmpq *376(%rax)"); } \
+	__attribute__((naked)) n_ret IOAccelSysMemory::getTag() { __asm__("movq __ZTV16IOAccelSysMemory@GOTPCREL(%rip), %rax\n\tjmpq *384(%rax)"); }
+
+class IOAccelVidMemory : public IOAccelMemory {
+	OSDeclareAbstractStructors(IOAccelVidMemory)
+public:
+	/*  18 */ virtual void free() override;
+	/*  36 */ virtual n_ret getLength() const override;
+	/*  37 */ virtual n_ret getDirtySize() const override;
+	/*  38 */ virtual n_ret getResidentSize() const override;
+	/*  41 */ virtual n_ret prepare() override;
+	/*  42 */ virtual n_ret complete() override;
+	/*  44 */ virtual n_ret setPurgeable(unsigned int, unsigned int*) override;
+	/*  45 */ virtual n_ret setTag(unsigned int) override;
+	/*  46 */ virtual n_ret getTag() override;
+	/*  47 */ virtual n_ret matchForReuse(void*, unsigned long long) override;
+	/*  54 */ virtual n_ret wire() override;
+	/*  55 */ virtual n_ret unwire() override;
+	/*  56 */ virtual n_ret orphanIt() override;
+	/*  57 */ virtual n_ret unorphanIt(IOAccelShared2*) override;
+	/*  58 */ virtual n_ret increment_wire_count() override;
+	/*  59 */ virtual n_ret decrement_wire_count() override;
+	/*  60 */ virtual n_ret init(IOGraphicsAccelerator2*, IOAccelShared2*, IOAccelResource2*, unsigned long long, void*);
+	/*  61 */ virtual n_ret allocPhysical() = 0;
+	/*  62 */ virtual n_ret deallocPhysical() = 0;
+	/*  63 */ virtual n_ret _RESERVEDIOAccelVidMemory0();
+	/*  64 */ virtual n_ret _RESERVEDIOAccelVidMemory1();
+	/*  65 */ virtual n_ret _RESERVEDIOAccelVidMemory2();
+	/*  66 */ virtual n_ret _RESERVEDIOAccelVidMemory3();
+	/*  67 */ virtual n_ret _RESERVEDIOAccelVidMemory4();
+	/*  68 */ virtual n_ret _RESERVEDIOAccelVidMemory5();
+	uint8_t _nva_data[0x110 - sizeof(IOAccelMemory)];   // the family's own fields
+};
+static_assert(sizeof(IOAccelVidMemory) == 0x110, "IOAccelVidMemory size");
+#define NVA_IOAccelVidMemory_SLOTS 69
+
+#define NVA_FWD_DEFS_IOAccelVidMemory \
+	__attribute__((naked)) n_ret IOAccelVidMemory::getLength() const { __asm__("movq __ZTV16IOAccelVidMemory@GOTPCREL(%rip), %rax\n\tjmpq *304(%rax)"); } \
+	__attribute__((naked)) n_ret IOAccelVidMemory::setTag(unsigned int a0) { __asm__("movq __ZTV16IOAccelVidMemory@GOTPCREL(%rip), %rax\n\tjmpq *376(%rax)"); } \
+	__attribute__((naked)) n_ret IOAccelVidMemory::getTag() { __asm__("movq __ZTV16IOAccelVidMemory@GOTPCREL(%rip), %rax\n\tjmpq *384(%rax)"); }
+
+class IOAccelMemoryMap : public OSObject {
+	OSDeclareAbstractStructors(IOAccelMemoryMap)
+public:
+	/*   5 */ virtual void release() const override;
+	/*  18 */ virtual void free() override;
+	/*  35 */ virtual n_ret init(IOGraphicsAccelerator2*, IOAccelTask*, IOAccelMemory*, unsigned int);
+	/*  36 */ virtual n_ret matchOptionBits(unsigned int);
+	/*  37 */ virtual n_ret getGPUVirtualAddress();
+	/*  38 */ virtual n_ret getGPUVirtualAddressForUserProcess();
+	/*  39 */ virtual n_ret prepare();
+	/*  40 */ virtual n_ret complete();
+	/*  41 */ virtual n_ret compatibleWith(IOAccelMemoryMap*);
+	/*  42 */ virtual n_ret allocGPUVirtualAddress();
+	/*  43 */ virtual n_ret reserveGPUVirtualAddress(unsigned long long, unsigned long long);
+	/*  44 */ virtual n_ret freeGPUVirtualAddress();
+	/*  45 */ virtual n_ret getLength() const;
+	/*  46 */ virtual n_ret commitIntoGPUPageTable() = 0;
+	/*  47 */ virtual n_ret releaseFromGPUPageTable() = 0;
+	/*  48 */ virtual n_ret updateGPUPageTable() = 0;
+	/*  49 */ virtual n_ret getGPUVirtualAddressLengthForUserProcess();
+	/*  50 */ virtual n_ret getAssignedGPUVirtualAddressLength() const;
+	/*  51 */ virtual n_ret _RESERVEDIOAccelMemoryMap1();
+	/*  52 */ virtual n_ret _RESERVEDIOAccelMemoryMap2();
+	/*  53 */ virtual n_ret _RESERVEDIOAccelMemoryMap3();
+	/*  54 */ virtual n_ret _RESERVEDIOAccelMemoryMap4();
+	/*  55 */ virtual n_ret _RESERVEDIOAccelMemoryMap5();
+	/*  56 */ virtual n_ret redirect(IOAccelMemory*);
+	uint8_t _nva_data[0x118 - sizeof(OSObject)];   // the family's own fields
+};
+static_assert(sizeof(IOAccelMemoryMap) == 0x118, "IOAccelMemoryMap size");
+#define NVA_IOAccelMemoryMap_SLOTS 57
+
+#define NVA_FWD_DEFS_IOAccelMemoryMap \
+	__attribute__((naked)) n_ret IOAccelMemoryMap::matchOptionBits(unsigned int a0) { __asm__("movq __ZTV16IOAccelMemoryMap@GOTPCREL(%rip), %rax\n\tjmpq *304(%rax)"); } \
+	__attribute__((naked)) n_ret IOAccelMemoryMap::getLength() const { __asm__("movq __ZTV16IOAccelMemoryMap@GOTPCREL(%rip), %rax\n\tjmpq *376(%rax)"); }
+
 class IOAccelDisplayPipeTransaction2 {
 public:
 	/* txn+84 */ uint32_t getTransactionID() const;
@@ -530,5 +746,7 @@ public:
 	uint32_t getPlaneHeight(unsigned int plane) const;
 	uint32_t getPlaneBytesPerRow(unsigned int plane) const;
 	IOMemoryDescriptor *getMemoryDescriptor() const;
+	uint64_t getAllocSize() const;
+	uint32_t getBytesPerRow() const;
 };
 

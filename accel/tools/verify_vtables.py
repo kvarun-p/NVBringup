@@ -10,7 +10,11 @@ OURS = {'NVMetalAccelerator': ('IOGraphicsAccelerator2', 'AppleParavirtAccelerat
         'NVMetalEventMachine': ('IOAccelEventMachineFast2', 'AppleParavirtEventMachine'),
         'NVMetalTask': ('IOAccelTask', 'AppleParavirtTask'),
         'NVMetalDisplayMachine': ('IOAccelDisplayMachine', 'AppleParavirtDisplayMachine'),
-        'NVDisplayPipe': ('IOAccelDisplayPipe', 'AppleParavirtDisplayPipe')}
+        'NVDisplayPipe': ('IOAccelDisplayPipe', 'AppleParavirtDisplayPipe'),
+        'NVMetalResource': ('IOAccelResource2', 'AppleParavirtResource'),
+        'NVMetalSysMemory': ('IOAccelSysMemory', 'AppleParavirtSysMemory'),
+        'NVMetalVidMemory': ('IOAccelVidMemory', 'AppleParavirtVidMemory'),
+        'NVMetalMemoryMap': ('IOAccelMemoryMap', 'AppleParavirtMemoryMap')}
 
 def qualname(s):
     """'bool IOService::start(IOService *) const' -> ('IOService', 'start', 'IOService*')"""

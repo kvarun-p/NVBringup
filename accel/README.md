@@ -23,17 +23,25 @@ Two personalities (`probe()` picks one):
     framebuffer once on its own work loop with `found_framebuffer`. The pipe count must grow or the bind fails.
   - Counters, as registry properties of the accelerator: `NVPipeSubmits`, `NVPipeCompletes`, `NVPipeErrors`,
     `NVPipeLastError`, `NVPipeBound`.
+  - Memory objects: the family makes every resource through `newResource` (and its IOSurface device cache, the
+    sysmem and vidmem it wraps through `newSysMemory`/`newVidMemory`, and task mappings through `newMemoryMap`).
+    Those return `NVMetalResource`, `NVMetalSysMemory`, `NVMetalVidMemory` and `NVMetalMemoryMap`, which answer
+    the pure slots as AppleParavirtGPU does, minus its host side: system memory only, one level, no aperture,
+    no GPU page table. Without them `createResource` returns NULL and `IOAccelDisplayPipe::init` faults on it.
+  - Guard: `bindPendingFB` calls `createResource(0, 64)` once before `found_framebuffer`. A NULL result logs,
+    sets `NVPipeLastError` and binds nothing.
   - Its probe score (1000) sits below NVBringup's (30000), so NVBringup has started and set the gate first.
 - Not under the GPU's PCI device in the Metal-only personality: GPUWrangler adopts a PCI GPU that has an
   accelerator as a display GPU, and the screen went black. The S1 personality accepts that trade-off by design.
 - `src/IOAccelFamily2_decl.h` declares the family's classes in this macOS's vtable order. It is generated
   from the kernel collections (`make decl`, needs `/opt/local/libexec/llvm-20/bin/llvm-mc`) and must be
   regenerated after a macOS update. It covers the classes we subclass or call (accelerator, machine, pipe,
-  framebuffer slots 309/317/318), plus non-virtual getters of IOSurface and the transaction. `probe()`
+  framebuffer slots 309/317/318, resource and the sysmem/vidmem/memory-map objects), plus non-virtual getters
+  of IOSurface and the transaction. `probe()`
   refuses if a family class size changed.
-- `make verify` checks the vtable slots of our five classes against the kernel's and that the committed
-  header is what `gen_decl.py` produces now; `make check` resolves the kext's symbols against the running
-  kernel.
+- `make verify` checks the vtable slots of our nine classes against the kernel's and that the committed
+  header is what `gen_decl.py` produces now; `make check` prints the kext's undefined symbols with the kernel
+  collection that provides each one (it exits 0 and does not compare the list, so read it).
 
 Loading: IOAcceleratorFamily2 is in the system kernel collection, so OpenCore can't inject this kext; it
 has to go in the auxiliary collection (`/Library/Extensions`, approved in System Settings, then a reboot),

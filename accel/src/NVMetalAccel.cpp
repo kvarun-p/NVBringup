@@ -104,10 +104,12 @@ public:
     void *newSurface() override { return nullptr; }
     void *new2DContext() override { return nullptr; }
     void *newVideoContext() override { return nullptr; }
-    void *newSysMemory() override { return nullptr; }
-    void *newVidMemory() override { return nullptr; }
-    void *newResource() override { return nullptr; }
-    void *newMemoryMap() override { return nullptr; }
+    // The memory objects the family builds for resources (createSysMemory, createVidMemory, createResource,
+    // createMemoryMap): NULL here would make the family's own creators fail, and the display pipe then faults.
+    void *newSysMemory() override;
+    void *newVidMemory() override;
+    void *newResource() override;
+    void *newMemoryMap() override;
 
     volatile uint32_t *stampVA() { return stamp_ ? (volatile uint32_t *)stamp_->getBytesNoCopy() : nullptr; }
 
@@ -153,16 +155,77 @@ public:
     bool setup(IOGraphicsAccelerator2 *accel);
 };
 
+// The family's memory objects, with the pure slots AppleParavirtGPU answers (its host side is not ours). The
+// S1 pipe copies by CPU and runs no GPU work, so every resource is system memory: one level, no paging buffer,
+// no aperture, no page table. NVMetalSysMemory needs no overrides: IOAccelSysMemory's own length, tags and
+// physical segments already do what AppleParavirtSysMemory does.
+class NVMetalResource : public IOAccelResource2 {
+    OSDeclareDefaultStructors(NVMetalResource)
+public:
+    n_ret rebuildPagingBuffer() override { return 0; }
+    n_ret getLevelOffset(unsigned char, unsigned char, int *offset) override { return levelOffset(offset); }
+    n_ret getBackingLevelOffset(unsigned char, unsigned char, int *offset) override { return levelOffset(offset); }
+    n_ret calculateIOSurfaceDeviceCacheVRAMBytes(unsigned long long *allocSize,
+                                                 unsigned long long *bytesPerRow) override;
+    n_ret addToAperture() override { return 0; }
+    n_ret removeFromAperture() override { return 0; }
+    n_ret getApertureMemoryDescriptor(unsigned long long *) override { return 0; }
+private:
+    static n_ret levelOffset(int *offset)
+    {
+        if (offset)
+            *offset = 0;
+        return 0;
+    }
+};
+
+class NVMetalSysMemory : public IOAccelSysMemory {
+    OSDeclareDefaultStructors(NVMetalSysMemory)
+};
+
+class NVMetalVidMemory : public IOAccelVidMemory {
+    OSDeclareDefaultStructors(NVMetalVidMemory)
+public:
+    // No VRAM in S1: the physical segment is 0 and allocating it succeeds with nothing to allocate.
+    n_ret getPhysicalSegment(unsigned long long, unsigned long long *physical) override
+    {
+        if (physical)
+            *physical = 0;
+        return 0;
+    }
+    n_ret allocPhysical() override { return 1; }
+    n_ret deallocPhysical() override { return 0; }
+};
+
+class NVMetalMemoryMap : public IOAccelMemoryMap {
+    OSDeclareDefaultStructors(NVMetalMemoryMap)
+public:
+    // This personality has no GPU page table to write: committing, updating and releasing a mapping succeed
+    // with nothing to do, as AppleParavirtMemoryMap reports success.
+    n_ret commitIntoGPUPageTable() override { return 1; }
+    n_ret releaseFromGPUPageTable() override { return 1; }
+    n_ret updateGPUPageTable() override { return 1; }
+};
+
 OSDefineMetaClassAndStructors(NVMetalDisplayMachine, IOAccelDisplayMachine)
 OSDefineMetaClassAndStructors(NVDisplayPipe, IOAccelDisplayPipe)
 OSDefineMetaClassAndStructors(NVMetalAccelerator, IOGraphicsAccelerator2)
 OSDefineMetaClassAndStructors(NVMetalEventMachine, IOAccelEventMachineFast2)
 OSDefineMetaClassAndStructors(NVMetalTask, IOAccelTask)
+OSDefineMetaClassAndStructors(NVMetalResource, IOAccelResource2)
+OSDefineMetaClassAndStructors(NVMetalSysMemory, IOAccelSysMemory)
+OSDefineMetaClassAndStructors(NVMetalVidMemory, IOAccelVidMemory)
+OSDefineMetaClassAndStructors(NVMetalMemoryMap, IOAccelMemoryMap)
 
 // The family's slots that aren't exported: tail jumps through its own vtables.
 NVA_FWD_DEFS_IOGraphicsAccelerator2
 NVA_FWD_DEFS_IOAccelEventMachine2
 NVA_FWD_DEFS_IOAccelEventMachineFast2
+NVA_FWD_DEFS_IOAccelResource2
+NVA_FWD_DEFS_IOAccelMemory
+NVA_FWD_DEFS_IOAccelSysMemory
+NVA_FWD_DEFS_IOAccelVidMemory
+NVA_FWD_DEFS_IOAccelMemoryMap
 
 // Refuses to run on a kernel whose family classes aren't the size the header was generated for.
 static bool layout_ok()
@@ -176,6 +239,11 @@ static bool layout_ok()
         { "IOAccelDisplayPipe", sizeof(IOAccelDisplayPipe) },
         { "IOAccelDisplayPipeTransaction2", sizeof(IOAccelDisplayPipeTransaction2) },
         { "IOFramebuffer", sizeof(IOFramebuffer) },
+        { "IOAccelResource2", sizeof(IOAccelResource2) },
+        { "IOAccelMemory", sizeof(IOAccelMemory) },
+        { "IOAccelSysMemory", sizeof(IOAccelSysMemory) },
+        { "IOAccelVidMemory", sizeof(IOAccelVidMemory) },
+        { "IOAccelMemoryMap", sizeof(IOAccelMemoryMap) },
     };
     for (const auto &c : classes) {
         const OSSymbol *s = OSSymbol::withCString(c.name);
@@ -527,6 +595,16 @@ void NVMetalAccelerator::bindPendingFB()
         fb->release();
         return;
     }
+    // IOAccelDisplayPipe::init stores through createResource(0, 64) with no NULL check (it faults at +0xc). Make
+    // that call once here; if it gives NULL the family's init would fault, so the framebuffer is not bound.
+    IOAccelResource2 *probe = createResource(nullptr, 64);
+    if (!probe) {
+        LOG("createResource(0, 64) returned NULL: not binding %s", fb->getName());
+        noteError(kIOReturnNoResources);
+        fb->release();
+        return;
+    }
+    probe->release();       // the pipe's own resource is made by its init
     uint32_t before = pipeCount(machine_);
     bool ok = machine_->found_framebuffer(static_cast<IOFramebuffer *>(fb));
     uint32_t after = pipeCount(machine_);
@@ -737,6 +815,29 @@ IOReturn NVDisplayPipe::copyPlane0(IOAccelDisplayPipeTransaction2 *txn)
     src->complete();
     ap->release();          // getApertureRange returns it retained: one leaked reference per frame overflows
     return r;
+}
+
+// ---- memory objects -------------------------------------------------------------------------------
+
+// The family's createResource calls this (through newResource) for every resource, the display pipe's own included.
+void *NVMetalAccelerator::newResource() { return OSTypeAlloc(NVMetalResource); }
+void *NVMetalAccelerator::newSysMemory() { return OSTypeAlloc(NVMetalSysMemory); }
+void *NVMetalAccelerator::newVidMemory() { return OSTypeAlloc(NVMetalVidMemory); }
+void *NVMetalAccelerator::newMemoryMap() { return OSTypeAlloc(NVMetalMemoryMap); }
+
+// The IOSurface device cache of this resource is at +224 (newResourceWithIOSurfaceDeviceCache stores it before
+// the family asks for these sizes), and the IOSurface is at cache+16: the same reads AppleParavirtResource makes.
+// The first output is the allocation size the family allocates VRAM for; the second is the row pitch.
+n_ret NVMetalResource::calculateIOSurfaceDeviceCacheVRAMBytes(unsigned long long *allocSize,
+                                                             unsigned long long *bytesPerRow)
+{
+    const uint8_t *cache = *(const uint8_t *const *)((const uint8_t *)this + 224);
+    IOSurface *s = cache ? *(IOSurface *const *)(cache + 16) : nullptr;
+    if (allocSize)
+        *allocSize = s ? s->getAllocSize() : 0;
+    if (bytesPerRow)
+        *bytesPerRow = s ? s->getBytesPerRow() : 0;
+    return 0;
 }
 
 // ---- kext ------------------------------------------------------------------------------------------

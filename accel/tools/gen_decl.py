@@ -30,6 +30,12 @@ CLASSES = [
     ('IOAccelDisplayMachine',    'IOService'),
     ('IOAccelDisplayPipe',       'IOService'),
     ('IOFramebuffer',            'IOService'),
+    # memory objects the family makes through newResource/newSysMemory/newVidMemory/newMemoryMap (S2)
+    ('IOAccelResource2',         'OSObject'),
+    ('IOAccelMemory',            'OSObject'),
+    ('IOAccelSysMemory',         'IOAccelMemory'),
+    ('IOAccelVidMemory',         'IOAccelMemory'),
+    ('IOAccelMemoryMap',         'OSObject'),
 ]
 PARAVIRT = {
     'IOGraphicsAccelerator2':   'AppleParavirtAccelerator',
@@ -39,6 +45,18 @@ PARAVIRT = {
     'IOAccelDisplayMachine':    'AppleParavirtDisplayMachine',
     'IOAccelDisplayPipe':       'AppleParavirtDisplayPipe',
     'IOFramebuffer':            'AppleParavirtFramebuffer',
+    # names of the pure slots (paravirt overrides them; IOAccelMemory's are named by its SysMemory child)
+    'IOAccelResource2':         'AppleParavirtResource',
+    'IOAccelMemory':            'AppleParavirtSysMemory',
+    'IOAccelSysMemory':         'AppleParavirtSysMemory',
+    'IOAccelVidMemory':         'AppleParavirtVidMemory',
+    'IOAccelMemoryMap':         'AppleParavirtMemoryMap',
+}
+# Names of pure slots whose paravirt override is not a named (exported) function: the family's own children
+# (IOAccelSysMemory, IOAccelVidMemory) override these slots with the names given here.
+PURE_NAMES = {
+    ('IOAccelMemory', 45): 'IOAccelMemory::setTag(unsigned int)',
+    ('IOAccelMemory', 46): 'IOAccelMemory::getTag()',
 }
 # Non-virtual members we call. Each is an exported symbol of the family (or of IOSurface), so the
 # declaration only has to name it; `make verify` checks that the symbol exists in the kernel.
@@ -67,6 +85,9 @@ PLAIN = [
         'uint32_t getPlaneHeight(unsigned int plane) const;',
         'uint32_t getPlaneBytesPerRow(unsigned int plane) const;',
         'IOMemoryDescriptor *getMemoryDescriptor() const;',
+        # the sizes IOAccelResource2's calculateIOSurfaceDeviceCacheVRAMBytes reports (paravirt, S2)
+        'uint64_t getAllocSize() const;',
+        'uint32_t getBytesPerRow() const;',
     ]),
 ]
 # Return types of the slots we call or override (checked against the paravirt driver's disassembly).
@@ -100,6 +121,9 @@ RET = {
     'IOAccelDisplayMachine::found_framebuffer': 'bool',
     # Our NVDisplayPipe overrides newDisplayPipe, so the base's return type must be the pipe class
     'IOGraphicsAccelerator2::newDisplayPipe': 'IOAccelDisplayPipe *',
+    # createResource returns the resource newResource made (NULL on failure). The IOSurface device cache checks it;
+    # the display pipe's init does not, so bindPendingFB's guard calls it first (S2)
+    'IOGraphicsAccelerator2::createResource': 'IOAccelResource2 *',
     # IOFramebuffer slots 309/317/318 (kernel IOGraphicsFamily, 14.8): getApertureRange, getPixelInformation,
     # getCurrentDisplayMode. 309 is the slot IOFramebuffer::getApertureRangeWithLength calls.
     'IOFramebuffer::getApertureRange': 'IODeviceMemory *',
@@ -172,7 +196,9 @@ for cls, parent in CLASSES:
             else:
                 ret, name, args, const = decls[(parent, slot)]
         elif addr == pure:
-            if '::' in pvdm[slot] and not pvdm[slot].startswith('_'):     # named by a descendant's override
+            if (cls, slot) in PURE_NAMES:                                # paravirt's override is unexported
+                _, name, args, const = split_dm(PURE_NAMES[(cls, slot)])
+            elif '::' in pvdm[slot] and not pvdm[slot].startswith('_'):  # named by a descendant's override
                 _, name, args, const = split_dm(pvdm[slot])
             else:
                 name, args, const = '_vslot%d' % slot, '', False
