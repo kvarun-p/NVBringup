@@ -62,9 +62,9 @@
 			<!-- NVIDIA (0x10de), any device -->
 			<key>IOPCIMatch</key>
 			<string>0x000010de&amp;0x0000ffff</string>
-			<!-- display controllers (class 0x03) -->
-			<key>IOPCIClassMatch</key>
-			<string>0x03000000&amp;0xff000000</string>
+			<!-- Vendor only, like NVBringup: no IOPCIClassMatch. Hackintosh configs commonly spoof the dGPU's
+			     class-code to 0xff0000 (OpenCore DeviceProperties) to hide it from macOS, and this laptop's does,
+			     so a display-class match never reaches probe(). probe() requires NVBringup on the device. -->
 			<key>IOMatchCategory</key>
 			<string>IOAccelerator</string>
 			<key>IOAccelRevision</key>
