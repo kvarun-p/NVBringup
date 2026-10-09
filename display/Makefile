@@ -1,6 +1,7 @@
 # Builds NVFramebuffer.kext (the IOFramebuffer for the display NVBringup lights), Command Line Tools only.
 #   make           the kext
-#   make verify    checks every vtable slot of NVFramebuffer against the kernel's IOFramebuffer
+#   make verify    checks every vtable slot of NVFramebuffer against the kernel's IOFramebuffer and of NVAGDCControl
+#                  against the kernel's AppleGraphicsDeviceControl, their sizes, and that every C++ import exists
 #   make vdisplay  build/nvvdisplay, the virtual display that feeds the HDMI monitor (vdisplay/)
 #   make check     resolves the kext's symbols against the running kernel (no load)
 
@@ -20,7 +21,7 @@ CFLAGS    := $(KFLAGS) -std=gnu11
 LDFLAGS   := $(ARCHFLAGS) -nostdlib -Xlinker -kext -Xlinker -export_dynamic \
              -lkmodc++ -lkmod -lcc_kext
 
-OBJS := $(BUILD)/NVFramebuffer.o $(BUILD)/kmod_info.o
+OBJS := $(BUILD)/NVFramebuffer.o $(BUILD)/NVAGDCControl.o $(BUILD)/kmod_info.o
 
 .PHONY: all verify check vdisplay clean
 VDISPLAY := $(BUILD)/nvvdisplay
@@ -33,7 +34,9 @@ $(VDISPLAY): vdisplay/nvvdisplay.m ../tools/libnvmac.c ../tools/libnvmac.h ../sr
 		-framework Foundation -framework CoreGraphics -framework IOSurface -framework IOKit -framework ScreenCaptureKit -framework CoreMedia -framework CoreVideo -o $@
 	codesign --force --sign - --identifier io.github.kvarun-p.nvvdisplay $@
 
-$(BUILD)/%.o: src/%.cpp | $(BUILD)
+HDRS := $(wildcard src/*.h)
+
+$(BUILD)/%.o: src/%.cpp $(HDRS) | $(BUILD)
 	clang++ $(CXXFLAGS) -c $< -o $@
 
 $(BUILD)/%.o: src/%.c | $(BUILD)
@@ -46,9 +49,13 @@ $(KEXT): $(OBJS) Info.plist
 	find $(KEXT) -name '._*' -delete; xattr -cr $(KEXT)
 	codesign --force --sign - $(KEXT)
 
-verify: | $(BUILD)
+verify: $(BUILD)/NVFramebuffer.o $(BUILD)/NVAGDCControl.o | $(BUILD)
 	clang++ $(CXXFLAGS) -c src/NVFramebuffer.cpp -o /dev/null -Xclang -fdump-vtable-layouts > $(BUILD)/vtables.txt
+	clang++ $(CXXFLAGS) -c src/NVAGDCControl.cpp -o /dev/null -Xclang -fdump-vtable-layouts >> $(BUILD)/vtables.txt
 	python3 tools/verify_vtables.py $(BUILD)/vtables.txt
+	clang++ $(CXXFLAGS) -c src/NVAGDCControl.cpp -o /dev/null -Xclang -fdump-record-layouts > $(BUILD)/layouts.txt
+	python3 tools/verify_sizes.py $(BUILD)/layouts.txt
+	python3 tools/verify_link.py $(BUILD)/NVFramebuffer.o $(BUILD)/NVAGDCControl.o
 
 check: $(KEXT)
 	kmutil libraries -p $(KEXT) --undef-symbols

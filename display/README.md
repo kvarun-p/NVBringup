@@ -66,8 +66,20 @@ WindowServer draws into the aperture with the CPU. The vertical blank comes from
   published on the framebuffer when the mode is set. The VBL timer delivers `'vbl '` through
   `registerForInterruptType` / `setInterruptState` at absolute deadlines of one frame, and `getVBLTime` returns
   the last deadline. `NVFBVblanks` counts the timer's vertical blanks (published about once a second).
-- `make verify` checks all of NVFramebuffer's vtable slots against the kernel's IOFramebuffer. Run it after a macOS
-  update. `make check` resolves the kext's symbols against the running kernel.
+- `make verify` checks all of NVFramebuffer's vtable slots against the kernel's IOFramebuffer, and NVAGDCControl's
+  (below) against the kernel's AppleGraphicsDeviceControl: slots, parameter types, the 272-byte size, and that every C++
+  import exists in the kernel collections. Run it after a macOS update. `make check` resolves the kext's symbols against
+  the running kernel.
+- NVAGDCControl (src/NVAGDCControl.cpp, same kext) is the display's AppleGraphicsDeviceControl provider. IOPresentment
+  (CoreDisplay's display pipe) finds a framebuffer only through an AGDC: for each AGDC service it opens type 2, asks
+  selector 1 (vendor info) and selector 0x980 (the framebuffer registry IDs it serves). Nothing served NVFramebuffer, so
+  CoreDisplay found no pipe for it. NVAGDCControl sits on NVDisplayNub beside NVFramebuffer and matches only while
+  NVDisplayPipeArmed is set on the nub. Its selector 0x980 lists NVFramebuffer's registry ID, read when asked. Its
+  layout is in src/AppleGraphicsDeviceControl_decl.h. probe() refuses to attach unless the kernel's class is 272 bytes.
+  The selection rule (CreateAssociationMap): each AGDC's node map starts with its own registry ID or with the first
+  display-class node among its parents and children; a device is served by the first AGDC whose node-map ID equals it.
+  So NVAGDCControl serves the NVIDIA device through its own ID, and IntelFBClientControl keeps the Intel devices.
+  Not yet run on hardware: this changes the association only. The pipe still needs the accelerator (below).
 
 On hardware (2026-10-09) WindowServer opens it as an unaccelerated display, then CoreDisplay looks for its display
 pipe every frame (`Unable to find display pipe for IOFB service`) and its compositor stops within a minute, the
