@@ -66,13 +66,28 @@ kernel's, since the SDK is newer than the OS.
 | Placement | Result |
 |---|---|
 | On IOResources | Starts (1920x1080, 60 Hz, EDID). WindowServer's GPUWrangler never lists it: it collects framebuffers through a GPU's PCI device or its accelerator |
-| Under the NVIDIA PCI device (`nvfb=1`) | GPUWrangler registers the NVIDIA GPU as a discrete GPU with this framebuffer, CoreDisplay fails building its display pipe, and boot hangs at the Apple logo |
+| Under the NVIDIA PCI device (`nvfb=1`, 2026-10-06) | GPUWrangler registers the NVIDIA GPU as a discrete GPU with this framebuffer, CoreDisplay fails building its display pipe, and boot hangs at the Apple logo. The aperture was wrong too (below) |
+| Under NVBringup's `NVDisplayNub` (2026-10-09) | Starts at the right aperture with a vblank timer; WindowServer opens it and treats it as unaccelerated (`isAcc=NO`), but logs `Unable to find display pipe for IOFB service` every frame, and ~1 min later its compositor stops, the internal panel included |
 
-A display GPU needs its own Metal display pipeline (IOAccelDisplayPipe and friends). The accelerator test in
-`accel/README.md` hit the same wall. The `class-code` injection that hides the GPU (see
-[hackintosh.md](hackintosh.md)) didn't cause this: GPUWrangler adopted the GPU anyway. Making this route work means
-writing that display pipeline, which is not attempted. NVBringup no longer publishes the resource the kext matches,
-so it doesn't start.
+So CoreDisplay on Sonoma wants a display pipe (IOAccelDisplayPipe, from an accelerator on the same GPU) for every
+framebuffer once another GPU is accelerated; an unaccelerated framebuffer, as a VESA display is, isn't enough. The
+accelerator test in `accel/README.md` hit the same wall. The `class-code` injection that hides the GPU (see
+[hackintosh.md](hackintosh.md)) didn't cause this: GPUWrangler adopted the GPU anyway. Making this route work means an
+accelerator under the GPU's PCI device whose display pipe takes WindowServer's frames (NullMoth's driver does this on
+Sequoia, over NVKMS); not attempted yet.
+
+Found on the way, each a boot:
+
+| Symptom | Cause |
+|---|---|
+| Kernel panic, `vm_page_validate_no_references`, on a page inside the aperture | `IODeviceMemory::getPhysicalAddress()` of BAR1 is an I/O address of the system mapper (VT-d), which to the CPU is RAM (here 0x101000000 for BAR1 at 0x7f80000000): WindowServer drew into the kernel's memory. `NVDisplayFB`'s `PhysAddr` and the CPU mappings of `NVMAC_MEM_CAN_MAP` buffers now use `getPhysicalSegment(…, kIOMemoryMapperNone)` |
+| Panic in `IOFramebuffer::powerStateWillChangeTo` (NULL controller) | `registerPowerDriver` in `start()`: IOGraphics creates the framebuffer's controller later. Removed; IONDRVFramebuffer registers at the very end |
+| WindowServer started a minute late, the panel stayed on the boot text | `probe()` slept up to 60 s for a lit display, holding the PCI device busy. NVBringup now publishes `NVDisplayNub` once a display is lit (and removes or replaces it on unplug or replug); NVFramebuffer matches that and never waits |
+| `nvfb-once` deleted from the kernel came back | `setProperty(kIONVRAMDeletePropertyKey)` doesn't delete; `setProperties()` with it and `kIONVRAMSyncNowPropertyKey`, as `nvram -d` does, does |
+
+Turning it on: boot-arg `nvfb=1`, or for one boot `sudo nvram nvfb-once=1`, which NVBringup deletes when it lights the
+display, so a boot that hangs is followed by a normal one. Uninstall `nvvdisplay` first: both would use the scanout
+buffers.
 
 ### What works: a virtual display (`nvvdisplay`)
 

@@ -434,7 +434,7 @@ firmware and your Mesa and llama.cpp builds. By hand:
 | `nvaccel=1` | Start NVMetalAccel, so Metal.framework lists the GPU (Metal step) |
 | `nvdisp=1` | Read what GSP-RM knows about the display outputs (connect state, EDIDs) into the log and `NVDisplayProbe`; changes nothing |
 | `nvdisp=2` | Light a connected HDMI/DVI port at boot and on hot-plug, for `nvvdisplay` (step 9). Keeps the GPU powered |
-| `nvfb=1` | Experiment only, don't use: puts NVFramebuffer.kext under the GPU's PCI device, which hangs the boot (see docs/display.md) |
+| `nvfb=1` | Experiment only, don't use: NVBringup publishes `NVDisplayNub` for NVFramebuffer.kext, and WindowServer stops within a minute (see docs/display.md). `sudo nvram nvfb-once=1` does the same for one boot |
 | `nvkmapvram=1` | NVK keeps its push buffers and descriptors in CPU-mapped VRAM: faster generation (+15 % on a 0.5B model, +6 % on 3B), but each program run holds ~2.7 MiB of BAR1 until a restart; after ~42 runs it falls back to system memory (default speed). `desc` / `cmd:<n>` select parts; see [docs/bar1-cpu-mappings.md](docs/bar1-cpu-mappings.md) |
 
 ## Troubleshooting

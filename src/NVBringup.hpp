@@ -238,6 +238,10 @@ private:
     IOReturn displayFlip(GpuConn *c, uint32_t buffer);
     bool     dispMemAlloc(NVDispMem &m, uint64_t size, uint64_t pa);
     uint32_t dispGen_ = 0;          // NVDisplayGen: bumped whenever the lit display comes or goes
+    IOService *dispNub_ = nullptr;  // NVDisplayNub, NVFramebuffer's provider, while a display is lit
+    int      fbWanted_ = -1;        // -1: not decided yet (see fbWanted)
+    bool     fbWanted();
+    void     dispNubUpdate(OSDictionary *fb);
     void     queryGrInfo();
     void     probeIntr();               // read-only: CPU interrupt table and tree state
     bool     initBar1();

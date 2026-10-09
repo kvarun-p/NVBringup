@@ -7,10 +7,14 @@
 // It lives in its own kext because IOGraphicsFamily is in the system kernel collection, which an
 // OpenCore-injected kext (NVBringup) can't link against. The two share no symbols: NVBringup's
 // NVDisplayFB property carries everything this needs.
+//
+// The vertical blanking interrupt WindowServer paces its frames by comes from a timer at the mode's
+// refresh rate, not from the display engine.
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/graphics/IOFramebuffer.h>
+#include <kern/thread_call.h>
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSDictionary.h>
@@ -23,6 +27,13 @@ class NVFramebuffer : public IOFramebuffer {
 
     static constexpr IODisplayModeID kMode = 1;
 
+    struct Interrupt {
+        IOFBInterruptProc proc = nullptr;
+        OSObject *target = nullptr;
+        void *ref = nullptr;
+        bool enabled = true;
+    };
+
     IODeviceMemory *aperture_ = nullptr;
     uint64_t phys_ = 0, size_ = 0;
     uint32_t width_ = 0, height_ = 0, pitch_ = 0, pclkKhz_ = 0;
@@ -30,13 +41,20 @@ class NVFramebuffer : public IOFramebuffer {
     uint32_t syncFlags_ = 0;            // bit 0: hsync negative, bit 1: vsync negative
     uint8_t edid_[128] = {};
     bool haveEdid_ = false;
+    Interrupt vbl_, connect_;
+    thread_call_t vblTimer_ = nullptr;
+    uint64_t vblNext_ = 0;              // absolute time of the next vertical blank
+    uint64_t vblCount_ = 0;
 
     bool readDisplay(IOService *provider);
     IOFixed1616 refresh() const;
+    uint64_t framePeriod() const;
+    static void vblFire(thread_call_param_t self, thread_call_param_t);
 
 public:
     IOService *probe(IOService *provider, SInt32 *score) override;
     bool start(IOService *provider) override;
+    void stop(IOService *provider) override;
     void free() override;
 
     IOReturn enableController() override;
@@ -54,6 +72,7 @@ public:
     IOReturn setDisplayMode(IODisplayModeID mode, IOIndex depth) override;
     IOReturn getStartupDisplayMode(IODisplayModeID *mode, IOIndex *depth) override;
     IOReturn getTimingInfoForDisplayMode(IODisplayModeID mode, IOTimingInformation *info) override;
+    IOReturn getAttribute(IOSelect attribute, uintptr_t *value) override;
     IOReturn setAttribute(IOSelect attribute, uintptr_t value) override;
     IOReturn setGammaTable(UInt32 channelCount, UInt32 dataCount, UInt32 dataWidth, void *data) override;
     IOItemCount getConnectionCount() override;
@@ -62,56 +81,44 @@ public:
     bool hasDDCConnect(IOIndex connect) override;
     IOReturn getDDCBlock(IOIndex connect, UInt32 blockNumber, IOSelect blockType, IOOptionBits options,
                          UInt8 *data, IOByteCount *length) override;
+    IOReturn registerForInterruptType(IOSelect type, IOFBInterruptProc proc, OSObject *target, void *ref,
+                                      void **interruptRef) override;
+    IOReturn unregisterInterrupt(void *interruptRef) override;
+    IOReturn setInterruptState(void *interruptRef, UInt32 state) override;
 };
 
 OSDefineMetaClassAndStructors(NVFramebuffer, IOFramebuffer)
 
-// NVBringup's NVDisplayFB property: the scanout surface and the mode it was lit at.
-// provider: IOResources (default), or with boot-arg nvfb=1 the NVIDIA PCI device NVBringup drives.
+// NVBringup's NVDisplayFB, on the NVDisplayNub it publishes while a display is lit: the scanout surface and
+// the mode it was lit at.
 bool NVFramebuffer::readDisplay(IOService *provider)
 {
-    OSDictionary *m = IOService::serviceMatching("NVBringup");
-    IOService *gpu = m ? IOService::copyMatchingService(m) : nullptr;
-    if (m)
-        m->release();
-    if (!gpu)
+    OSDictionary *d = OSDynamicCast(OSDictionary, provider->getProperty("NVDisplayFB"));
+    if (!d)
         return false;
-    uint32_t onPci = 0;
-    PE_parse_boot_argn("nvfb", &onPci, sizeof(onPci));
-    const bool wantPci = onPci != 0;
-    const bool isPci = provider != getResourceService();
-    if (wantPci != isPci || (isPci && gpu->getProvider() != provider)) {
-        gpu->release();
-        return false;
+    auto num = [&](const char *k) -> uint64_t {
+        OSNumber *n = OSDynamicCast(OSNumber, d->getObject(k));
+        return n ? n->unsigned64BitValue() : 0;
+    };
+    phys_ = num("PhysAddr");
+    size_ = num("Size");
+    width_ = (uint32_t)num("Width");
+    height_ = (uint32_t)num("Height");
+    pitch_ = (uint32_t)num("Pitch");
+    pclkKhz_ = (uint32_t)num("PixelClockKHz");
+    htotal_ = (uint32_t)num("HTotal");
+    vtotal_ = (uint32_t)num("VTotal");
+    hsyncStart_ = (uint32_t)num("HSyncStart");
+    hsyncWidth_ = (uint32_t)num("HSyncWidth");
+    vsyncStart_ = (uint32_t)num("VSyncStart");
+    vsyncWidth_ = (uint32_t)num("VSyncWidth");
+    syncFlags_ = (uint32_t)num("Flags");
+    if (OSData *e = OSDynamicCast(OSData, d->getObject("EDID")); e && e->getLength() >= sizeof(edid_)) {
+        memcpy(edid_, e->getBytesNoCopy(), sizeof(edid_));
+        haveEdid_ = true;
     }
-    bool ok = false;
-    if (OSDictionary *d = OSDynamicCast(OSDictionary, gpu->getProperty("NVDisplayFB"))) {
-        auto num = [&](const char *k) -> uint64_t {
-            OSNumber *n = OSDynamicCast(OSNumber, d->getObject(k));
-            return n ? n->unsigned64BitValue() : 0;
-        };
-        phys_ = num("PhysAddr");
-        size_ = num("Size");
-        width_ = (uint32_t)num("Width");
-        height_ = (uint32_t)num("Height");
-        pitch_ = (uint32_t)num("Pitch");
-        pclkKhz_ = (uint32_t)num("PixelClockKHz");
-        htotal_ = (uint32_t)num("HTotal");
-        vtotal_ = (uint32_t)num("VTotal");
-        hsyncStart_ = (uint32_t)num("HSyncStart");
-        hsyncWidth_ = (uint32_t)num("HSyncWidth");
-        vsyncStart_ = (uint32_t)num("VSyncStart");
-        vsyncWidth_ = (uint32_t)num("VSyncWidth");
-        syncFlags_ = (uint32_t)num("Flags");
-        if (OSData *e = OSDynamicCast(OSData, d->getObject("EDID")); e && e->getLength() >= sizeof(edid_)) {
-            memcpy(edid_, e->getBytesNoCopy(), sizeof(edid_));
-            haveEdid_ = true;
-        }
-        ok = phys_ && width_ && height_ && pitch_ >= width_ * 4 && size_ >= (uint64_t)pitch_ * height_ &&
-             htotal_ && vtotal_;
-    }
-    gpu->release();
-    return ok;
+    return phys_ && width_ && height_ && pitch_ >= width_ * 4 && size_ >= (uint64_t)pitch_ * height_ &&
+           htotal_ && vtotal_;
 }
 
 IOFixed1616 NVFramebuffer::refresh() const
@@ -119,32 +126,21 @@ IOFixed1616 NVFramebuffer::refresh() const
     return (IOFixed1616)(((uint64_t)pclkKhz_ * 1000 << 16) / ((uint64_t)htotal_ * vtotal_));
 }
 
+uint64_t NVFramebuffer::framePeriod() const
+{
+    uint64_t ns = 16666667;
+    if (pclkKhz_ && htotal_ && vtotal_) {
+        const uint64_t q = (uint64_t)htotal_ * vtotal_ * 1000000 / pclkKhz_;
+        if (q >= 4000000 && q <= 50000000)      // 20 to 250 Hz
+            ns = q;
+    }
+    uint64_t abs = 0;
+    nanoseconds_to_absolutetime(ns, &abs);
+    return abs;
+}
+
 IOService *NVFramebuffer::probe(IOService *provider, SInt32 *score)
 {
-    // Under the PCI device (nvfb=1) matching runs once, when this kext's personalities arrive, which can be
-    // before NVBringup's modeset: wait for the NVDisplayLit resource here (IOResourceMatch would not retry).
-    uint32_t onPci = 0;
-    PE_parse_boot_argn("nvfb", &onPci, sizeof(onPci));
-    if (onPci && provider != getResourceService()) {
-        OSDictionary *m = IOService::serviceMatching("NVBringup");
-        IOService *gpu = m ? IOService::copyMatchingService(m) : nullptr;
-        if (m)
-            m->release();
-        const bool ours = gpu && gpu->getProvider() == provider;
-        if (gpu)
-            gpu->release();
-        if (!ours)
-            return nullptr;
-        OSDictionary *r = IOService::resourceMatching("NVDisplayLit");
-        IOService *lit = r ? IOService::waitForMatchingService(r, 60ull * 1000 * 1000 * 1000) : nullptr;
-        if (r)
-            r->release();
-        if (!lit) {
-            LOG("no lit display from NVBringup within 60 s");
-            return nullptr;
-        }
-        lit->release();
-    }
     if (!readDisplay(provider))
         return nullptr;
     return IOFramebuffer::probe(provider, score);
@@ -154,14 +150,34 @@ bool NVFramebuffer::start(IOService *provider)
 {
     if (!aperture_ && !(aperture_ = IODeviceMemory::withRange(phys_, size_)))
         return false;
+    if (!(vblTimer_ = thread_call_allocate_with_options(vblFire, this, THREAD_CALL_PRIORITY_HIGH,
+                                                        THREAD_CALL_OPTIONS_ONCE)))
+        return false;
     if (!IOFramebuffer::start(provider)) {
         LOG("IOFramebuffer::start failed");
         return false;
     }
+    // No registerPowerDriver: IOFramebuffer's power callbacks use its controller, which IOGraphics sets up
+    // later than this; a power change from here panicked in IOFramebuffer::powerStateWillChangeTo on a NULL
+    // controller (2026-10-09). The display's power follows NVBringup's GPU anyway.
+    vblNext_ = mach_absolute_time() + framePeriod();
+    thread_call_enter_delayed(vblTimer_, vblNext_);
     LOG("started on %s: %ux%u @ %u.%02u Hz, pitch %u, surface 0x%llx (%llu bytes), EDID %s", provider->getName(),
         width_, height_,
         refresh() >> 16, ((refresh() & 0xffff) * 100) >> 16, pitch_, phys_, size_, haveEdid_ ? "yes" : "no");
     return true;
+}
+
+void NVFramebuffer::stop(IOService *provider)
+{
+    // The timer stops rearming once vblTimer_ is cleared. It isn't freed: one may still be running, and
+    // waiting for it (thread_call_cancel_wait) is private KPI.
+    if (vblTimer_) {
+        thread_call_t t = vblTimer_;
+        vblTimer_ = nullptr;
+        thread_call_cancel(t);
+    }
+    IOFramebuffer::stop(provider);
 }
 
 void NVFramebuffer::free()
@@ -171,6 +187,24 @@ void NVFramebuffer::free()
         aperture_ = nullptr;
     }
     IOFramebuffer::free();
+}
+
+// One vertical blank: call WindowServer's VBL handler, then rearm a frame later on the same grid.
+void NVFramebuffer::vblFire(thread_call_param_t self, thread_call_param_t)
+{
+    NVFramebuffer *fb = (NVFramebuffer *)self;
+    thread_call_t t = fb->vblTimer_;
+    if (!t)
+        return;
+    if (fb->vbl_.proc && fb->vbl_.enabled)
+        fb->vbl_.proc(fb->vbl_.target, fb->vbl_.ref);
+    if (++fb->vblCount_ == 1)
+        LOG("first vertical blank (timer, %s handler)", fb->vbl_.proc ? "with a" : "no");
+    const uint64_t period = fb->framePeriod(), now = mach_absolute_time();
+    fb->vblNext_ += period;
+    if (fb->vblNext_ <= now)                // fell behind: skip to the next frame from now
+        fb->vblNext_ = now + period;
+    thread_call_enter_delayed(t, fb->vblNext_);
 }
 
 IOReturn NVFramebuffer::enableController()
@@ -302,11 +336,28 @@ IOReturn NVFramebuffer::getTimingInfoForDisplayMode(IODisplayModeID mode, IOTimi
     return kIOReturnSuccess;
 }
 
+// WindowServer's active state: IOFramebuffer keeps it; this only answers when the base class doesn't.
+IOReturn NVFramebuffer::getAttribute(IOSelect attribute, uintptr_t *value)
+{
+    IOReturn r = IOFramebuffer::getAttribute(attribute, value);
+    if (r == kIOReturnUnsupported && attribute == kIOWindowServerActiveAttribute) {
+        if (value)
+            *value = 1;
+        r = kIOReturnSuccess;
+    }
+    return r;
+}
+
+// IOFramebuffer runs power management and asks for each change through kIOPowerAttribute. The display's
+// power follows NVBringup's GPU, so only IOGraphics' notifications are sent, as IOFramebuffer.h asks.
 IOReturn NVFramebuffer::setAttribute(IOSelect attribute, uintptr_t value)
 {
-    if (attribute == kIOPowerAttribute)
-        return kIOReturnSuccess;    // the display's power follows NVBringup's GPU
-    return IOFramebuffer::setAttribute(attribute, value);
+    if (attribute == kIOPowerAttribute) {
+        handleEvent(value ? kIOFBNotifyDidPowerOn : kIOFBNotifyWillPowerOff);
+        return kIOReturnSuccess;
+    }
+    IOReturn r = IOFramebuffer::setAttribute(attribute, value);
+    return (r == kIOReturnUnsupported && attribute == kIOWindowServerActiveAttribute) ? kIOReturnSuccess : r;
 }
 
 IOReturn NVFramebuffer::setGammaTable(UInt32 channelCount, UInt32 dataCount, UInt32 dataWidth, void *data)
@@ -339,6 +390,17 @@ IOReturn NVFramebuffer::getAttributeForConnection(IOIndex connect, IOSelect attr
         if (value)
             *value = 0;
         return kIOReturnSuccess;
+    case kConnectionColorModesSupported:        // RGB, 8 bits per component: what the head sends
+    case kConnectionColorMode:
+        if (value)
+            *value = 1;                 // RGB (kIODisplayColorModeRGB, under #if 0 in the SDK)
+        return kIOReturnSuccess;
+    case kConnectionColorDepthsSupported:
+    case kConnectionControllerColorDepth:
+    case kConnectionControllerDepthsSupported:
+        if (value)
+            *value = kIODisplayRGBColorComponentBits8;
+        return kIOReturnSuccess;
     default:
         return IOFramebuffer::getAttributeForConnection(connect, attribute, value);
     }
@@ -351,6 +413,10 @@ IOReturn NVFramebuffer::setAttributeForConnection(IOIndex connect, IOSelect attr
     switch (attribute) {
     case kConnectionPostWake:
     case kConnectionEnable:
+    case kConnectionPower:
+    case kConnectionColorMode:
+    case kConnectionControllerColorDepth:
+    case kConnectionFlags:
         return kIOReturnSuccess;
     default:
         return IOFramebuffer::setAttributeForConnection(connect, attribute, value);
@@ -372,5 +438,37 @@ IOReturn NVFramebuffer::getDDCBlock(IOIndex connect, UInt32 blockNumber, IOSelec
     const IOByteCount n = *length < sizeof(edid_) ? *length : sizeof(edid_);
     memcpy(data, edid_, n);
     *length = n;
+    return kIOReturnSuccess;
+}
+
+// VBL: called by vblFire at the mode's refresh rate. Connect: kept, but never called (no hot-plug yet).
+IOReturn NVFramebuffer::registerForInterruptType(IOSelect type, IOFBInterruptProc proc, OSObject *target, void *ref,
+                                                 void **interruptRef)
+{
+    Interrupt *i = type == kIOFBVBLInterruptType ? &vbl_ : type == kIOFBConnectInterruptType ? &connect_ : nullptr;
+    if (!i)
+        return kIOReturnUnsupported;
+    i->target = target;
+    i->ref = ref;
+    i->enabled = true;
+    i->proc = proc;
+    if (interruptRef)
+        *interruptRef = i;
+    return kIOReturnSuccess;
+}
+
+IOReturn NVFramebuffer::unregisterInterrupt(void *interruptRef)
+{
+    if (interruptRef != &vbl_ && interruptRef != &connect_)
+        return kIOReturnBadArgument;
+    ((Interrupt *)interruptRef)->proc = nullptr;
+    return kIOReturnSuccess;
+}
+
+IOReturn NVFramebuffer::setInterruptState(void *interruptRef, UInt32 state)
+{
+    if (interruptRef != &vbl_ && interruptRef != &connect_)
+        return kIOReturnBadArgument;
+    ((Interrupt *)interruptRef)->enabled = state != 0;
     return kIOReturnSuccess;
 }

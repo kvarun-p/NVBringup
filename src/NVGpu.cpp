@@ -23,6 +23,8 @@
 #include "nv_uapi.h"
 #include "NVGpuUserClient.hpp"
 
+#include <IOKit/IODeviceTreeSupport.h>
+#include <IOKit/IOKitKeys.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOLocks.h>
 #include <kern/clock.h>
@@ -1181,7 +1183,8 @@ void NVBringup::dispHotplugTick()
         mask |= d.candId[i];
     uint8_t cs[NV0073_CONNECT_SIZE] = {};
     put32(cs, NV0073_CONNECT_displayMask, mask);
-    if (!gspRmControl(g->hClient, g->hDisp, NV0073_CTRL_CMD_SYSTEM_GET_CONNECT_STATE_, cs, sizeof(cs), &st))
+    if (!gspRmControl(g->hClient, g->hDisp, NV0073_CTRL_CMD_SYSTEM_GET_CONNECT_STATE_, cs, sizeof(cs), &st,
+                      true))      // once a second: logged only when it fails
         return;
     memcpy(&conn, cs + NV0073_CONNECT_displayMask, 4);
     uint32_t want = 0, wantProto = 0;
@@ -1238,6 +1241,7 @@ void NVBringup::dispPublish()
     IODeviceMemory *bar1 = pci_ ? pci_->getDeviceMemoryWithIndex(1) : nullptr;
     if (!g || !g->disp.litId || !bar1) {
         removeProperty("NVDisplayFB");
+        dispNubUpdate(nullptr);
         return;
     }
     GspState::DispHw &d = g->disp;
@@ -1250,7 +1254,9 @@ void NVBringup::dispPublish()
             n->release();
         }
     };
-    num("PhysAddr", bar1->getPhysicalAddress() + d.fb.bar1, 64);
+    // The CPU physical address: getPhysicalAddress() goes through the system mapper (VT-d) and gives an I/O
+    // address that is RAM to the CPU. NVFramebuffer handed it to WindowServer as the aperture: kernel panic.
+    num("PhysAddr", bar1->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone) + d.fb.bar1, 64);
     num("Size", d.fb.size, 64);
     num("Width", d.w, 32);
     num("Height", d.h, 32);
@@ -1269,7 +1275,73 @@ void NVBringup::dispPublish()
         e->release();
     }
     setProperty("NVDisplayFB", dict);
+    dispNubUpdate(dict);
     dict->release();
+}
+
+// NVFramebuffer's provider: a nub under NVBringup, published while a display is lit, carrying NVDisplayFB.
+// NVFramebuffer (display/) matches it as soon as it appears, so nothing waits for the modeset, and a
+// replug or unplug replaces or removes it.
+class NVDisplayNub : public IOService {
+    OSDeclareDefaultStructors(NVDisplayNub)
+};
+OSDefineMetaClassAndStructors(NVDisplayNub, IOService)
+
+// NVFramebuffer instead of nvvdisplay: boot-arg nvfb=1, or for one boot the NVRAM variable nvfb-once
+// (`sudo nvram nvfb-once=1`), deleted here the first time a display is lit, so a boot that hangs on the
+// framebuffer is followed by a normal one. Deleted the way `nvram -d` does it, and checked.
+bool NVBringup::fbWanted()
+{
+    if (fbWanted_ >= 0)
+        return fbWanted_ == 1;
+    uint32_t arg = 0;
+    fbWanted_ = PE_parse_boot_argn("nvfb", &arg, sizeof(arg)) && arg ? 1 : 0;
+    IORegistryEntry *opts = fbWanted_ ? nullptr : IORegistryEntry::fromPath("/options", gIODTPlane);
+    OSObject *v = opts ? opts->copyProperty("nvfb-once") : nullptr;
+    if (v) {
+        v->release();
+        fbWanted_ = 1;
+        OSString *name = OSString::withCString("nvfb-once");
+        static const char *const keys[] = { kIONVRAMDeletePropertyKey, kIONVRAMSyncNowPropertyKey };
+        for (const char *key : keys) {
+            OSDictionary *req = name ? OSDictionary::withCapacity(1) : nullptr;
+            if (req) {
+                req->setObject(key, name);
+                opts->setProperties(req);
+                req->release();
+            }
+        }
+        OSSafeReleaseNULL(name);
+        OSObject *left = opts->copyProperty("nvfb-once");
+        LOG("display: nvfb-once: NVFramebuffer for this boot; the variable %s",
+            left ? "could NOT be deleted (run sudo nvram -d nvfb-once)" : "is deleted");
+        OSSafeReleaseNULL(left);
+    }
+    OSSafeReleaseNULL(opts);
+    return fbWanted_ == 1;
+}
+
+void NVBringup::dispNubUpdate(OSDictionary *fb)
+{
+    if (dispNub_) {
+        dispNub_->terminate();
+        OSSafeReleaseNULL(dispNub_);
+    }
+    if (!fb || !fbWanted())
+        return;
+    NVDisplayNub *n = OSTypeAlloc(NVDisplayNub);
+    if (!n || !n->init()) {
+        OSSafeReleaseNULL(n);
+        return;
+    }
+    n->setProperty("NVDisplayFB", fb);
+    if (!n->attach(this)) {
+        n->release();
+        return;
+    }
+    n->registerService();
+    dispNub_ = n;
+    LOG("display: published NVDisplayNub for NVFramebuffer");
 }
 
 // NVMAC_DISPLAY_FLIP: window 0 to the other buffer, applied by the display engine at the next vblank
@@ -1713,7 +1785,7 @@ bool NVBringup::initBar1()
     if (!g->bar1Heap || !nv_vram_init(g->bar1Heap, 0x1000000, len - 1))
         return false;
     g->bar1Aperture = len;
-    g->bar1Phys = bar1->getPhysicalAddress();
+    g->bar1Phys = bar1->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);    // CPU physical, not the mapper's
     LOG("GSP: BAR1 window for CPU mappings: 0x1000000..0x%llx of %llu MiB at phys 0x%llx",
         (unsigned long long)(len - 1), (unsigned long long)(len >> 20), (unsigned long long)g->bar1Phys);
 

@@ -47,26 +47,22 @@ An IOFramebuffer for the display NVBringup lights, so macOS sees the NVIDIA GPU'
 screen. NVBringup does the modeset over GSP-RM (boot-arg `nvdisp=2`) and scans out one pitch-linear
 X8R8G8B8 surface in VRAM. This driver hands that surface to IOGraphics as the aperture (its physical
 BAR1 range), with the one mode it was lit at, and the sink's EDID over DDC. There's no acceleration:
-WindowServer draws into the aperture with the CPU.
+WindowServer draws into the aperture with the CPU. The vertical blank comes from a timer at the mode's refresh rate.
 
-- It attaches to IOResources and matches the `NVDisplayLit` resource. NVBringup published that resource after a
-  modeset that scans out, but since hot-plug it no longer does, so this kext doesn't start. It sits outside the GPU's
-  PCI device for the same reason as NVMetalAccel (`accel/README.md`).
-- NVBringup's `NVDisplayFB` property carries everything it needs: the physical address and size of the surface,
+- It matches `NVDisplayNub`, which NVBringup publishes under itself (so under the GPU's PCI device, where
+  GPUWrangler looks) while a display is lit, and only with boot-arg `nvfb=1` or, for one boot, the NVRAM variable
+  `nvfb-once` (`sudo nvram nvfb-once=1`; NVBringup deletes it when it lights the display). Uninstall nvvdisplay first.
+- The nub's `NVDisplayFB` property carries everything it needs: the physical address and size of the surface,
   the mode, and the EDID. The two kexts share no symbols.
 - `make verify` checks all of NVFramebuffer's vtable slots against the kernel's IOFramebuffer. Run it after a macOS
   update. `make check` resolves the kext's symbols against the running kernel.
 
-What happened on hardware (2026-10-06):
+On hardware (2026-10-09) WindowServer opens it as an unaccelerated display, then CoreDisplay looks for its display
+pipe every frame (`Unable to find display pipe for IOFB service`) and its compositor stops within a minute, the
+internal panel's too. It needs an accelerator with a display pipe on the NVIDIA GPU. The earlier attempts and the
+bugs found on the way are in [docs/display.md](../docs/display.md).
 
-- On IOResources (the default), it starts at 1920x1080, 60 Hz, with the EDID, but WindowServer's GPUWrangler never
-  lists it. GPUWrangler collects framebuffers through a GPU's PCI device or accelerator.
-- Under the NVIDIA PCI device (boot-arg `nvfb=1`), GPUWrangler registers the NVIDIA GPU as a discrete GPU with this
-  framebuffer, and boot hangs at the Apple logo. A display GPU needs its own Metal display pipeline (IOAccelDisplayPipe),
-  as the accelerator test in `accel/README.md` also showed.
-
-It never supported mode changes, hot-plug, gamma, or sleep and wake (nvvdisplay handles the last three).
-The design and the findings are in [docs/display.md](../docs/display.md).
+It never supported mode changes, gamma, or sleep and wake (nvvdisplay handles the last).
 
 Loading: IOGraphicsFamily is in the system kernel collection, so OpenCore can't inject this kext. It has to go in the
 auxiliary collection, the same way as NVMetalAccel:
@@ -77,5 +73,5 @@ sudo chown -R root:wheel /Library/Extensions/NVFramebuffer.kext
 sudo kmutil load -p /Library/Extensions/NVFramebuffer.kext   # approve in System Settings → Privacy & Security
 ```
 
-Reboot. With the monitor connected and `nvdisp=2`, `kmutil showloaded | grep nvframebuffer` should list it and
-`ioreg -c NVFramebuffer` should show it.
+Then `sudo nvram nvfb-once=1` and reboot with the monitor connected and `nvdisp=2`: `ioreg -c NVFramebuffer` should
+show it on `NVDisplayNub`.

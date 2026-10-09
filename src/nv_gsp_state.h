@@ -144,6 +144,7 @@ struct NVBringup::GspState {
     uint32_t txSeq = 2;             // SET_SYSTEM_INFO and SET_REGISTRY were 0 and 1
     uint32_t waitFunction = 0, waitResult = 0;  // reply awaited by waitGspReply
     bool     waitDone = false;
+    bool     waitQuiet = false;             // a successful reply isn't logged (quiet controls)
     uint8_t *waitBuf = nullptr;                 // optional copy of the reply payload
     uint32_t waitCap = 0, waitLen = 0;
     uint32_t hClient = 0, hDevice = 0, hSubdevice = 0;  // our RM objects (Phase 4)

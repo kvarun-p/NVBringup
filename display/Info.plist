@@ -20,42 +20,19 @@
 	<string>0.1.0</string>
 	<key>IOKitPersonalities</key>
 	<dict>
+		<!-- NVBringup publishes an NVDisplayNub under itself (so under the GPU's PCI device, where WindowServer's
+		     GPUWrangler looks for a GPU's framebuffers) while a display is lit, and only with boot-arg nvfb=1
+		     or, for one boot, the NVRAM variable nvfb-once. The nub carries NVDisplayFB. -->
 		<key>NVFramebuffer</key>
 		<dict>
 			<key>CFBundleIdentifier</key>
 			<string>io.github.kvarun-p.nvframebuffer</string>
 			<key>IOClass</key>
 			<string>NVFramebuffer</string>
-			<!-- On IOResources, not on the GPU's PCI device (see accel/README.md: WindowServer's
-			     GPUWrangler adopts a PCI GPU it finds graphics services under). NVBringup publishes
-			     the NVDisplayLit resource only after a modeset that scans out (boot-arg nvdisp=2). -->
 			<key>IOProviderClass</key>
-			<string>IOResources</string>
-			<key>IOResourceMatch</key>
-			<string>NVDisplayLit</string>
+			<string>NVDisplayNub</string>
 			<key>IOMatchCategory</key>
-			<string>NVFramebuffer</string>
-			<key>IOProbeScore</key>
-			<integer>1000</integer>
-		</dict>
-		<!-- Under the GPU's PCI device instead (boot-arg nvfb=1): where WindowServer's GPUWrangler looks for a
-		     GPU's framebuffers. probe() takes exactly one of the two personalities. -->
-		<key>NVFramebufferPCI</key>
-		<dict>
-			<key>CFBundleIdentifier</key>
-			<string>io.github.kvarun-p.nvframebuffer</string>
-			<key>IOClass</key>
-			<string>NVFramebuffer</string>
-			<key>IOProviderClass</key>
-			<string>IOPCIDevice</string>
-			<key>IOPCIMatch</key>
-			<string>0x000010de&amp;0x0000ffff</string>
-			<!-- No IOResourceMatch: a PCI device is matched only once, when these personalities arrive,
-			     possibly before the modeset. probe() waits for NVDisplayLit instead. -->
-			<key>IOMatchCategory</key>
-			<string>NVFramebuffer</string>
-			<key>IOProbeScore</key>
-			<integer>1000</integer>
+			<string>IOFramebuffer</string>
 		</dict>
 	</dict>
 	<key>OSBundleLibraries</key>

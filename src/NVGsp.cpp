@@ -452,7 +452,8 @@ int NVBringup::handleGspMessage(const GSP_MSG_QUEUE_ELEMENT *e, const uint8_t *p
         g->waitLen = len < g->waitCap ? len : g->waitCap;
         if (g->waitBuf)
             memcpy(g->waitBuf, p, g->waitLen);
-        LOG("GSP: reply to 0x%x: result 0x%x", e->rpc.function, e->rpc.rpc_result);
+        if (!g->waitQuiet || e->rpc.rpc_result)
+            LOG("GSP: reply to 0x%x: result 0x%x", e->rpc.function, e->rpc.rpc_result);
         return 0;
     }
     switch (e->rpc.function) {
@@ -1068,9 +1069,11 @@ bool NVBringup::gspRmControl(uint32_t hClient, uint32_t hObject, uint32_t cmd,
     if (size)
         memcpy(buf + sizeof(c), params, size);
     uint32_t res = 0, len = 0;
+    gsp_->waitQuiet = quiet;
     bool ok = sendGspRpc(NV_VGPU_MSG_FUNCTION_GSP_RM_CONTROL, buf, total) &&
               waitGspReply(NV_VGPU_MSG_FUNCTION_GSP_RM_CONTROL, 5000, &res, buf, total, &len) &&
               len >= total;
+    gsp_->waitQuiet = false;
     uint32_t st = ok ? ((rpc_gsp_rm_control_v03_00 *)buf)->status : 0xffffffff;
     *status = res ? (st ? st : res) : 0;
     if (ok && res == 0 && size)
