@@ -9,7 +9,8 @@ import kclib
 OURS = {'NVMetalAccelerator': ('IOGraphicsAccelerator2', 'AppleParavirtAccelerator'),
         'NVMetalEventMachine': ('IOAccelEventMachineFast2', 'AppleParavirtEventMachine'),
         'NVMetalTask': ('IOAccelTask', 'AppleParavirtTask'),
-        'NVMetalDisplayMachine': ('IOAccelDisplayMachine', 'AppleParavirtDisplayMachine')}
+        'NVMetalDisplayMachine': ('IOAccelDisplayMachine', 'AppleParavirtDisplayMachine'),
+        'NVDisplayPipe': ('IOAccelDisplayPipe', 'AppleParavirtDisplayPipe')}
 
 def qualname(s):
     """'bool IOService::start(IOService *) const' -> ('IOService', 'start', 'IOService*')"""

@@ -35,12 +35,48 @@
 			<string>IOKit</string>
 			<key>IOMatchCategory</key>
 			<string>IOAccelerator</string>
+			<!-- Refused while NVBringup's NVDisplayPipeArmed is set (probe()): the display-pipe personality below
+			     then owns the GPU. -->
 			<!-- What Metal.framework loads for this accelerator: NVMetal.bundle, principal class
 			     NVMetalDevice (a subclass of MTLIOAccelDevice). -->
 			<key>MetalPluginName</key>
 			<string>NVMetal</string>
 			<key>MetalPluginClassName</key>
 			<string>NVMetalDevice</string>
+			<key>IOProbeScore</key>
+			<integer>1000</integer>
+		</dict>
+		<!-- S1 display pipe (boot-arg nvdpipe=1, or the nvdpipe-once NVRAM gate, which NVBringup arms): the GPU's
+		     PCI device, so NVBringup's NVDisplayNub and NVFramebuffer sit at depth <= 2 under it (S0-1). Starts
+		     only while NVBringup on this device has NVDisplayPipeArmed = true (probe()). Probe score 1000 is well
+		     below NVBringup's 30000, so NVBringup has started and set the gate first.
+		     No MetalPluginName / MetalPluginClassName here: S1 runs without Metal (S2 adds them). -->
+		<key>NVMetalDisplayPipe</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>io.github.kvarun-p.nvmetalaccel</string>
+			<key>IOClass</key>
+			<string>NVMetalAccelerator</string>
+			<key>IOProviderClass</key>
+			<string>IOPCIDevice</string>
+			<!-- NVIDIA (0x10de), any device -->
+			<key>IOPCIMatch</key>
+			<string>0x000010de&amp;0x0000ffff</string>
+			<!-- display controllers (class 0x03) -->
+			<key>IOPCIClassMatch</key>
+			<string>0x03000000&amp;0xff000000</string>
+			<key>IOMatchCategory</key>
+			<string>IOAccelerator</string>
+			<key>IOAccelRevision</key>
+			<integer>2</integer>
+			<!-- read by IOAcceleratorFamily2's copyCapabilities; IOPresentment refuses the pipe without it -->
+			<key>IOAccelDisplayPipeCapabilities</key>
+			<dict>
+				<key>DisplayPipeSupported</key>
+				<true/>
+				<key>TransactionsSupported</key>
+				<true/>
+			</dict>
 			<key>IOProbeScore</key>
 			<integer>1000</integer>
 		</dict>

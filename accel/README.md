@@ -7,12 +7,33 @@ driver (as Navi48-MacOS's Navi48Accel does). The bundle side (NVMetal.bundle, `N
 is nvmetal, built with NVK from nvbringup-mesa (branch `main`) and installed on the system volume by
 `tools/nvmetal_root_install.sh`; installation is step 7 of the top-level README.
 
-- Attaches to IOResources (category `IOAccelerator`) when NVBringup is present; off unless boot-arg `nvaccel=1`. Not under the GPU's PCI device: WindowServer's GPUWrangler adopts a PCI GPU that has an accelerator as a display GPU, and the screen went black.
+Two personalities (`probe()` picks one):
+
+- **IOResources** (`nvaccel=1`): Metal only, as before. Refused while NVBringup's `NVDisplayPipeArmed` is set.
+- **IOPCIDevice, `NVMetalDisplayPipe`** (S1, display pipe, no Metal plugin): on the GPU's PCI device, only while
+  NVBringup on that device has `NVDisplayPipeArmed = true`. Its IOAccelDisplayPipe binds NVBringup's
+  NVFramebuffer (a client of the same device's NVDisplayNub, at most two levels down) and copies plane 0 of
+  each WindowServer transaction into the scanout by CPU:
+  - `validateTransaction`: plane 0 must be a `'BGRA'` IOSurface.
+  - `submitTransaction`: copies the dirty rect (whole surface if empty or invalid), clamped to the smaller of
+    surface and framebuffer, into the framebuffer's system aperture (write-combined). Completion is
+    synchronous: `isTransactionComplete` reports it, then `signalTransactionInterrupt` kicks the family.
+  - Setup: `enableAccelerator()` (accel+3192), accel+3528 set (every transaction completes inside submit), the
+    config flag accel+3279 for the display-pipe user client, and a publish notification that binds the
+    framebuffer once on its own work loop with `found_framebuffer`. The pipe count must grow or the bind fails.
+  - Counters, as registry properties of the accelerator: `NVPipeSubmits`, `NVPipeCompletes`, `NVPipeErrors`,
+    `NVPipeLastError`, `NVPipeBound`.
+  - Its probe score (1000) sits below NVBringup's (30000), so NVBringup has started and set the gate first.
+- Not under the GPU's PCI device in the Metal-only personality: GPUWrangler adopts a PCI GPU that has an
+  accelerator as a display GPU, and the screen went black. The S1 personality accepts that trade-off by design.
 - `src/IOAccelFamily2_decl.h` declares the family's classes in this macOS's vtable order. It is generated
   from the kernel collections (`make decl`, needs `/opt/local/libexec/llvm-20/bin/llvm-mc`) and must be
-  regenerated after a macOS update; `probe()` refuses if the family's class sizes changed.
-- `make verify` checks all 780 vtable slots of our four classes against the kernel's; `make check`
-  resolves the kext's symbols against the running kernel.
+  regenerated after a macOS update. It covers the classes we subclass or call (accelerator, machine, pipe,
+  framebuffer slots 309/317/318), plus non-virtual getters of IOSurface and the transaction. `probe()`
+  refuses if a family class size changed.
+- `make verify` checks the vtable slots of our five classes against the kernel's and that the committed
+  header is what `gen_decl.py` produces now; `make check` resolves the kext's symbols against the running
+  kernel.
 
 Loading: IOAcceleratorFamily2 is in the system kernel collection, so OpenCore can't inject this kext; it
 has to go in the auxiliary collection (`/Library/Extensions`, approved in System Settings, then a reboot),

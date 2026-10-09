@@ -1241,7 +1241,7 @@ void NVBringup::dispPublish()
     IODeviceMemory *bar1 = pci_ ? pci_->getDeviceMemoryWithIndex(1) : nullptr;
     if (!g || !g->disp.litId || !bar1) {
         removeProperty("NVDisplayFB");
-        dispNubUpdate(nullptr);
+        dispNubWant(nullptr);
         return;
     }
     GspState::DispHw &d = g->disp;
@@ -1275,13 +1275,13 @@ void NVBringup::dispPublish()
         e->release();
     }
     setProperty("NVDisplayFB", dict);
-    dispNubUpdate(dict);
+    dispNubWant(dict);
     dict->release();
 }
 
-// NVFramebuffer's provider: a nub under NVBringup, published while a display is lit, carrying NVDisplayFB.
-// NVFramebuffer (display/) matches it as soon as it appears, so nothing waits for the modeset, and a
-// replug or unplug replaces or removes it.
+// NVFramebuffer's provider: a nub under the GPU's PCI device (NVBringup's provider), so NVFramebuffer is a client
+// at depth 2 of it. Published while a display is lit, carrying NVDisplayFB. NVFramebuffer (display/) matches it
+// as soon as it appears, so nothing waits for the modeset, and a replug or unplug replaces or removes it.
 class NVDisplayNub : public IOService {
     OSDeclareDefaultStructors(NVDisplayNub)
 };
@@ -1289,59 +1289,120 @@ OSDefineMetaClassAndStructors(NVDisplayNub, IOService)
 
 // NVFramebuffer instead of nvvdisplay: boot-arg nvfb=1, or for one boot the NVRAM variable nvfb-once
 // (`sudo nvram nvfb-once=1`), deleted here the first time a display is lit, so a boot that hangs on the
-// framebuffer is followed by a normal one. Deleted the way `nvram -d` does it, and checked.
+// framebuffer is followed by a normal one. The display pipe gate (dispPipeArmed_) wants it too.
 bool NVBringup::fbWanted()
 {
     if (fbWanted_ >= 0)
         return fbWanted_ == 1;
     uint32_t arg = 0;
-    fbWanted_ = PE_parse_boot_argn("nvfb", &arg, sizeof(arg)) && arg ? 1 : 0;
-    IORegistryEntry *opts = fbWanted_ ? nullptr : IORegistryEntry::fromPath("/options", gIODTPlane);
-    OSObject *v = opts ? opts->copyProperty("nvfb-once") : nullptr;
-    if (v) {
-        v->release();
+    fbWanted_ = ((PE_parse_boot_argn("nvfb", &arg, sizeof(arg)) && arg) || dispPipeArmed_) ? 1 : 0;
+    if (!fbWanted_ && nvramOneShot("nvfb-once"))
         fbWanted_ = 1;
-        OSString *name = OSString::withCString("nvfb-once");
-        static const char *const keys[] = { kIONVRAMDeletePropertyKey, kIONVRAMSyncNowPropertyKey };
-        for (const char *key : keys) {
-            OSDictionary *req = name ? OSDictionary::withCapacity(1) : nullptr;
-            if (req) {
-                req->setObject(key, name);
-                opts->setProperties(req);
-                req->release();
-            }
-        }
-        OSSafeReleaseNULL(name);
-        OSObject *left = opts->copyProperty("nvfb-once");
-        LOG("display: nvfb-once: NVFramebuffer for this boot; the variable %s",
-            left ? "could NOT be deleted (run sudo nvram -d nvfb-once)" : "is deleted");
-        OSSafeReleaseNULL(left);
-    }
-    OSSafeReleaseNULL(opts);
     return fbWanted_ == 1;
 }
 
-void NVBringup::dispNubUpdate(OSDictionary *fb)
+// An NVRAM one-shot: read once, and if it is set, deleted here and checked. The delete is the one `nvram -d`
+// does: setProperty(kIONVRAMDeletePropertyKey) doesn't delete, setProperties() with it and
+// kIONVRAMSyncNowPropertyKey does. True if the variable was set, which makes it apply to this boot only.
+bool NVBringup::nvramOneShot(const char *name)
 {
-    if (dispNub_) {
-        dispNub_->terminate();
-        OSSafeReleaseNULL(dispNub_);
+    IORegistryEntry *opts = IORegistryEntry::fromPath("/options", gIODTPlane);
+    OSObject *v = opts ? opts->copyProperty(name) : nullptr;
+    if (!v) {
+        OSSafeReleaseNULL(opts);
+        return false;
     }
-    if (!fb || !fbWanted())
-        return;
-    NVDisplayNub *n = OSTypeAlloc(NVDisplayNub);
-    if (!n || !n->init()) {
-        OSSafeReleaseNULL(n);
-        return;
+    v->release();
+    OSString *key = OSString::withCString(name);
+    static const char *const keys[] = { kIONVRAMDeletePropertyKey, kIONVRAMSyncNowPropertyKey };
+    for (const char *k : keys) {
+        OSDictionary *req = key ? OSDictionary::withCapacity(1) : nullptr;
+        if (req) {
+            req->setObject(k, key);
+            opts->setProperties(req);
+            req->release();
+        }
     }
-    n->setProperty("NVDisplayFB", fb);
-    if (!n->attach(this)) {
-        n->release();
-        return;
+    OSSafeReleaseNULL(key);
+    OSObject *left = opts->copyProperty(name);
+    if (left) {
+        LOG("nvram %s: set, for this boot; the variable could NOT be deleted (run sudo nvram -d %s)", name, name);
+    } else {
+        LOG("nvram %s: set, for this boot; the variable is deleted", name);
     }
-    n->registerService();
-    dispNub_ = n;
-    LOG("display: published NVDisplayNub for NVFramebuffer");
+    OSSafeReleaseNULL(left);
+    OSSafeReleaseNULL(opts);
+    return true;
+}
+
+// Records the nub's state for dispNubSync: fb is the lit display's NVDisplayFB, nullptr none. Caller holds gspLock_.
+void NVBringup::dispNubWant(OSDictionary *fb)
+{
+    if (fb)
+        fb->retain();
+    OSSafeReleaseNULL(dispWant_);
+    dispWant_ = fb;
+    dispWantGen_++;
+}
+
+// Brings dispNub_ to the newest state recorded by dispNubWant. Callers have released gspLock_: registerService()
+// and terminate() run IORegistry matching and the clients' start() and stop() on this thread, and a client that
+// calls back into NVBringup (through a user client, or the IOAccelerator family's gate) takes gspLock_, which
+// deadlocks if it is held here. dispNubLock_ orders the applies; each one catches up to the newest generation,
+// so a rapid unplug and replug ends on the last state.
+void NVBringup::dispNubSync()
+{
+    if (!dispNubLock_ || !gspLock_)
+        return;
+    IOLockLock(dispNubLock_);
+    for (;;) {
+        IOLockLock(gspLock_);
+        OSDictionary *want = dispWant_;
+        const uint32_t gen = dispWantGen_;
+        if (want)
+            want->retain();
+        IOLockUnlock(gspLock_);
+        if (gen == dispNubGen_) {
+            OSSafeReleaseNULL(want);
+            break;
+        }
+        if (dispNub_) {
+            dispNub_->terminate();
+            OSSafeReleaseNULL(dispNub_);
+        }
+        if (want && pci_ && fbWanted()) {
+            NVDisplayNub *n = OSTypeAlloc(NVDisplayNub);
+            if (n && !n->init())
+                OSSafeReleaseNULL(n);
+            if (n) {
+                n->setProperty("NVDisplayFB", want);
+                if (dispPipeArmed_)
+                    n->setProperty("NVDisplayPipeArmed", kOSBooleanTrue);
+                if (n->attach(pci_)) {
+                    n->registerService();
+                    dispNub_ = n;
+                    LOG("display: published NVDisplayNub for NVFramebuffer");
+                } else {
+                    n->release();
+                }
+            }
+        }
+        dispNubGen_ = gen;
+        OSSafeReleaseNULL(want);
+    }
+    IOLockUnlock(dispNubLock_);
+}
+
+// shutdownHw (stop, or didTerminate when the PCI device goes). The nub is a client of the PCI device, not of
+// NVBringup, so nothing terminates it with us: it goes here, before the device is closed.
+void NVBringup::dispNubStop()
+{
+    if (gspLock_) {
+        IOLockLock(gspLock_);
+        dispNubWant(nullptr);
+        IOLockUnlock(gspLock_);
+    }
+    dispNubSync();
 }
 
 // NVMAC_DISPLAY_FLIP: window 0 to the other buffer, applied by the display engine at the next vblank

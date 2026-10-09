@@ -12,6 +12,7 @@
 // refresh rate, not from the display engine.
 
 #include <IOKit/IOLib.h>
+#include <IOKit/IOLocks.h>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/graphics/IOFramebuffer.h>
 #include <kern/thread_call.h>
@@ -41,14 +42,21 @@ class NVFramebuffer : public IOFramebuffer {
     uint32_t syncFlags_ = 0;            // bit 0: hsync negative, bit 1: vsync negative
     uint8_t edid_[128] = {};
     bool haveEdid_ = false;
-    Interrupt vbl_, connect_;
-    thread_call_t vblTimer_ = nullptr;
-    uint64_t vblNext_ = 0;              // absolute time of the next vertical blank
-    uint64_t vblCount_ = 0;
+    Interrupt vbl_, connect_;           // guarded by vblLock_
+    thread_call_t vblCall_ = nullptr;   // allocated in start, freed in free; armed while vblActive_
+    IOSimpleLock *vblLock_ = nullptr;   // guards vbl_, connect_, vblActive_, vblBusy_, vblNext_, vblLast_
+    bool vblActive_ = false;            // the timer rearms only while this is set
+    int vblBusy_ = 0;                   // vblFire calls past their entry check (stop waits for them to leave)
+    uint64_t vblNext_ = 0;              // absolute deadline of the next vertical blank
+    uint64_t vblLast_ = 0;              // deadline of the last vertical blank fired, for getVBLTime
+    uint64_t vblCount_ = 0;             // vertical blanks fired by the timer (published as NVFBVblanks)
+    uint64_t vblPublishAt_ = 0;         // absolute time after which NVFBVblanks is published again
 
     bool readDisplay(IOService *provider);
     IOFixed1616 refresh() const;
     uint64_t framePeriod() const;
+    void publishTiming();
+    void publishVblanks();
     static void vblFire(thread_call_param_t self, thread_call_param_t);
 
 public:
@@ -61,6 +69,7 @@ public:
     bool isConsoleDevice() override;
     IODeviceMemory *getApertureRange(IOPixelAperture aperture) override;
     IODeviceMemory *getVRAMRange() override;
+    void getVBLTime(AbsoluteTime *time, AbsoluteTime *delta) override;
     const char *getPixelFormats() override;
     IOItemCount getDisplayModeCount() override;
     IOReturn getDisplayModes(IODisplayModeID *allDisplayModes) override;
@@ -150,8 +159,10 @@ bool NVFramebuffer::start(IOService *provider)
 {
     if (!aperture_ && !(aperture_ = IODeviceMemory::withRange(phys_, size_)))
         return false;
-    if (!(vblTimer_ = thread_call_allocate_with_options(vblFire, this, THREAD_CALL_PRIORITY_HIGH,
-                                                        THREAD_CALL_OPTIONS_ONCE)))
+    if (!vblLock_ && !(vblLock_ = IOSimpleLockAlloc()))      // before the base start: it may register VBL
+        return false;
+    if (!vblCall_ && !(vblCall_ = thread_call_allocate_with_options(vblFire, this, THREAD_CALL_PRIORITY_HIGH,
+                                                                    THREAD_CALL_OPTIONS_ONCE)))
         return false;
     if (!IOFramebuffer::start(provider)) {
         LOG("IOFramebuffer::start failed");
@@ -160,8 +171,14 @@ bool NVFramebuffer::start(IOService *provider)
     // No registerPowerDriver: IOFramebuffer's power callbacks use its controller, which IOGraphics sets up
     // later than this; a power change from here panicked in IOFramebuffer::powerStateWillChangeTo on a NULL
     // controller (2026-10-09). The display's power follows NVBringup's GPU anyway.
-    vblNext_ = mach_absolute_time() + framePeriod();
-    thread_call_enter_delayed(vblTimer_, vblNext_);
+    publishTiming();
+    publishVblanks();
+    const uint64_t now = mach_absolute_time();
+    IOSimpleLockLock(vblLock_);
+    vblNext_ = now + framePeriod();
+    vblActive_ = true;
+    IOSimpleLockUnlock(vblLock_);
+    thread_call_enter_delayed(vblCall_, vblNext_);
     LOG("started on %s: %ux%u @ %u.%02u Hz, pitch %u, surface 0x%llx (%llu bytes), EDID %s", provider->getName(),
         width_, height_,
         refresh() >> 16, ((refresh() & 0xffff) * 100) >> 16, pitch_, phys_, size_, haveEdid_ ? "yes" : "no");
@@ -170,18 +187,33 @@ bool NVFramebuffer::start(IOService *provider)
 
 void NVFramebuffer::stop(IOService *provider)
 {
-    // The timer stops rearming once vblTimer_ is cleared. It isn't freed: one may still be running, and
-    // waiting for it (thread_call_cancel_wait) is private KPI.
-    if (vblTimer_) {
-        thread_call_t t = vblTimer_;
-        vblTimer_ = nullptr;
-        thread_call_cancel(t);
+    // Stop rearming first, then cancel the pending call. A vblFire already past its entry check (vblBusy_)
+    // may still be calling the handler; wait for it to leave before the object can go.
+    IOSimpleLockLock(vblLock_);
+    vblActive_ = false;
+    IOSimpleLockUnlock(vblLock_);
+    thread_call_cancel(vblCall_);
+    for (;;) {
+        IOSimpleLockLock(vblLock_);
+        const bool busy = vblBusy_ != 0;
+        IOSimpleLockUnlock(vblLock_);
+        if (!busy)
+            break;
+        IOSleep(1);
     }
     IOFramebuffer::stop(provider);
 }
 
 void NVFramebuffer::free()
 {
+    if (vblCall_) {
+        thread_call_free(vblCall_);     // not pending: stop cancelled it and waited out vblFire
+        vblCall_ = nullptr;
+    }
+    if (vblLock_) {
+        IOSimpleLockFree(vblLock_);
+        vblLock_ = nullptr;
+    }
     if (aperture_) {
         aperture_->release();
         aperture_ = nullptr;
@@ -189,22 +221,84 @@ void NVFramebuffer::free()
     IOFramebuffer::free();
 }
 
-// One vertical blank: call WindowServer's VBL handler, then rearm a frame later on the same grid.
+// One vertical blank, at its deadline: call the family's VBL handler, then rearm the next deadline on the same
+// grid (absolute times, so no drift). A late wakeup skips to a frame from now rather than firing in a burst.
 void NVFramebuffer::vblFire(thread_call_param_t self, thread_call_param_t)
 {
     NVFramebuffer *fb = (NVFramebuffer *)self;
-    thread_call_t t = fb->vblTimer_;
-    if (!t)
+    IOSimpleLockLock(fb->vblLock_);
+    if (!fb->vblActive_) {
+        IOSimpleLockUnlock(fb->vblLock_);
         return;
-    if (fb->vbl_.proc && fb->vbl_.enabled)
-        fb->vbl_.proc(fb->vbl_.target, fb->vbl_.ref);
-    if (++fb->vblCount_ == 1)
-        LOG("first vertical blank (timer, %s handler)", fb->vbl_.proc ? "with a" : "no");
+    }
+    fb->vblBusy_++;
+    const uint64_t deadline = fb->vblNext_;
+    const IOFBInterruptProc proc = fb->vbl_.enabled ? fb->vbl_.proc : nullptr;
+    OSObject *target = fb->vbl_.target;
+    void *ref = fb->vbl_.ref;
+    IOSimpleLockUnlock(fb->vblLock_);
+
+    if (proc)
+        proc(target, ref);
     const uint64_t period = fb->framePeriod(), now = mach_absolute_time();
-    fb->vblNext_ += period;
-    if (fb->vblNext_ <= now)                // fell behind: skip to the next frame from now
-        fb->vblNext_ = now + period;
-    thread_call_enter_delayed(t, fb->vblNext_);
+    if (++fb->vblCount_ == 1)
+        LOG("first vertical blank (timer, %s handler)", proc ? "with a" : "no");
+    if (now >= fb->vblPublishAt_) {                     // about once a second: no registry churn per frame
+        fb->publishVblanks();
+        uint64_t second = 0;
+        nanoseconds_to_absolutetime(1000000000ULL, &second);
+        fb->vblPublishAt_ = now + second;
+    }
+
+    uint64_t next = deadline + period;
+    if (next <= now)                                    // fell behind: skip to the next frame from now
+        next = now + period;
+    IOSimpleLockLock(fb->vblLock_);
+    fb->vblLast_ = deadline;
+    fb->vblNext_ = next;
+    if (fb->vblActive_)
+        thread_call_enter_delayed(fb->vblCall_, next);
+    fb->vblBusy_--;
+    IOSimpleLockUnlock(fb->vblLock_);                   // the last touch: stop may free fb once this returns
+}
+
+// The framebuffer's VBL time and frame period, from the timer's own deadlines.
+void NVFramebuffer::getVBLTime(AbsoluteTime *time, AbsoluteTime *delta)
+{
+    uint64_t last = 0;
+    if (vblLock_) {
+        IOSimpleLockLock(vblLock_);
+        last = vblLast_;
+        IOSimpleLockUnlock(vblLock_);
+    }
+    if (time)
+        *time = last;
+    if (delta)
+        *delta = framePeriod();
+}
+
+// The pixel count and clock the family's pipe reads (IOFBCurrentPixelCount, IOFBCurrentPixelClock, in its
+// displayModeDidChange). IOGraphics doesn't publish them, so the framebuffer does: pixel count = htotal x
+// vtotal, clock in Hz. From these the pipe's frame period is count x 1e9 / clock.
+void NVFramebuffer::publishTiming()
+{
+    const UInt64 count = (UInt64)htotal_ * vtotal_, clock = (UInt64)pclkKhz_ * 1000;
+    if (OSNumber *n = OSNumber::withNumber(count, 32)) {
+        setProperty("IOFBCurrentPixelCount", (OSObject *)n);
+        n->release();
+    }
+    if (OSNumber *n = OSNumber::withNumber(clock, 32)) {
+        setProperty("IOFBCurrentPixelClock", (OSObject *)n);
+        n->release();
+    }
+}
+
+void NVFramebuffer::publishVblanks()
+{
+    if (OSNumber *n = OSNumber::withNumber(vblCount_, 64)) {
+        setProperty("NVFBVblanks", (OSObject *)n);
+        n->release();
+    }
 }
 
 IOReturn NVFramebuffer::enableController()
@@ -302,7 +396,10 @@ IOReturn NVFramebuffer::getCurrentDisplayMode(IODisplayModeID *mode, IOIndex *de
 
 IOReturn NVFramebuffer::setDisplayMode(IODisplayModeID mode, IOIndex depth)
 {
-    return (mode == kMode && depth == 0) ? kIOReturnSuccess : kIOReturnUnsupported;
+    if (mode != kMode || depth != 0)
+        return kIOReturnUnsupported;
+    publishTiming();                // the one mode, republished as the pipe reads it on each mode change
+    return kIOReturnSuccess;
 }
 
 IOReturn NVFramebuffer::getStartupDisplayMode(IODisplayModeID *mode, IOIndex *depth)
@@ -448,10 +545,14 @@ IOReturn NVFramebuffer::registerForInterruptType(IOSelect type, IOFBInterruptPro
     Interrupt *i = type == kIOFBVBLInterruptType ? &vbl_ : type == kIOFBConnectInterruptType ? &connect_ : nullptr;
     if (!i)
         return kIOReturnUnsupported;
+    if (!vblLock_)
+        return kIOReturnNotReady;
+    IOSimpleLockLock(vblLock_);
     i->target = target;
     i->ref = ref;
     i->enabled = true;
     i->proc = proc;
+    IOSimpleLockUnlock(vblLock_);
     if (interruptRef)
         *interruptRef = i;
     return kIOReturnSuccess;
@@ -461,7 +562,15 @@ IOReturn NVFramebuffer::unregisterInterrupt(void *interruptRef)
 {
     if (interruptRef != &vbl_ && interruptRef != &connect_)
         return kIOReturnBadArgument;
-    ((Interrupt *)interruptRef)->proc = nullptr;
+    if (!vblLock_)
+        return kIOReturnNotReady;
+    Interrupt *i = (Interrupt *)interruptRef;
+    IOSimpleLockLock(vblLock_);
+    i->proc = nullptr;
+    i->target = nullptr;
+    i->ref = nullptr;
+    i->enabled = false;
+    IOSimpleLockUnlock(vblLock_);
     return kIOReturnSuccess;
 }
 
@@ -469,6 +578,10 @@ IOReturn NVFramebuffer::setInterruptState(void *interruptRef, UInt32 state)
 {
     if (interruptRef != &vbl_ && interruptRef != &connect_)
         return kIOReturnBadArgument;
+    if (!vblLock_)
+        return kIOReturnNotReady;
+    IOSimpleLockLock(vblLock_);
     ((Interrupt *)interruptRef)->enabled = state != 0;
+    IOSimpleLockUnlock(vblLock_);
     return kIOReturnSuccess;
 }

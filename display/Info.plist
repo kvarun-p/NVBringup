@@ -20,9 +20,12 @@
 	<string>0.1.0</string>
 	<key>IOKitPersonalities</key>
 	<dict>
-		<!-- NVBringup publishes an NVDisplayNub under itself (so under the GPU's PCI device, where WindowServer's
-		     GPUWrangler looks for a GPU's framebuffers) while a display is lit, and only with boot-arg nvfb=1
-		     or, for one boot, the NVRAM variable nvfb-once. The nub carries NVDisplayFB. -->
+		<!-- NVBringup publishes an NVDisplayNub while a display is lit, and only with boot-arg nvfb=1 or nvdpipe=1
+		     or, for one boot, the NVRAM variable nvfb-once / nvdpipe-once. The nub is a client of the GPU's
+		     IOPCIDevice (NVBringup is another client of the same device, and owns the nub), so it sits one
+		     level below the PCI device, where IOAccelDisplayMachine and GPUWrangler look for framebuffers.
+		     The nub carries NVDisplayFB. -->
+
 		<key>NVFramebuffer</key>
 		<dict>
 			<key>CFBundleIdentifier</key>

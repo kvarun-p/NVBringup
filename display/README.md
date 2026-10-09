@@ -49,11 +49,16 @@ X8R8G8B8 surface in VRAM. This driver hands that surface to IOGraphics as the ap
 BAR1 range), with the one mode it was lit at, and the sink's EDID over DDC. There's no acceleration:
 WindowServer draws into the aperture with the CPU. The vertical blank comes from a timer at the mode's refresh rate.
 
-- It matches `NVDisplayNub`, which NVBringup publishes under itself (so under the GPU's PCI device, where
-  GPUWrangler looks) while a display is lit, and only with boot-arg `nvfb=1` or, for one boot, the NVRAM variable
-  `nvfb-once` (`sudo nvram nvfb-once=1`; NVBringup deletes it when it lights the display). Uninstall nvvdisplay first.
+- It matches `NVDisplayNub`, which NVBringup publishes while a display is lit, as a client of the GPU's
+  IOPCIDevice (NVBringup is another client of that device, and owns the nub). Only with boot-arg `nvfb=1` or
+  `nvdpipe=1`, or, for one boot, the NVRAM variable `nvfb-once` or `nvdpipe-once` (NVBringup deletes it when it
+  lights the display). Uninstall nvvdisplay first. The driver reads nothing from NVBringup itself, only the nub.
 - The nub's `NVDisplayFB` property carries everything it needs: the physical address and size of the surface,
   the mode, and the EDID. The two kexts share no symbols.
+- Timing for the display pipe: `IOFBCurrentPixelCount` (htotal x vtotal) and `IOFBCurrentPixelClock` (Hz) are
+  published on the framebuffer when the mode is set. The VBL timer delivers `'vbl '` through
+  `registerForInterruptType` / `setInterruptState` at absolute deadlines of one frame, and `getVBLTime` returns
+  the last deadline. `NVFBVblanks` counts the timer's vertical blanks (published about once a second).
 - `make verify` checks all of NVFramebuffer's vtable slots against the kernel's IOFramebuffer. Run it after a macOS
   update. `make check` resolves the kext's symbols against the running kernel.
 

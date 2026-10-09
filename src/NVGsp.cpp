@@ -345,6 +345,7 @@ fail:
 
 out:
     IOLockUnlock(gspLock_);
+    dispNubSync();      // createRmObjects may have lit the display: its nub is published outside gspLock_
     return r;
 }
 
@@ -428,6 +429,7 @@ void NVBringup::gspPoll()
         idleTick();
     }
     IOLockUnlock(gspLock_);
+    dispNubSync();      // a display that came or went this poll: its nub, outside gspLock_
     if (again)
         gspTimer_->setTimeoutMS(100);
 }
@@ -704,6 +706,7 @@ IOReturn NVBringup::unloadGsp(const char *why)
     IOLockLock(gspLock_);
     IOReturn r = unloadGspLocked(why);
     IOLockUnlock(gspLock_);
+    dispNubSync();      // dispLost took the display away: its nub goes outside gspLock_
     return r;
 }
 

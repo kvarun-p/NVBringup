@@ -4,9 +4,25 @@
 #include <IOKit/IOService.h>
 #include <IOKit/IORangeAllocator.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IODeviceMemory.h>
 
 typedef uint64_t n_ret;   // a slot whose return type we don't use
 
+// A display-pipe transaction plane's rect: returned by value in xmm0/xmm1 (S0-2).
+struct IOAccelDisplayRect { float x, y, w, h; };
+
+struct IOAccelDisplayPipeScaler;
+struct IOColorEntry;
+struct IODisplayModeInformation;
+struct IOGBounds;
+struct IOGPoint;
+struct IOHardwareCursorDescriptor;
+struct IOHardwareCursorInfo;
+struct IOI2CBusTiming;
+struct IOI2CRequest;
+struct IOPixelInformation;
+struct IOTimingInformation;
+struct semaphore;
 struct task;
 class IOAccelAllocationInfo;
 class IOAccelClientSharedRO;
@@ -14,6 +30,8 @@ class IOAccelClientSharedRW;
 class IOAccelCommandDescriptor;
 class IOAccelConfig;
 class IOAccelDisplayMachine;
+class IOAccelDisplayPipe;
+class IOAccelDisplayPipeTransaction2;
 class IOAccelEvent;
 class IOAccelEventMachine2;
 class IOAccelEventMachineFast2;
@@ -30,6 +48,7 @@ class IOFramebuffer;
 class IOGraphicsAccelerator2;
 class IOPCIDevice;
 class IOSurface;
+class OSSerialize;
 class vendevtBarrierRec;
 class vendevtCommandRec;
 
@@ -113,7 +132,7 @@ public:
 	/* 326 */ virtual void * newSurface() = 0;
 	/* 327 */ virtual void * new2DContext() = 0;
 	/* 328 */ virtual void * newVideoContext() = 0;
-	/* 329 */ virtual n_ret newDisplayPipe();
+	/* 329 */ virtual IOAccelDisplayPipe * newDisplayPipe();
 	/* 330 */ virtual n_ret newDrawable();
 	/* 331 */ virtual n_ret newContext(unsigned int);
 	/* 332 */ virtual void * newSysMemory() = 0;
@@ -134,6 +153,9 @@ public:
 	/* 347 */ virtual n_ret describeDriverAllocations(IOAccelAllocationInfo*);
 	/* 348 */ virtual n_ret newCommandQueue();
 	/* 349 */ virtual n_ret ktraceStateChanged();
+	/* accel+3192 |= 0x2 (S0-4 R4): transactionEnd is refused while this is clear */
+	void enableAccelerator();
+	void disableAccelerator();
 	uint8_t _nva_data[0xdd8 - sizeof(IOService)];   // the family's own fields
 };
 static_assert(sizeof(IOGraphicsAccelerator2) == 0xdd8, "IOGraphicsAccelerator2 size");
@@ -315,7 +337,7 @@ public:
 	/* 280 */ virtual n_ret framebuffer_did_power_on(unsigned int);
 	/* 281 */ virtual n_ret display_mode_will_change(unsigned int);
 	/* 282 */ virtual n_ret display_mode_did_change(unsigned int);
-	/* 283 */ virtual n_ret found_framebuffer(IOFramebuffer*);
+	/* 283 */ virtual bool found_framebuffer(IOFramebuffer*);
 	uint8_t _nva_data[0x178 - sizeof(IOService)];   // the family's own fields
 };
 static_assert(sizeof(IOAccelDisplayMachine) == 0x178, "IOAccelDisplayMachine size");
@@ -323,4 +345,190 @@ static_assert(sizeof(IOAccelDisplayMachine) == 0x178, "IOAccelDisplayMachine siz
 
 #define NVA_FWD_DEFS_IOAccelDisplayMachine \
 	/* none */
+
+class IOAccelDisplayPipe : public IOService {
+	OSDeclareAbstractStructors(IOAccelDisplayPipe)
+public:
+	/*  18 */ virtual void free() override;
+	/* 266 */ virtual n_ret init(IOGraphicsAccelerator2*, IOAccelDisplayMachine*, IOFramebuffer*, unsigned int);
+	/* 267 */ virtual n_ret initFramebufferResource(unsigned int, IOAccelResource2*);
+	/* 268 */ virtual n_ret destroyFramebufferResource(unsigned int, IOAccelResource2*);
+	/* 269 */ virtual n_ret displayModeWillChange();
+	/* 270 */ virtual n_ret displayModeDidChange();
+	/* 271 */ virtual n_ret enableVBLInterrupt();
+	/* 272 */ virtual n_ret disableVBLInterrupt();
+	/* 273 */ virtual n_ret enableTransactionInterrupt();
+	/* 274 */ virtual n_ret disableTransactionInterrupt();
+	/* 275 */ virtual n_ret newDisplayPipeTransaction();
+	/* 276 */ virtual n_ret validateTransaction(IOAccelDisplayPipeTransaction2*);
+	/* 277 */ virtual n_ret performTransaction(IOAccelDisplayPipeTransaction2*);
+	/* 278 */ virtual n_ret isTransactionComplete(IOAccelDisplayPipeTransaction2*);
+	/* 279 */ virtual n_ret submitTransaction(IOAccelDisplayPipeTransaction2*);
+	/* 280 */ virtual n_ret getDisplayModePipeScalerSetup(IOAccelDisplayPipeScaler*);
+	/* 281 */ virtual n_ret createWorkLoop();
+	/* 282 */ virtual n_ret copyCapabilities();
+	/* 283 */ virtual n_ret beginTransaction(IOAccelEvent*);
+	/* 284 */ virtual n_ret signalTransactionComplete(IOAccelEvent*);
+	/* 285 */ virtual n_ret framebufferTerminated();
+	/* 286 */ virtual n_ret wsaaEnterDefer(int);
+	/* 287 */ virtual n_ret wsaaWillExitDefer(int);
+	/* 288 */ virtual n_ret wsaaDidExitDefer(int);
+	/* 289 */ virtual n_ret wsaaWillEnterDefer(int);
+	/* 290 */ virtual n_ret wsaaDidEnterDefer(int);
+	/* 291 */ virtual n_ret willPowerOff();
+	/* 292 */ virtual n_ret didPowerOn();
+	/* 293 */ virtual n_ret logTransactionTimeoutDiagnosisReport();
+	/* 294 */ virtual n_ret getStampIndex() const;
+	/* 295 */ virtual n_ret triage(char**, unsigned long long*);
+	/* 296 */ virtual n_ret _RESERVEDIOAccelDisplayPipe1();
+	/* 297 */ virtual n_ret _RESERVEDIOAccelDisplayPipe2();
+	/* 298 */ virtual n_ret _RESERVEDIOAccelDisplayPipe3();
+	/* 299 */ virtual n_ret _RESERVEDIOAccelDisplayPipe4();
+	/* 300 */ virtual n_ret _RESERVEDIOAccelDisplayPipe5();
+	/* 301 */ virtual n_ret _RESERVEDIOAccelDisplayPipe6();
+	/* 302 */ virtual n_ret _RESERVEDIOAccelDisplayPipe7();
+	/* 303 */ virtual n_ret framebuffer_will_power_off();
+	/* 304 */ virtual n_ret framebuffer_did_power_on();
+	/* 305 */ virtual n_ret framebuffer_terminated();
+	void signalTransactionInterrupt(void *);
+	IOFramebuffer *getFramebuffer() const;
+	uint8_t _nva_data[0x318 - sizeof(IOService)];   // the family's own fields
+};
+static_assert(sizeof(IOAccelDisplayPipe) == 0x318, "IOAccelDisplayPipe size");
+#define NVA_IOAccelDisplayPipe_SLOTS 306
+
+#define NVA_FWD_DEFS_IOAccelDisplayPipe \
+	/* none */
+
+class IOFramebuffer : public IOService {
+	OSDeclareAbstractStructors(IOFramebuffer)
+public:
+	/*  18 */ virtual void free() override;
+	/*  96 */ virtual IOReturn setProperties(OSObject *) override;
+	/* 127 */ virtual bool requestTerminate(IOService *, IOOptionBits) override;
+	/* 128 */ virtual bool willTerminate(IOService *, IOOptionBits) override;
+	/* 129 */ virtual bool didTerminate(IOService *, IOOptionBits, bool *) override;
+	/* 184 */ virtual bool start(IOService *) override;
+	/* 185 */ virtual void stop(IOService *) override;
+	/* 192 */ virtual bool terminate(IOOptionBits) override;
+	/* 206 */ virtual bool attach(IOService *) override;
+	/* 209 */ virtual IOWorkLoop * getWorkLoop() const override;
+	/* 215 */ virtual IOReturn callPlatformFunction(const OSSymbol *, bool, void *, void *, void *, void *) override;
+	/* 229 */ virtual IOReturn requestProbe(IOOptionBits) override;
+	/* 230 */ virtual IOReturn message(UInt32, IOService *, void *) override;
+	/* 239 */ virtual IOReturn newUserClient(task_t, void *, UInt32, IOUserClient **) override;
+	/* 248 */ virtual IOReturn setAggressiveness(unsigned long, unsigned long) override;
+	/* 249 */ virtual IOReturn getAggressiveness(unsigned long, unsigned long *) override;
+	/* 253 */ virtual IOReturn setPowerState(unsigned long, IOService *) override;
+	/* 257 */ virtual IOReturn powerStateWillChangeTo(IOPMPowerFlags, unsigned long, IOService *) override;
+	/* 258 */ virtual IOReturn powerStateDidChangeTo(IOPMPowerFlags, unsigned long, IOService *) override;
+	/* 266 */ virtual n_ret hideCursor();
+	/* 267 */ virtual n_ret showCursor(IOGPoint*, int);
+	/* 268 */ virtual n_ret moveCursor(IOGPoint*, int);
+	/* 269 */ virtual n_ret getVBLTime(unsigned long long*, unsigned long long*);
+	/* 270 */ virtual n_ret getBoundingRect(IOGBounds**);
+	/* 271 */ virtual n_ret doI2CRequest(unsigned int, IOI2CBusTiming*, IOI2CRequest*);
+	/* 272 */ virtual n_ret diagnoseReport(void*, void*, void*, void*);
+	/* 273 */ virtual n_ret setGammaTable(unsigned int, unsigned int, unsigned int, void*, bool);
+	/* 274 */ virtual n_ret _RESERVEDIOFramebuffer3();
+	/* 275 */ virtual n_ret _RESERVEDIOFramebuffer4();
+	/* 276 */ virtual n_ret _RESERVEDIOFramebuffer5();
+	/* 277 */ virtual n_ret _RESERVEDIOFramebuffer6();
+	/* 278 */ virtual n_ret _RESERVEDIOFramebuffer7();
+	/* 279 */ virtual n_ret _RESERVEDIOFramebuffer8();
+	/* 280 */ virtual n_ret _RESERVEDIOFramebuffer9();
+	/* 281 */ virtual n_ret _RESERVEDIOFramebuffer10();
+	/* 282 */ virtual n_ret _RESERVEDIOFramebuffer11();
+	/* 283 */ virtual n_ret _RESERVEDIOFramebuffer12();
+	/* 284 */ virtual n_ret _RESERVEDIOFramebuffer13();
+	/* 285 */ virtual n_ret _RESERVEDIOFramebuffer14();
+	/* 286 */ virtual n_ret _RESERVEDIOFramebuffer15();
+	/* 287 */ virtual n_ret _RESERVEDIOFramebuffer16();
+	/* 288 */ virtual n_ret _RESERVEDIOFramebuffer17();
+	/* 289 */ virtual n_ret _RESERVEDIOFramebuffer18();
+	/* 290 */ virtual n_ret _RESERVEDIOFramebuffer19();
+	/* 291 */ virtual n_ret _RESERVEDIOFramebuffer20();
+	/* 292 */ virtual n_ret _RESERVEDIOFramebuffer21();
+	/* 293 */ virtual n_ret _RESERVEDIOFramebuffer22();
+	/* 294 */ virtual n_ret _RESERVEDIOFramebuffer23();
+	/* 295 */ virtual n_ret _RESERVEDIOFramebuffer24();
+	/* 296 */ virtual n_ret _RESERVEDIOFramebuffer25();
+	/* 297 */ virtual n_ret _RESERVEDIOFramebuffer26();
+	/* 298 */ virtual n_ret _RESERVEDIOFramebuffer27();
+	/* 299 */ virtual n_ret _RESERVEDIOFramebuffer28();
+	/* 300 */ virtual n_ret _RESERVEDIOFramebuffer29();
+	/* 301 */ virtual n_ret _RESERVEDIOFramebuffer30();
+	/* 302 */ virtual n_ret _RESERVEDIOFramebuffer31();
+	/* 303 */ virtual n_ret open();
+	/* 304 */ virtual n_ret close();
+	/* 305 */ virtual n_ret isConsoleDevice();
+	/* 306 */ virtual n_ret setupForCurrentConfig();
+	/* 307 */ virtual n_ret serializeInfo(OSSerialize*);
+	/* 308 */ virtual n_ret setNumber(OSDictionary*, char const*, unsigned int);
+	/* 309 */ virtual IODeviceMemory * getApertureRange(int) = 0;
+	/* 310 */ virtual IODeviceMemory * getVRAMRange();
+	/* 311 */ virtual n_ret enableController();
+	/* 312 */ virtual n_ret getPixelFormats() = 0;
+	/* 313 */ virtual n_ret getDisplayModeCount() = 0;
+	/* 314 */ virtual n_ret getDisplayModes(int*) = 0;
+	/* 315 */ virtual n_ret getInformationForDisplayMode(int, IODisplayModeInformation*) = 0;
+	/* 316 */ virtual n_ret _vslot316() = 0;
+	/* 317 */ virtual IOReturn getPixelInformation(int, int, int, IOPixelInformation*) = 0;
+	/* 318 */ virtual IOReturn getCurrentDisplayMode(int*, int*) = 0;
+	/* 319 */ virtual n_ret setDisplayMode(int, int);
+	/* 320 */ virtual n_ret setApertureEnable(int, unsigned int);
+	/* 321 */ virtual n_ret setStartupDisplayMode(int, int);
+	/* 322 */ virtual n_ret getStartupDisplayMode(int*, int*);
+	/* 323 */ virtual n_ret setCLUTWithEntries(IOColorEntry*, unsigned int, unsigned int, unsigned int);
+	/* 324 */ virtual n_ret setGammaTable(unsigned int, unsigned int, unsigned int, void*);
+	/* 325 */ virtual n_ret setAttribute(unsigned int, unsigned long);
+	/* 326 */ virtual n_ret getAttribute(unsigned int, unsigned long*);
+	/* 327 */ virtual n_ret getTimingInfoForDisplayMode(int, IOTimingInformation*);
+	/* 328 */ virtual n_ret validateDetailedTiming(void*, unsigned long long);
+	/* 329 */ virtual n_ret setDetailedTimings(OSArray*);
+	/* 330 */ virtual n_ret getConnectionCount();
+	/* 331 */ virtual n_ret setAttributeForConnection(int, unsigned int, unsigned long);
+	/* 332 */ virtual n_ret getAttributeForConnection(int, unsigned int, unsigned long*);
+	/* 333 */ virtual n_ret convertCursorImage(void*, IOHardwareCursorDescriptor*, IOHardwareCursorInfo*);
+	/* 334 */ virtual n_ret setCursorImage(void*);
+	/* 335 */ virtual n_ret setCursorState(int, int, bool);
+	/* 336 */ virtual n_ret flushCursor();
+	/* 337 */ virtual n_ret getAppleSense(int, unsigned int*, unsigned int*, unsigned int*, unsigned int*);
+	/* 338 */ virtual n_ret connectFlags(int, int, unsigned int*);
+	/* 339 */ virtual n_ret setDDCClock(int, unsigned int);
+	/* 340 */ virtual n_ret setDDCData(int, unsigned int);
+	/* 341 */ virtual n_ret readDDCClock(int);
+	/* 342 */ virtual n_ret readDDCData(int);
+	/* 343 */ virtual n_ret enableDDCRaster(bool);
+	/* 344 */ virtual n_ret hasDDCConnect(int);
+	/* 345 */ virtual n_ret getDDCBlock(int, unsigned int, unsigned int, unsigned int, unsigned char*, unsigned long long*);
+	/* 346 */ virtual n_ret registerForInterruptType(unsigned int, void (*)(OSObject*, void*), OSObject*, void*, void**);
+	/* 347 */ virtual n_ret unregisterInterrupt(void*);
+	/* 348 */ virtual n_ret setInterruptState(void*, unsigned int);
+	/* 349 */ virtual n_ret getNotificationSemaphore(unsigned int, semaphore**);
+	uint8_t _nva_data[0x1d0 - sizeof(IOService)];   // the family's own fields
+};
+static_assert(sizeof(IOFramebuffer) == 0x1d0, "IOFramebuffer size");
+#define NVA_IOFramebuffer_SLOTS 350
+
+#define NVA_FWD_DEFS_IOFramebuffer \
+	/* none */
+
+class IOAccelDisplayPipeTransaction2 {
+public:
+	/* txn+84 */ uint32_t getTransactionID() const;
+	/* frame block plane p, sub-surface i */ IOSurface *getPlaneIOSurface(unsigned int p, unsigned int i) const;
+	/* plane p dirty rect, in plane pixels (float x,y,w,h) */ IOAccelDisplayRect getPlaneDirtyRect(unsigned int p) const;
+	uint8_t _nva_data[0x1b8];   // the family's own fields (kernel MetaClass size, checked at probe)
+};
+static_assert(sizeof(IOAccelDisplayPipeTransaction2) == 0x1b8, "IOAccelDisplayPipeTransaction2 size");
+
+class IOSurface {
+public:
+	uint32_t getPixelFormat() const;
+	uint32_t getPlaneWidth(unsigned int plane) const;
+	uint32_t getPlaneHeight(unsigned int plane) const;
+	uint32_t getPlaneBytesPerRow(unsigned int plane) const;
+	IOMemoryDescriptor *getMemoryDescriptor() const;
+};
 

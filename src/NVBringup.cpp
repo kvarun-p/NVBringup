@@ -45,8 +45,9 @@ bool NVBringup::start(IOService *provider)
 
     gspLock_ = IOLockAlloc();
     waitLock_ = IOLockAlloc();
+    dispNubLock_ = IOLockAlloc();
     powerInit();
-    if (!gspLock_ || !waitLock_ || !powerLock_) {
+    if (!gspLock_ || !waitLock_ || !dispNubLock_ || !powerLock_) {
         stop(provider);
         return false;
     }
@@ -65,6 +66,19 @@ bool NVBringup::start(IOService *provider)
         LOG("boot-arg nvboost=%u: P-state boost policy %s", boost, policies[boost]);
     boostPolicy_ = boost <= NVMAC_PERF_POLICY_ADAPTIVE ? boost : NVMAC_PERF_POLICY_ADAPTIVE;
     boostCall_ = thread_call_allocate(&NVBringup::boostThunk, this);
+
+    // Display pipe gate (S1): boot-arg nvdpipe=1, or the NVRAM one-shot nvdpipe-once (deleted here, so it
+    // applies to this boot only; read even when the boot-arg is set, so it can't outlive the boot). Decided
+    // here, not when a display lights: the accelerator, a client of this PCI device, reads the property at
+    // its match. Armed, NVFramebuffer is wanted (fbWanted) and the NVDisplayNub carries the property too.
+    const bool pipeOnce = nvramOneShot("nvdpipe-once");
+    uint32_t pipe = 0;
+    dispPipeArmed_ = (PE_parse_boot_argn("nvdpipe", &pipe, sizeof(pipe)) && pipe) || pipeOnce;
+    if (dispPipeArmed_) {
+        setProperty("NVDisplayPipeArmed", kOSBooleanTrue);
+        LOG("display pipe armed (%s): NVFramebuffer and the accelerator take part this boot",
+            pipeOnce ? "nvdpipe-once" : "boot-arg nvdpipe=1");
+    }
 
     findAcpiNode();
     powerProbe();
@@ -132,6 +146,7 @@ void NVBringup::shutdownHw()
         sleepNotifier_ = nullptr;
     }
     stopGspPoller();
+    dispNubStop();                                  // the nub is ours under the PCI device: it goes first
     if (gspLock_) {
         IOLockLock(gspLock_);
         freeGsp(true);      // stops a running GSP before its buffers go away
@@ -177,6 +192,11 @@ void NVBringup::free()
         IOLockFree(powerLock_);
         powerLock_ = nullptr;
     }
+    if (dispNubLock_) {
+        IOLockFree(dispNubLock_);
+        dispNubLock_ = nullptr;
+    }
+    OSSafeReleaseNULL(dispWant_);                   // shutdownHw has taken the nub down
     if (bar1Held_)
         IOFree(bar1Held_, bar1HeldCap_ * sizeof(Bar1Held));
     super::free();

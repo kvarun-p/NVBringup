@@ -42,6 +42,7 @@ decl:
 	python3 tools/gen_decl.py > src/IOAccelFamily2_decl.h
 
 verify: | $(BUILD)
+	python3 tools/gen_decl.py | cmp -s - src/IOAccelFamily2_decl.h || { echo "src/IOAccelFamily2_decl.h is stale: run make decl"; exit 1; }
 	clang++ $(CXXFLAGS) -c src/NVMetalAccel.cpp -o /dev/null -Xclang -fdump-vtable-layouts > $(BUILD)/vtables.txt
 	python3 tools/verify_vtables.py $(BUILD)/vtables.txt
 
