@@ -73,14 +73,16 @@ WindowServer draws into the aperture with the CPU. The vertical blank comes from
 - NVAGDCControl (src/NVAGDCControl.cpp, same kext) is the display's AppleGraphicsDeviceControl provider. IOPresentment
   (CoreDisplay's display pipe) finds a framebuffer only through an AGDC: for each AGDC service it opens type 2, asks
   selector 1 (vendor info) and selector 0x980 (the framebuffer registry IDs it serves). Nothing served NVFramebuffer, so
-  CoreDisplay found no pipe for it. NVAGDCControl sits on NVDisplayNub beside NVFramebuffer and matches only while
-  NVDisplayPipeArmed is set on the nub. Its selector 0x980 lists NVFramebuffer as an object pointer, read when asked; AGDC turns each
-  pointer into its registry ID before userspace sees it (a registry ID in its place panics in getRegistryEntryID). Its
-  layout is in src/AppleGraphicsDeviceControl_decl.h. probe() refuses to attach unless the kernel's class is 272 bytes.
-  The selection rule (CreateAssociationMap): each AGDC's node map starts with its own registry ID or with the first
-  display-class node among its parents and children; a device is served by the first AGDC whose node-map ID equals it.
-  So NVAGDCControl serves the NVIDIA device through its own ID, and IntelFBClientControl keeps the Intel devices.
-  Not yet run on hardware: this changes the association only. The pipe still needs the accelerator (below).
+  CoreDisplay found no pipe for it. Its selector 0x980 lists NVFramebuffer as an object pointer, read when asked; AGDC
+  turns each pointer into its registry ID before userspace sees it (a registry ID in its place panics in
+  getRegistryEntryID). Its layout is in src/AppleGraphicsDeviceControl_decl.h. probe() refuses to attach unless the
+  kernel's class is 272 bytes.
+  The pairing rule (CreateAssociationMap, GetNodeMap): every AGDC and every IOAccelerator gets a key, its first
+  IOService-plane ancestor whose class-code is a display class, else its own registry ID; a device gets a node only
+  when an AGDC and an accelerator share a key (else "Interface creation error: 0x815"). OpenCore spoofs PEGP@0's
+  class-code (docs/hackintosh.md), so the GPU can't be that ancestor. Instead NVMetalAccelerator, in display-pipe mode,
+  sets class-code 0x030000 on itself, and NVAGDCControl matches on it (IOProviderClass NVMetalAccelerator, IOPropertyMatch
+  NVDisplayPipeMode): both keys are then the accelerator's registry ID. Intel's pair keys on IGPU@2.
 
 On hardware (2026-10-09) WindowServer opens it as an unaccelerated display, then CoreDisplay looks for its display
 pipe every frame (`Unable to find display pipe for IOFB service`) and its compositor stops within a minute, the

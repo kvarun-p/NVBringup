@@ -3,8 +3,12 @@
 // framebuffers are listed by IntelFBClientControl; nothing lists NVFramebuffer, so IOPresentmentCreateForRegistryID finds no
 // association and CoreDisplay reports "Unable to find display pipe". See display/README.md.
 //
-// This class is attached to NVBringup's NVDisplayNub, as a sibling of NVFramebuffer, by the personality in Info.plist. That
-// personality matches only while the nub's NVDisplayPipeArmed is set, and probe() checks it again. The kernel's AGDC does the
+// This class is attached to NVMetalAccelerator in display-pipe mode (NVDisplayPipeMode, set only on an armed boot), by the
+// personality in Info.plist; probe() checks the property again. It sits under the accelerator, not beside NVFramebuffer,
+// because IOPresentment pairs an AGDC with an accelerator through their first display-class ancestor (else their own
+// registry ID): with PEGP@0's class-code spoofed, the accelerator marks itself display-class (NVMetalAccel.cpp) and is
+// that ancestor for this class, so both keys are the accelerator's registry ID. Beside NVFramebuffer, the keys differed
+// and IOPresentment failed with "Interface creation error: 0x815". The kernel's AGDC does the
 // rest: its user client (IOServiceOpen type 2, authorized as WindowServer), its start() queries, and its selector dispatch.
 // This class answers the vendor hook for selector 1 (vendor info) and selector 0x980 (GPU capability), and returns
 // kIOReturnUnsupported for every other selector.
@@ -24,6 +28,7 @@
 #include "AppleGraphicsDeviceControl_decl.h"
 #include <IOKit/IOLib.h>
 #include <IOKit/IORegistryEntry.h>
+#include <IOKit/IOService.h>
 #include <libkern/c++/OSBoolean.h>
 #include <libkern/c++/OSDictionary.h>
 #include <string.h>
@@ -43,7 +48,7 @@ class NVAGDCControl : public AppleGraphicsDeviceControl {
     static constexpr UInt32 kListOffset = 0x3c;
     static constexpr UInt32 kListSlots = 8;            // AGDC converts at most 8 entries
 
-    static bool gateArmed(IOService *nub);
+    static bool gateArmed(IOService *accel);
     static void put32(uint8_t *b, UInt32 off, UInt32 v) { memcpy(b + off, &v, 4); }
     static void put64(uint8_t *b, UInt32 off, UInt64 v) { memcpy(b + off, &v, 8); }
     UInt32 listFramebuffers(uint8_t *out, UInt32 slots) const;
@@ -59,10 +64,10 @@ public:
 
 OSDefineMetaClassAndStructors(NVAGDCControl, AppleGraphicsDeviceControl)
 
-// NVBringup's gate: NVDisplayPipeArmed on the nub (set when NVBringup arms the display pipe, see NVGpu.cpp).
-bool NVAGDCControl::gateArmed(IOService *nub)
+// The gate: NVDisplayPipeMode on the accelerator (its PCI personality, which matches only on an armed boot).
+bool NVAGDCControl::gateArmed(IOService *accel)
 {
-    OSBoolean *b = nub ? OSDynamicCast(OSBoolean, nub->getProperty("NVDisplayPipeArmed")) : nullptr;
+    OSBoolean *b = accel ? OSDynamicCast(OSBoolean, accel->getProperty("NVDisplayPipeMode")) : nullptr;
     return b && b->isTrue();
 }
 
@@ -81,20 +86,21 @@ IOService *NVAGDCControl::probe(IOService *provider, SInt32 *score)
     return IOService::probe(provider, score);
 }
 
-// The framebuffers under the provider (NVDisplayNub): NVFramebuffer, a live one, as object pointers for AGDC to convert
-// (see the header). Read at call time, since IOPresentment asks each time it builds an association and NVFramebuffer may
-// attach after this object starts. Not retained: AGDC converts them in the same call, and NVFramebuffer stays
-// attached to the nub for the boot.
+// The framebuffers of this GPU: NVFramebuffer services under the accelerator's PCI device (PEGP@0 > NVDisplayNub >
+// NVFramebuffer), live ones, as object pointers for AGDC to convert (see the header). Read at call time, since
+// IOPresentment asks each time it builds an association and NVFramebuffer may attach after this object starts. Not
+// retained: AGDC converts them in the same call, and NVFramebuffer stays attached to the nub for the boot.
 UInt32 NVAGDCControl::listFramebuffers(uint8_t *out, UInt32 slots) const
 {
     UInt32 n = 0;
-    IOService *nub = getProvider();
-    if (!nub)
+    IOService *accel = getProvider();
+    IOService *pci = accel ? accel->getProvider() : nullptr;
+    if (!pci)
         return 0;
-    auto it = nub->getChildIterator(gIOServicePlane);
+    IORegistryIterator *it = IORegistryIterator::iterateOver(pci, gIOServicePlane, kIORegistryIterateRecursively);
     if (!it)
         return 0;
-    while (IORegistryEntry *e = (IORegistryEntry *)it->getNextObject()) {
+    while (IORegistryEntry *e = it->getNextObject()) {
         IOService *s = OSDynamicCast(IOService, e);
         if (!s || s->isInactive() || strcmp(s->getMetaClass()->getClassName(), "NVFramebuffer") != 0)
             continue;
@@ -103,6 +109,7 @@ UInt32 NVAGDCControl::listFramebuffers(uint8_t *out, UInt32 slots) const
         put64(out, 8 * n, (UInt64)(uintptr_t)s);
         n++;
     }
+    it->release();
     return n;
 }
 

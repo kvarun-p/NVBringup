@@ -377,6 +377,17 @@ bool NVMetalAccelerator::start(IOService *provider)
         // writes NVMetal's stamps. With the flag set, the base event machine passes stamp waits the GPU never
         // reaches (testEventUnlocked, slot 48) and transaction_interrupt_gated completes the live transaction.
         *(volatile uint32_t *)((uint8_t *)this + kSyncCompleteOffset) = 1;
+        // IOPresentment pairs an AGDC with an accelerator by a key: each service's first IOService-plane ancestor with a
+        // display "class-code" (0x30000 ...), else its own registry ID (GetNodeMap 0x7ff80ff58fa3; the device loop of
+        // CreateAssociationMap 0x7ff80ff5399e). OpenCore spoofs PEGP@0's class-code to 0xff0000 (docs/hackintosh.md),
+        // so neither key reaches the GPU and the pair fails ("Interface creation error: 0x815", 2026-10-10 12:54).
+        // Marking the accelerator display-class, with NVAGDCControl attached under it, gives both the accelerator's
+        // registry ID as key. Only in this mode, so only on an armed boot; PEGP@0 itself is left alone.
+        static const uint8_t kDisplayClass[4] = { 0x00, 0x00, 0x03, 0x00 };
+        if (OSData *cc = OSData::withBytes(kDisplayClass, sizeof(kDisplayClass))) {
+            setProperty("class-code", cc);
+            cc->release();
+        }
         if (!armBinding()) {
             LOG("cannot arm the framebuffer binding");
             gAccel = nullptr;

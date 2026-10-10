@@ -39,10 +39,11 @@
 			<string>IOFramebuffer</string>
 		</dict>
 
-		<!-- NVAGDCControl: the AppleGraphicsDeviceControl provider for NVFramebuffer (src/NVAGDCControl.cpp). It sits on the
-		     nub beside NVFramebuffer, the way Intel's AGDC sits under its framebuffer controller, and matches only while
-		     NVBringup's NVDisplayPipeArmed is set on the nub (NVGpu.cpp). Without it IOPresentment lists no framebuffer
-		     for NVFramebuffer and CoreDisplay can't find a display pipe for it. -->
+		<!-- NVAGDCControl: the AppleGraphicsDeviceControl provider for NVFramebuffer (src/NVAGDCControl.cpp). It sits under
+		     NVMetalAccelerator in display-pipe mode (NVDisplayPipeMode, an armed boot only): IOPresentment pairs an AGDC with an
+		     accelerator through their first display-class ancestor, and with PEGP@0's class-code spoofed the accelerator, which
+		     marks itself display-class, is that ancestor. Without it IOPresentment lists no framebuffer for NVFramebuffer and
+		     CoreDisplay can't find a display pipe for it. -->
 		<key>NVAGDCControl</key>
 		<dict>
 			<key>CFBundleIdentifier</key>
@@ -50,10 +51,10 @@
 			<key>IOClass</key>
 			<string>NVAGDCControl</string>
 			<key>IOProviderClass</key>
-			<string>NVDisplayNub</string>
+			<string>NVMetalAccelerator</string>
 			<key>IOPropertyMatch</key>
 			<dict>
-				<key>NVDisplayPipeArmed</key>
+				<key>NVDisplayPipeMode</key>
 				<true/>
 			</dict>
 			<key>IOMatchCategory</key>

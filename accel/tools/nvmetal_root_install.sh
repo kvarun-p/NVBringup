@@ -55,9 +55,57 @@ fi
 trap 'umount $MNT 2>/dev/null || true' EXIT
 [[ -d $MNT/System/Library/Extensions ]] || die "$vol mounted at $MNT has no System/Library/Extensions"
 
+# WindowServer enforces library validation even with AMFI relaxed: an ad-hoc signed library loads, an unsigned one
+# doesn't (MacPorts' libLLVM: "mapped file has no cdhash", 2026-10-10). So the bundle carries its own copies of every
+# non-system library it needs, in Contents/Frameworks, renamed to @rpath/<name> and ad-hoc signed, and its rpath is
+# only @loader_path/../Frameworks. The build tree and /opt/local are left as they are.
+embed_libs() {   # $1 = staged bundle
+    local fw=$1/Contents/Frameworks bin=$1/Contents/MacOS/NVMetal
+    local -a todo rpaths
+    local -A done
+    local obj dep name src r f
+    rpaths=(${(f)"$(otool -l $bin | awk '/LC_RPATH/ { getline; getline; print $2 }')"})
+    mkdir -p $fw
+    todo=($bin)
+    while (( $#todo )); do
+        obj=$todo[1]; todo=(${todo[2,-1]})
+        for dep in ${(f)"$(otool -L $obj | tail -n +2 | awk '{ print $1 }')"}; do
+            [[ $dep == /usr/lib/* || $dep == /System/* ]] && continue
+            name=${dep:t}; src=""
+            if [[ $dep == @rpath/* ]]; then
+                for r in $rpaths; do
+                    r=${r/@loader_path/${BUNDLE}/Contents/MacOS}
+                    [[ -f $r/$name ]] && { src=$r/$name; break }
+                done
+            else
+                src=$dep
+            fi
+            [[ $obj == $bin || $dep != @rpath/* ]] && install_name_tool -change $dep @rpath/$name $obj 2>/dev/null
+            [[ -n ${done[$name]:-} ]] && continue
+            [[ -f $src ]] || die "can't find $dep (needed by ${obj:t})"
+            cp -L $src $fw/$name
+            chmod 755 $fw/$name
+            install_name_tool -id @rpath/$name $fw/$name 2>/dev/null
+            install_name_tool -add_rpath @loader_path $fw/$name 2>/dev/null || true
+            done[$name]=1
+            todo+=($fw/$name)
+            print "embedded $name ($src)"
+        done
+    done
+    for r in $rpaths; do install_name_tool -delete_rpath $r $bin 2>/dev/null; done
+    install_name_tool -add_rpath @loader_path/../Frameworks $bin 2>/dev/null
+    for f in $fw/*.dylib; do codesign --force --sign - $f; done
+    codesign --force --sign - $1
+}
+
 if [[ $cmd == install ]]; then
     rm -rf "$MNT/$DEST"
-    ditto --norsrc --noextattr "$BUNDLE" "$MNT/$DEST"
+    stage=$(mktemp -d /private/var/tmp/nvmetal-stage.XXXXXX)
+    ditto --norsrc --noextattr "$BUNDLE" "$stage/NVMetal.bundle"
+    embed_libs "$stage/NVMetal.bundle"
+    codesign --verify --deep --strict "$stage/NVMetal.bundle" || die "staged bundle doesn't verify"
+    ditto --norsrc --noextattr "$stage/NVMetal.bundle" "$MNT/$DEST"
+    rm -rf "$stage"
     chown -R root:wheel "$MNT/$DEST"
     chmod -R 755 "$MNT/$DEST"
     print "copied $BUNDLE"
