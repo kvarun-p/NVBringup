@@ -74,7 +74,8 @@ WindowServer draws into the aperture with the CPU. The vertical blank comes from
   (CoreDisplay's display pipe) finds a framebuffer only through an AGDC: for each AGDC service it opens type 2, asks
   selector 1 (vendor info) and selector 0x980 (the framebuffer registry IDs it serves). Nothing served NVFramebuffer, so
   CoreDisplay found no pipe for it. NVAGDCControl sits on NVDisplayNub beside NVFramebuffer and matches only while
-  NVDisplayPipeArmed is set on the nub. Its selector 0x980 lists NVFramebuffer's registry ID, read when asked. Its
+  NVDisplayPipeArmed is set on the nub. Its selector 0x980 lists NVFramebuffer as an object pointer, read when asked; AGDC turns each
+  pointer into its registry ID before userspace sees it (a registry ID in its place panics in getRegistryEntryID). Its
   layout is in src/AppleGraphicsDeviceControl_decl.h. probe() refuses to attach unless the kernel's class is 272 bytes.
   The selection rule (CreateAssociationMap): each AGDC's node map starts with its own registry ID or with the first
   display-class node among its parents and children; a device is served by the first AGDC whose node-map ID equals it.

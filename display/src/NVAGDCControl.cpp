@@ -14,9 +14,12 @@
 // or 2):
 //   selector 1 (0x2c bytes out): +0x00 u32 vendor ID 0x10de (IOPresentment logs it; the association doesn't test it),
 //     +0x24 u16 platform 0, +0x28 u32 kind 2 (kind 1 makes IOPresentment validate the platform ID; 2 skips that check).
-//   selector 0x980 (0xdc bytes out): +0x30 u32 count of framebuffers, +0x3c u64 framebuffer registry ID [count], up to 20.
-//     The fields not listed are zero. The association path (CreateAssociationMap, CreateForRegistryID) reads only the
-//     fields above; the rest of the blob has not been traced.
+//   selector 0x980 (0xdc bytes out): +0x30 u32 count of framebuffers, +0x3c framebuffer IOService pointer [count], up to
+//     8. The vendor answers with kernel object pointers: AGDC's filtered_doDeviceAttribute (after the vendor hook, before
+//     the copy out) replaces each nonzero pointer at +0x34 and +0x3c[min(count, 8)] with getRegistryEntryID(), so
+//     userspace sees registry IDs. A registry ID here is dereferenced as an object (the 2026-10-10 12:45 panic). +0x34
+//     (a device object, not traced) stays zero, which AGDC skips. The fields not listed are zero; the association path
+//     (CreateAssociationMap, CreateForRegistryID) reads only the fields above.
 
 #include "AppleGraphicsDeviceControl_decl.h"
 #include <IOKit/IOLib.h>
@@ -38,7 +41,7 @@ class NVAGDCControl : public AppleGraphicsDeviceControl {
     static constexpr UInt32 kKindDiscrete = 2;
     static constexpr UInt32 kCountOffset = 0x30;
     static constexpr UInt32 kListOffset = 0x3c;
-    static constexpr UInt32 kListSlots = 20;
+    static constexpr UInt32 kListSlots = 8;            // AGDC converts at most 8 entries
 
     static bool gateArmed(IOService *nub);
     static void put32(uint8_t *b, UInt32 off, UInt32 v) { memcpy(b + off, &v, 4); }
@@ -78,8 +81,10 @@ IOService *NVAGDCControl::probe(IOService *provider, SInt32 *score)
     return IOService::probe(provider, score);
 }
 
-// The framebuffer registry IDs under the provider (NVDisplayNub): NVFramebuffer, a live one. Read at call time, since
-// IOPresentment asks each time it builds an association and NVFramebuffer may attach after this object starts.
+// The framebuffers under the provider (NVDisplayNub): NVFramebuffer, a live one, as object pointers for AGDC to convert
+// (see the header). Read at call time, since IOPresentment asks each time it builds an association and NVFramebuffer may
+// attach after this object starts. Not retained: AGDC converts them in the same call, and NVFramebuffer stays
+// attached to the nub for the boot.
 UInt32 NVAGDCControl::listFramebuffers(uint8_t *out, UInt32 slots) const
 {
     UInt32 n = 0;
@@ -95,7 +100,7 @@ UInt32 NVAGDCControl::listFramebuffers(uint8_t *out, UInt32 slots) const
             continue;
         if (n >= slots)
             break;
-        put64(out, 8 * n, s->getRegistryEntryID());
+        put64(out, 8 * n, (UInt64)(uintptr_t)s);
         n++;
     }
     return n;
@@ -126,8 +131,10 @@ IOReturn NVAGDCControl::gpuCapability(unsigned long *out, unsigned long *outCoun
     static UInt32 lastCount = 0xffffffff;
     static UInt64 lastFB = 0;
     UInt64 fb = 0;
-    if (n)
+    if (n) {
         memcpy(&fb, b + kListOffset, 8);
+        fb = ((IORegistryEntry *)(uintptr_t)fb)->getRegistryEntryID();
+    }
     if (n != lastCount || fb != lastFB) {
         LOG("GPU capability: %u framebuffer(s), first regID %#llx", n, (unsigned long long)fb);
         lastCount = n;
