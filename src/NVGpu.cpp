@@ -1347,6 +1347,21 @@ bool NVBringup::fbWanted()
 // kIONVRAMSyncNowPropertyKey does. True if the variable was set, which makes it apply to this boot only.
 bool NVBringup::nvramOneShot(const char *name)
 {
+    // OpenCore injects this kext, so start() can run before AppleEFINVRAM has loaded the OS's variables into /options:
+    // then a variable set with `nvram` is missing here and the one-shot is silently ignored (2026-10-10 13:06 and 13:14,
+    // with nvdpipe-once=1 still set after boot). Wait for the controller first; it is up within a second of boot.
+    static bool nvramReady = false;
+    if (!nvramReady) {
+        OSDictionary *match = IOService::serviceMatching("AppleEFINVRAM");
+        IOService *ctl = match ? IOService::waitForMatchingService(match, 10ULL * NSEC_PER_SEC) : nullptr;
+        OSSafeReleaseNULL(match);
+        if (ctl) {
+            ctl->release();
+        } else {
+            LOG("nvram: AppleEFINVRAM not up after 10 s; reading /options anyway");
+        }
+        nvramReady = true;
+    }
     IORegistryEntry *opts = IORegistryEntry::fromPath("/options", gIODTPlane);
     OSObject *v = opts ? opts->copyProperty(name) : nullptr;
     if (!v) {
