@@ -26,4 +26,7 @@ private:
     task_t task_ = nullptr;
     bool closed_ = false;
     bool control_ = false;          // NVMAC_CONTROL_TYPE: power control only, no GPU connection
+
+public:
+    bool allowWindowServer = false; // set by NVBringup::newUserClient on a display-pipe boot, before initWithTask
 };

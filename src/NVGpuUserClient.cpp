@@ -1,4 +1,6 @@
 #include "NVGpuUserClient.hpp"
+#include <sys/kauth.h>
+#include <sys/proc.h>
 #include "nv_uapi.h"
 
 #include <IOKit/IOLib.h>
@@ -7,15 +9,27 @@
 #define super IOUserClient
 OSDefineMetaClassAndStructors(NVGpuUserClient, IOUserClient)
 
+// The calling process is WindowServer: uid 88 (_windowserver) and that process name. initWithTask runs in the caller.
+static bool isWindowServer()
+{
+    char name[32] = {};
+    proc_selfname(name, sizeof(name));
+    return kauth_getuid() == 88 && strcmp(name, "WindowServer") == 0;
+}
+
 bool NVGpuUserClient::initWithTask(task_t owningTask, void *securityToken, UInt32 type,
                                    OSDictionary *properties)
 {
     // Root, or the user logged in at the console (connections are isolated from each other:
     // own VA space, unprivileged channels, scrubbed VRAM). nvgpu_users=1 lets anyone in.
+    // On a display-pipe boot, also WindowServer: it runs as _windowserver (uid 88), neither admin nor the console
+    // user, and NVMetal in it opens the GPU through NVK (refused, NVK found no GPU and CoreDisplay's Metal device had
+    // no library: the WindowServer crashes of 2026-10-11 20:18).
     uint32_t users = 0;
     PE_parse_boot_argn("nvgpu_users", &users, sizeof(users));
     if (users != 1 && clientHasPrivilege(securityToken, kIOClientPrivilegeAdministrator) != kIOReturnSuccess &&
-        clientHasPrivilege(securityToken, kIOClientPrivilegeLocalUser) != kIOReturnSuccess)
+        clientHasPrivilege(securityToken, kIOClientPrivilegeLocalUser) != kIOReturnSuccess &&
+        !(allowWindowServer && isWindowServer()))
         return false;
     if (!super::initWithTask(owningTask, securityToken, type, properties))
         return false;
