@@ -2391,10 +2391,12 @@ IOReturn NVBringup::newUserClient(task_t owningTask, void *securityID, UInt32 ty
 {
     if (type != NVMAC_CLIENT_TYPE && type != NVMAC_CONTROL_TYPE)
         return IOService::newUserClient(owningTask, securityID, type, properties, handler);
-    NVGpuUserClient *c = OSTypeAlloc(NVGpuUserClient);
+    // WindowServer on a display-pipe boot gets the IOAccel-named class, the only kind its sandbox lets it open
+    const bool ws = dispPipeArmed_ && NVGpuUserClient::callerIsWindowServer();
+    NVGpuUserClient *c = ws ? OSTypeAlloc(IOAccelNVGpuUserClient) : OSTypeAlloc(NVGpuUserClient);
     if (!c)
         return kIOReturnNoMemory;
-    c->allowWindowServer = dispPipeArmed_;    // both types: NVK lists the GPU through the control client first
+    c->allowWindowServer = ws;                // both types: NVK lists the GPU through the control client first
     if (!c->initWithTask(owningTask, securityID, type, properties)) {
         c->release();
         return kIOReturnNotPrivileged;

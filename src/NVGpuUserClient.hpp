@@ -29,4 +29,13 @@ private:
 
 public:
     bool allowWindowServer = false; // set by NVBringup::newUserClient on a display-pipe boot, before initWithTask
+    static bool callerIsWindowServer();
+};
+
+// The same client under a name WindowServer's sandbox lets it open: com.apple.WindowServer.sb allows iokit-open only
+// for listed user-client classes and the prefixes IOAccel, IOFramebuffer, IOHID and IOSurface, and denied
+// NVGpuUserClient ("deny(1) iokit-open-user-client NVGpuUserClient", 2026-10-11 20:32). NVBringup::newUserClient makes
+// this class only for WindowServer on a display-pipe boot.
+class IOAccelNVGpuUserClient : public NVGpuUserClient {
+    OSDeclareDefaultStructors(IOAccelNVGpuUserClient)
 };

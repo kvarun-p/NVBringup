@@ -9,8 +9,11 @@
 #define super IOUserClient
 OSDefineMetaClassAndStructors(NVGpuUserClient, IOUserClient)
 
-// The calling process is WindowServer: uid 88 (_windowserver) and that process name. initWithTask runs in the caller.
-static bool isWindowServer()
+OSDefineMetaClassAndStructors(IOAccelNVGpuUserClient, NVGpuUserClient)
+
+// The calling process is WindowServer: uid 88 (_windowserver) and that process name. newUserClient and initWithTask run
+// in the caller.
+bool NVGpuUserClient::callerIsWindowServer()
 {
     char name[32] = {};
     proc_selfname(name, sizeof(name));
@@ -30,7 +33,7 @@ bool NVGpuUserClient::initWithTask(task_t owningTask, void *securityToken, UInt3
     PE_parse_boot_argn("nvgpu_users", &users, sizeof(users));
     if (users != 1 && clientHasPrivilege(securityToken, kIOClientPrivilegeAdministrator) != kIOReturnSuccess &&
         clientHasPrivilege(securityToken, kIOClientPrivilegeLocalUser) != kIOReturnSuccess &&
-        !(allowWindowServer && isWindowServer()))
+        !(allowWindowServer && callerIsWindowServer()))
         return false;
     if (!super::initWithTask(owningTask, securityToken, type, properties))
         return false;
