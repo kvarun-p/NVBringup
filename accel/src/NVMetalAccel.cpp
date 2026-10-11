@@ -324,6 +324,8 @@ static void publishBound(bool on)
 
 static void noteError(IOReturn r)
 {
+    if (gErrors < 8)            // the first few in the log: the counters below are lost if the machine goes down
+        LOG("display pipe error %#x (%llu before it)", r, (unsigned long long)gErrors);
     gErrors++;
     gLastError = (uint32_t)r;
     publishU("NVPipeErrors", gErrors);
@@ -789,6 +791,10 @@ IOReturn NVDisplayPipe::copyPlane0(IOAccelDisplayPipeTransaction2 *txn)
     if (!ap)
         return kIOReturnNotReady;
 
+    if (gSubmits <= 3)          // the first frames in the log, for the same reason
+        LOG("frame %llu: surface %ux%u pitch %u -> framebuffer %ux%u pitch %u, aperture %#llx+%#llx",
+            (unsigned long long)gSubmits, sw, sh, spitch, fw, fh, fpitch, (unsigned long long)ap->getPhysicalAddress(),
+            (unsigned long long)ap->getLength());
     const uint32_t w = sw < fw ? sw : fw, h = sh < fh ? sh : fh;
     uint32_t x0 = 0, y0 = 0, x1 = w, y1 = h;
     const IOAccelDisplayRect d = txn->getPlaneDirtyRect(0);
@@ -826,6 +832,8 @@ IOReturn NVDisplayPipe::copyPlane0(IOAccelDisplayPipeTransaction2 *txn)
         smap->release();
     src->complete();
     ap->release();          // getApertureRange returns it retained: one leaked reference per frame overflows
+    if (gSubmits <= 3)
+        LOG("frame %llu: copied rows %u..%u cols %u..%u: %#x", (unsigned long long)gSubmits, y0, y1, x0, x1, r);
     return r;
 }
 
