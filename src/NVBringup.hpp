@@ -275,6 +275,8 @@ private:
     PipeSrc  pipeSrc_[kPipeSrcs];
     uint64_t pipeUse_ = 0;
     IOReturn pipeCopy(OSObject *key, IOMemoryDescriptor *md, struct nv_pipe_copy *a);
+    uint32_t dispLinesToVblank();               // raster lines until head 0's next vblank starts (0: unknown)
+    uint64_t dispLinesAbs(uint32_t lines);      // their duration, in absolute time units
     int      pipeSrcMap(OSObject *key, IOMemoryDescriptor *md);   // the slot holding the source, or -1
     void     pipeSrcDrop(uint32_t i, bool unmap);
     void     pipeSrcFlush(bool unmap);

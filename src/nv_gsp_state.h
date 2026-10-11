@@ -210,6 +210,9 @@ struct NVBringup::GspState {
         bool     cursOn = false;        // head 0's cursor is enabled (core methods since the last modeset)
         bool     cursHave = false;      // curs holds an image (NVFramebuffer's setCursorImage)
         uint32_t front = 0;             // which one window 0 scans out (0: fb)
+        int      pipePend = -1;         // the display pipe's last flip, until it is on screen (pipeCopy)
+        uint64_t pipePendAt = 0;        // when it is: the first vblank after its UPDATE (absolute time)
+        uint64_t pipeFlips = 0, pipeWaits = 0, pipeWaitUs = 0;   // NVPipeFlips: flips, frames that waited, total wait
         uint32_t flipBy[4] = {};        // flips completed by: timeout (0), notifier (1), armed state (2), armed
                                         // state with the raster not seen passing a vblank (3)
         uint16_t latchLine[24] = {};    // raster line at which the first flips were seen latched

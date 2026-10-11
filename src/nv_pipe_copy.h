@@ -21,6 +21,10 @@
 //                             (void *)(uintptr_t)visible, nullptr)
 //       the image's top-left in framebuffer pixels; doesn't block (callable from IOFramebuffer's cursor paths)
 // NVDisplayFB's CursorSize (256) says the cursor is available.
+// Head 0's vblank, for NVFramebuffer's vertical blank timer:
+//   gpu->callPlatformFunction(sym(NV_VBLANK_LINES_FN), false, &lines, nullptr, nullptr, nullptr)
+//       lines (uint32_t): raster lines until the next vblank starts, 0 when unknown
+#define NV_VBLANK_LINES_FN    "NVVblankLines"
 #define NV_CURSOR_IMAGE_FN    "NVCursorImage"
 #define NV_CURSOR_MOVE_FN     "NVCursorMove"
 

@@ -947,7 +947,8 @@ IOReturn NVDisplayPipe::copyPlane0(IOAccelDisplayPipeTransaction2 *txn)
     }
 
     uint32_t gpuUs = 0;
-    if (gpuCopy(fb, s, src, spitch, x0, y0, x1, y1, fw, fh, fpitch, &gpuUs)) {
+    // The whole frame: NVBringup presents it with a flip, into a buffer that holds an older frame.
+    if (gpuCopy(fb, s, src, spitch, 0, 0, w, h, fw, fh, fpitch, &gpuUs)) {
         ap->release();
         noteCopy((uint64_t)(x1 - x0) * (y1 - y0), (uint64_t)w * h, gpuUs, true);
         if (gSubmits <= 3)

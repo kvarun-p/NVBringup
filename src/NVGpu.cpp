@@ -1052,6 +1052,7 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
     }
     bar1Flush();
     d.front = 0;
+    d.pipePend = -1;
 
     // SOR: DFP_ASSIGN_SOR for the display, as r535_outp_acquire.
     {
@@ -1189,6 +1190,7 @@ void NVBringup::dispBlank()
     dispMthd(true, 0x200, 1);
     dispKick(true);
     cursorLive(false);
+    d.pipePend = -1;
     if (d.cursOn) {
         dispMthd(false, 0x209c, 0xcf);                                            // CONTROL_CURSOR: disabled
         dispMthd(false, 0x2088, 0);                                               // CONTEXT_DMA_CURSOR: none
@@ -1717,6 +1719,11 @@ IOReturn NVBringup::callPlatformFunction(const OSSymbol *functionName, bool wait
 {
     if (functionName && functionName->isEqualTo(NV_PIPE_COPY_FN))
         return pipeCopy((OSObject *)param1, (IOMemoryDescriptor *)param2, (nv_pipe_copy *)param3);
+    if (functionName && functionName->isEqualTo(NV_VBLANK_LINES_FN)) {
+        if (param1)
+            *(uint32_t *)param1 = dispLinesToVblank();
+        return kIOReturnSuccess;
+    }
     if (functionName && functionName->isEqualTo(NV_CURSOR_IMAGE_FN))
         return cursorImage((const uint32_t *)param1, (uint32_t)(uintptr_t)param2, (uint32_t)(uintptr_t)param3);
     if (functionName && functionName->isEqualTo(NV_CURSOR_MOVE_FN))
@@ -1838,27 +1845,56 @@ IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy
         return r;
     }
     GspState::DispHw &d = g->disp;
-    const NVDispMem &f = d.fb;                  // NVDisplayFB's surface: NVFramebuffer's aperture
-    if (!f.pa || a->dstWidth != d.w || a->dstHeight != d.h || a->dstPitch != d.pitch ||
-        a->x1 > d.w || a->y1 > d.h || (uint64_t)d.pitch * (a->y1 - 1) + (uint64_t)a->x1 * 4 > f.size) {
+    // Presented with a flip at the vblank (window 0, non-tearing), into a buffer that isn't on screen: the one
+    // window 0 shows (front) and the one flipped to last (pipePend, until its vblank has passed) are off limits;
+    // with three buffers one is always left. A frame that comes before the last flip is on screen waits for it.
+    const uint64_t need = (uint64_t)d.pitch * (d.h - 1) + (uint64_t)d.w * 4;
+    const bool flips = d.fbB.pa && d.fbC.pa && d.fbB.size >= need && d.fbC.size >= need && d.fb.size >= need &&
+                       d.vtotal && d.pclkKhz && d.htotal;
+    if (!d.fb.pa || a->dstWidth != d.w || a->dstHeight != d.h || a->dstPitch != d.pitch ||
+        a->x1 > d.w || a->y1 > d.h || (uint64_t)d.pitch * (a->y1 - 1) + (uint64_t)a->x1 * 4 > d.fb.size) {
         IOLockUnlock(gspLock_);
         return r;
     }
+    uint64_t waitedAbs = 0;
+    if (flips && d.pipePend >= 0) {
+        const uint64_t at = d.pipePendAt, w0 = mach_absolute_time();
+        IOLockUnlock(gspLock_);
+        for (int i = 0; i < 40 && mach_absolute_time() < at; i++)     // at most a frame; 40 ms if the clock is off
+            IOSleep(1);
+        waitedAbs = at > w0 ? mach_absolute_time() - w0 : 0;
+        IOLockLock(gspLock_);
+        g = gsp_;
+        if (!g || !g->booted || !g->utilOk || !g->pd3 || !g->dispLit || !g->disp.ready) {
+            IOLockUnlock(gspLock_);
+            return r;
+        }
+        if (g->disp.pipePend >= 0) {
+            g->disp.front = (uint32_t)g->disp.pipePend;
+            g->disp.pipePend = -1;
+        }
+    }
+    GspState::DispHw &dd = g->disp;
+    const uint32_t target = flips ? (dd.front + 1) % 3 : 0;
+    NVDispMem *const now[3] = { &dd.fb, &dd.fbB, &dd.fbC };     // g may be a new GspState after the wait
+    const NVDispMem &f = *now[target];
+    // A flip shows the whole buffer, which holds an older frame: the whole frame is copied, not the dirty rect.
+    const uint32_t x0 = flips ? 0 : a->x0, y0 = flips ? 0 : a->y0;
     const int slot = pipeSrcMap(key, md);
     if (slot < 0) {
         IOLockUnlock(gspLock_);
         return kIOReturnNoMemory;
     }
-    const uint64_t in = kPipeVa + (uint64_t)slot * kPipeVaSlot + (uint64_t)a->y0 * a->srcPitch + (uint64_t)a->x0 * 4;
-    const uint64_t out = f.pa + (uint64_t)a->y0 * d.pitch + (uint64_t)a->x0 * 4;
+    const uint64_t in = kPipeVa + (uint64_t)slot * kPipeVaSlot + (uint64_t)y0 * a->srcPitch + (uint64_t)x0 * 4;
+    const uint64_t out = f.pa + (uint64_t)y0 * dd.pitch + (uint64_t)x0 * 4;
     const uint32_t subch = 4, payload = 0x5d000000u | (++g->utilSeq & 0xffffff);
     TestChan &c = g->util;
     const uint32_t push[] = {
         pbHeader(subch, 0x000, 1), chip_->arch->cls.copy,                              // SET_OBJECT
         pbHeader(subch, NVC5B5_SET_DST_PHYS_MODE_, 1), 0,                              // LOCAL_FB
         pbHeader(subch, 0x400, 4), (uint32_t)(in >> 32), (uint32_t)in, (uint32_t)(out >> 32), (uint32_t)out,
-        pbHeader(subch, 0x410, 4), a->srcPitch, d.pitch, (a->x1 - a->x0) * 4, a->y1 - a->y0,  // PITCH_IN/OUT,
-        pbHeader(subch, 0x240, 3), (uint32_t)(c.vaSem >> 32), (uint32_t)c.vaSem, payload,   // LINE_LENGTH, COUNT
+        pbHeader(subch, 0x410, 4), a->srcPitch, dd.pitch, (a->x1 - x0) * 4, a->y1 - y0,  // PITCH_IN/OUT,
+        pbHeader(subch, 0x240, 3), (uint32_t)(c.vaSem >> 32), (uint32_t)c.vaSem, payload, // LINE_LENGTH, COUNT
         // LAUNCH_DMA: non-pipelined, flush, release one word, pitch -> pitch, multi-line, virtual source,
         // physical destination
         pbHeader(subch, 0x300, 1), 2u | 1u << 2 | 1u << 3 | 1u << 7 | 1u << 8 | 1u << 9 | 1u << 13,
@@ -1870,8 +1906,56 @@ IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy
     a->gpuUs = (uint32_t)(ns / 1000);
     if (!ok)                                    // what the slot held is suspect: map it again next time
         pipeSrcDrop((uint32_t)slot, true);
+    if (ok && flips && target != dd.front) {
+        dispMthd(true, 0x260, (uint32_t)(f.pa >> 8));                     // window 0, offset 0: the buffer
+        dispMthd(true, 0x370, 0);                                         // not interlocked with the core
+        dispMthd(true, 0x374, 0);
+        dispMthd(true, 0x200, 1);                                         // UPDATE: latched at the next vblank
+        uint32_t lines = dispLinesToVblank();
+        if (!lines)
+            lines = dd.vtotal;
+        dd.pipePend = (int)target;
+        dd.pipePendAt = mach_absolute_time() + dispLinesAbs(lines + 2);  // two lines' margin
+        dd.pipeFlips++;
+        if (waitedAbs) {
+            uint64_t wns = 0;
+            absolutetime_to_nanoseconds(waitedAbs, &wns);
+            dd.pipeWaits++;
+            dd.pipeWaitUs += wns / 1000;
+        }
+        if (dd.pipeFlips % 120 == 1) {
+            char m[96];
+            snprintf(m, sizeof(m), "%llu flips; %llu waited for the previous one, %llu us in all",
+                     (unsigned long long)dd.pipeFlips, (unsigned long long)dd.pipeWaits,
+                     (unsigned long long)dd.pipeWaitUs);
+            setProperty("NVPipeFlips", m);
+        }
+    }
     IOLockUnlock(gspLock_);
     return ok ? kIOReturnSuccess : kIOReturnTimeout;
+}
+
+// Head 0's raster: lines until the next vblank starts (the line after blank start, vbS), a whole frame when it
+// starts now; 0 when the display isn't lit. The raster line is 0x616330 (gv100_head_rgpos). No lock: one read.
+uint32_t NVBringup::dispLinesToVblank()
+{
+    GspState *g = gsp_;
+    if (!g || !g->dispLit || !g->disp.ready || !g->disp.vtotal)
+        return 0;
+    const uint32_t vt = g->disp.vtotal, line = rd32(0x616330) & 0xffff;
+    if (line >= vt)
+        return 0;
+    const uint32_t n = (g->disp.vbS + 1 + vt - line) % vt;
+    return n ? n : vt;
+}
+
+uint64_t NVBringup::dispLinesAbs(uint32_t lines)
+{
+    GspState *g = gsp_;
+    uint64_t abs = 0;
+    if (g && g->disp.pclkKhz)
+        nanoseconds_to_absolutetime((uint64_t)lines * g->disp.htotal * 1000000ull / g->disp.pclkKhz, &abs);
+    return abs;
 }
 
 // GSP-RM is going down (sleep, idle, unload): the display engine with it. The kernel mappings go; the
@@ -1892,6 +1976,7 @@ void NVBringup::dispLost()
     for (NVDispMem *m : surfaces)
         *m = NVDispMem();
     d.cursChan = d.cursOn = d.cursHave = false;     // the channel goes with the client
+    d.pipePend = -1;
     d.ready = false;
     d.litId = 0;
     g->dispLit = false;
