@@ -210,9 +210,12 @@ struct NVBringup::GspState {
         bool     cursOn = false;        // head 0's cursor is enabled (core methods since the last modeset)
         bool     cursHave = false;      // curs holds an image (NVFramebuffer's setCursorImage)
         uint32_t front = 0;             // which one window 0 scans out (0: fb)
-        // The display pipe's flips (pipeCopy), latest frame wins: pipeArmed is the buffer window 0 was last flipped
-        // to; a buffer flipped away from may still be on screen until the vblank after that (pipeFreeAt).
+        // The display pipe's flips (pipeCopy). Window 0 presents with a minimum interval of one frame, so flips
+        // queue: each is shown at the first vblank after its UPDATE, but no sooner than a frame after the one
+        // before it. pipeArmed is the buffer last flipped to, pipeShowAt when it is (or was) shown; a buffer is in
+        // use until the flip after it is shown (pipeFreeAt).
         uint32_t pipeArmed = 0;
+        uint64_t pipeShowAt = 0;
         uint64_t pipeFreeAt[3] = {};
         uint64_t pipeFlips = 0, pipeWaits = 0, pipeWaitUs = 0;   // NVPipeFlips: flips, frames that waited, total wait
         uint32_t flipBy[4] = {};        // flips completed by: timeout (0), notifier (1), armed state (2), armed

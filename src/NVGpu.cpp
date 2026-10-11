@@ -1053,6 +1053,7 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
     bar1Flush();
     d.front = 0;
     d.pipeArmed = 0;
+    d.pipeShowAt = 0;
     d.pipeFreeAt[0] = d.pipeFreeAt[1] = d.pipeFreeAt[2] = 0;
 
     // SOR: DFP_ASSIGN_SOR for the display, as r535_outp_acquire.
@@ -1845,10 +1846,10 @@ IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy
         return r;
     }
     GspState::DispHw &d = g->disp;
-    // Presented with a flip at the vblank (window 0, non-tearing), latest frame wins: the copy goes into a buffer
-    // that is neither the one window 0 was last flipped to nor one that may still be on screen (flipped away from
-    // less than a vblank ago); with three buffers one is free unless frames come faster than two per refresh,
-    // and then this waits (at most a frame) instead of writing into what the display reads.
+    // Presented with a flip at the vblank (window 0, non-tearing, flips queue in order): the copy goes into a
+    // buffer that is neither the one window 0 was last flipped to nor one still on screen or queued (pipeFreeAt).
+    // With three buffers one is free unless two flips are already queued, and then this waits for the next one
+    // to be shown (at most a frame). Writing into a queued buffer showed frames out of order (2026-10-12).
     const uint64_t need = (uint64_t)d.pitch * (d.h - 1) + (uint64_t)d.w * 4;
     const bool flips = d.fbB.pa && d.fbC.pa && d.fbB.size >= need && d.fbC.size >= need && d.fb.size >= need &&
                        d.vtotal && d.pclkKhz && d.htotal;
@@ -1928,8 +1929,14 @@ IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy
         uint32_t lines = dispLinesToVblank();
         if (!lines)
             lines = dd.vtotal;
-        // The buffer flipped away from may be on screen until the vblank after this UPDATE (two lines' margin).
-        dd.pipeFreeAt[dd.pipeArmed] = mach_absolute_time() + dispLinesAbs(lines + 2);
+        // Shown at the next vblank (two lines' margin), or a frame after the flip before it if that one is still
+        // queued; the buffer before is on screen until then.
+        uint64_t showAt = mach_absolute_time() + dispLinesAbs(lines + 2);
+        const uint64_t frame = dispLinesAbs(dd.vtotal);
+        if (dd.pipeShowAt && showAt < dd.pipeShowAt + frame)
+            showAt = dd.pipeShowAt + frame;
+        dd.pipeFreeAt[dd.pipeArmed] = showAt;
+        dd.pipeShowAt = showAt;
         dd.pipeArmed = (uint32_t)target;
         dd.front = (uint32_t)target;
         dd.pipeFlips++;
