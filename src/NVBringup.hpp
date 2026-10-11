@@ -248,7 +248,8 @@ private:
     IOLock   *dispNubLock_ = nullptr;           // orders dispNubSync; taken before gspLock_, never under it
     bool     dispPipeArmed_ = false;            // the display pipe gate (nvdpipe=1 or nvdpipe-once), set in start()
     // Armed, start() holds this service busy until the first NVDisplayNub is registered, so WindowServer's
-    // IOKitWaitQuiet (WSInitialize, 60 s) waits for NVFramebuffer; bootBusyCall_ drops it after 15 s regardless.
+    // IOKitWaitQuiet (WSInitialize, 60 s) waits for NVFramebuffer; bootBusyCall_ drops it after 50 s regardless
+    // (WindowServer waits 60 s; the GSP boot comes from a LaunchDaemon, more than 15 s after start()).
     volatile uint32_t bootBusy_ = 0;
     thread_call_t bootBusyCall_ = nullptr;
     void bootBusyRelease(const char *why);

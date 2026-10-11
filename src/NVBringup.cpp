@@ -83,7 +83,7 @@ bool NVBringup::start(IOService *provider)
             bootBusy_ = 1;
             adjustBusy(1);
             uint64_t dl;
-            clock_interval_to_deadline(15, kSecondScale, &dl);
+            clock_interval_to_deadline(50, kSecondScale, &dl);
             thread_call_enter_delayed(bootBusyCall_, dl);
         }
         setProperty("NVDisplayPipeArmed", kOSBooleanTrue);
@@ -129,7 +129,7 @@ bool NVBringup::start(IOService *provider)
 
 // Stops GSP-RM, releases BAR0/ACPI and closes the PCI device. Idempotent.
 // Drops start()'s busy hold once: when the first NVDisplayNub is registered (its own matching keeps IOKit busy until
-// NVFramebuffer has started), or after 15 s, or at shutdown.
+// NVFramebuffer has started), or after 50 s, or at shutdown.
 void NVBringup::bootBusyRelease(const char *why)
 {
     if (OSCompareAndSwap(1, 0, &bootBusy_)) {
@@ -140,7 +140,7 @@ void NVBringup::bootBusyRelease(const char *why)
 
 void NVBringup::bootBusyThunk(thread_call_param_t self, thread_call_param_t)
 {
-    ((NVBringup *)self)->bootBusyRelease("15 s without a display nub");
+    ((NVBringup *)self)->bootBusyRelease("50 s without a display nub");
 }
 
 void NVBringup::shutdownHw()
