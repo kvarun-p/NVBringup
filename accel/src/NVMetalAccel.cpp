@@ -73,9 +73,7 @@ public:
     n_ret submitTransaction(IOAccelDisplayPipeTransaction2 *txn) override;
     n_ret initFramebufferResource(unsigned int index, IOAccelResource2 *res) override;
     n_ret destroyFramebufferResource(unsigned int index, IOAccelResource2 *res) override;
-    void free() override;
 private:
-    IOAccelSysMemory *fbMem_ = nullptr;     // the framebuffer aperture as the pipe's framebuffer resource memory
     static const uint32_t kDoneRing = 16;   // more than the 4 transactions the family keeps in flight
     uint64_t done_[kDoneRing] = {};         // transaction id + 1 of recently copied transactions; 0 = empty
     uint32_t doneNext_ = 0;
@@ -755,7 +753,9 @@ extern IOAccelSysMemory *nvAccelSysMemoryWithDescriptor(IOGraphicsAccelerator2 *
 // init_framebuffer_resource, run from the pipe's displayModeDidChange: it needs this slot to return the memory for
 // the framebuffer resource (the base forwards to the display machine's slot 271, a stub that returns NULL). As
 // AppleParavirtDisplayPipe does, the framebuffer's memory (here its system aperture, BAR1) wrapped for the resource;
-// the caller stores it at res+136 and prepares it. Kept here and released in 268.
+// the caller stores it at res+136, prepares it and owns it: the family releases it itself before it calls 268 (keeping
+// a pointer here and releasing it in 268 released a freed object: panic in display_mode_will_change, 2026-10-11 22:44).
+// So each call makes a new wrapper and hands it over.
 n_ret NVDisplayPipe::initFramebufferResource(unsigned int index, IOAccelResource2 *res)
 {
     IOFramebuffer *fb = getFramebuffer();
@@ -764,30 +764,24 @@ n_ret NVDisplayPipe::initFramebufferResource(unsigned int index, IOAccelResource
         LOG("initFramebufferResource(%u): no %s", index, !fb ? "framebuffer" : !a ? "accelerator" : "resource");
         return 0;
     }
-    if (fbMem_)
-        return (n_ret)(uintptr_t)fbMem_;
     IODeviceMemory *ap = fb->getApertureRange(kIOFBSystemAperture);
     if (!ap) {
         LOG("initFramebufferResource(%u): the framebuffer has no aperture", index);
         return 0;
     }
-    fbMem_ = nvAccelSysMemoryWithDescriptor(a, res, ap);
+    IOAccelSysMemory *m = nvAccelSysMemoryWithDescriptor(a, res, ap);
     ap->release();          // getApertureRange returns it retained; the wrapper keeps its own reference
-    LOG("initFramebufferResource(%u): %s", index, fbMem_ ? "framebuffer aperture wrapped" : "wrap failed");
-    return (n_ret)(uintptr_t)fbMem_;
+    static volatile SInt32 logged = 0;
+    if (!m || OSIncrementAtomic(&logged) < 4)
+        LOG("initFramebufferResource(%u): %s", index, m ? "framebuffer aperture wrapped" : "wrap failed");
+    return (n_ret)(uintptr_t)m;
 }
 
+// The family has released what 267 returned; nothing of ours to free.
 n_ret NVDisplayPipe::destroyFramebufferResource(unsigned int index, IOAccelResource2 *)
 {
     (void)index;
-    OSSafeReleaseNULL(fbMem_);
     return 0;
-}
-
-void NVDisplayPipe::free()
-{
-    OSSafeReleaseNULL(fbMem_);
-    IOAccelDisplayPipe::free();
 }
 
 // Plane 0 of the transaction, if it is a 'BGRA' IOSurface. Otherwise the reason it is refused.
