@@ -1052,7 +1052,8 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
     }
     bar1Flush();
     d.front = 0;
-    d.pipePend = -1;
+    d.pipeArmed = 0;
+    d.pipeFreeAt[0] = d.pipeFreeAt[1] = d.pipeFreeAt[2] = 0;
 
     // SOR: DFP_ASSIGN_SOR for the display, as r535_outp_acquire.
     {
@@ -1190,7 +1191,6 @@ void NVBringup::dispBlank()
     dispMthd(true, 0x200, 1);
     dispKick(true);
     cursorLive(false);
-    d.pipePend = -1;
     if (d.cursOn) {
         dispMthd(false, 0x209c, 0xcf);                                            // CONTROL_CURSOR: disabled
         dispMthd(false, 0x2088, 0);                                               // CONTEXT_DMA_CURSOR: none
@@ -1845,9 +1845,10 @@ IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy
         return r;
     }
     GspState::DispHw &d = g->disp;
-    // Presented with a flip at the vblank (window 0, non-tearing), into a buffer that isn't on screen: the one
-    // window 0 shows (front) and the one flipped to last (pipePend, until its vblank has passed) are off limits;
-    // with three buffers one is always left. A frame that comes before the last flip is on screen waits for it.
+    // Presented with a flip at the vblank (window 0, non-tearing), latest frame wins: the copy goes into a buffer
+    // that is neither the one window 0 was last flipped to nor one that may still be on screen (flipped away from
+    // less than a vblank ago); with three buffers one is free unless frames come faster than two per refresh,
+    // and then this waits (at most a frame) instead of writing into what the display reads.
     const uint64_t need = (uint64_t)d.pitch * (d.h - 1) + (uint64_t)d.w * 4;
     const bool flips = d.fbB.pa && d.fbC.pa && d.fbB.size >= need && d.fbC.size >= need && d.fb.size >= need &&
                        d.vtotal && d.pclkKhz && d.htotal;
@@ -1856,26 +1857,39 @@ IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy
         IOLockUnlock(gspLock_);
         return r;
     }
-    uint64_t waitedAbs = 0;
-    if (flips && d.pipePend >= 0) {
-        const uint64_t at = d.pipePendAt, w0 = mach_absolute_time();
+    auto pickFree = [](GspState::DispHw &h, uint64_t now, uint64_t *soonest) -> int {
+        int best = -1;
+        *soonest = ~0ull;
+        for (uint32_t b = 0; b < 3; b++) {
+            if (b == h.pipeArmed)
+                continue;
+            if (now >= h.pipeFreeAt[b]) {
+                if (best < 0 || h.pipeFreeAt[b] < h.pipeFreeAt[best])
+                    best = (int)b;
+            } else if (h.pipeFreeAt[b] < *soonest) {
+                *soonest = h.pipeFreeAt[b];
+            }
+        }
+        return best;
+    };
+    uint64_t waitedAbs = 0, soonest = 0;
+    int target = 0;
+    if (flips && (target = pickFree(d, mach_absolute_time(), &soonest)) < 0) {
+        const uint64_t w0 = mach_absolute_time();
         IOLockUnlock(gspLock_);
-        for (int i = 0; i < 40 && mach_absolute_time() < at; i++)     // at most a frame; 40 ms if the clock is off
+        for (int i = 0; i < 40 && mach_absolute_time() < soonest; i++)  // at most a frame; 40 ms if the clock is off
             IOSleep(1);
-        waitedAbs = at > w0 ? mach_absolute_time() - w0 : 0;
+        waitedAbs = mach_absolute_time() - w0;
         IOLockLock(gspLock_);
         g = gsp_;
         if (!g || !g->booted || !g->utilOk || !g->pd3 || !g->dispLit || !g->disp.ready) {
             IOLockUnlock(gspLock_);
             return r;
         }
-        if (g->disp.pipePend >= 0) {
-            g->disp.front = (uint32_t)g->disp.pipePend;
-            g->disp.pipePend = -1;
-        }
+        if ((target = pickFree(g->disp, ~0ull, &soonest)) < 0)          // the clock was off: take the oldest
+            target = (int)((g->disp.pipeArmed + 1) % 3);
     }
     GspState::DispHw &dd = g->disp;
-    const uint32_t target = flips ? (dd.front + 1) % 3 : 0;
     NVDispMem *const now[3] = { &dd.fb, &dd.fbB, &dd.fbC };     // g may be a new GspState after the wait
     const NVDispMem &f = *now[target];
     // A flip shows the whole buffer, which holds an older frame: the whole frame is copied, not the dirty rect.
@@ -1906,7 +1920,7 @@ IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy
     a->gpuUs = (uint32_t)(ns / 1000);
     if (!ok)                                    // what the slot held is suspect: map it again next time
         pipeSrcDrop((uint32_t)slot, true);
-    if (ok && flips && target != dd.front) {
+    if (ok && flips && (uint32_t)target != dd.pipeArmed) {
         dispMthd(true, 0x260, (uint32_t)(f.pa >> 8));                     // window 0, offset 0: the buffer
         dispMthd(true, 0x370, 0);                                         // not interlocked with the core
         dispMthd(true, 0x374, 0);
@@ -1914,8 +1928,10 @@ IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy
         uint32_t lines = dispLinesToVblank();
         if (!lines)
             lines = dd.vtotal;
-        dd.pipePend = (int)target;
-        dd.pipePendAt = mach_absolute_time() + dispLinesAbs(lines + 2);  // two lines' margin
+        // The buffer flipped away from may be on screen until the vblank after this UPDATE (two lines' margin).
+        dd.pipeFreeAt[dd.pipeArmed] = mach_absolute_time() + dispLinesAbs(lines + 2);
+        dd.pipeArmed = (uint32_t)target;
+        dd.front = (uint32_t)target;
         dd.pipeFlips++;
         if (waitedAbs) {
             uint64_t wns = 0;
@@ -1925,7 +1941,7 @@ IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy
         }
         if (dd.pipeFlips % 120 == 1) {
             char m[96];
-            snprintf(m, sizeof(m), "%llu flips; %llu waited for the previous one, %llu us in all",
+            snprintf(m, sizeof(m), "%llu flips; %llu waited for a free buffer, %llu us in all",
                      (unsigned long long)dd.pipeFlips, (unsigned long long)dd.pipeWaits,
                      (unsigned long long)dd.pipeWaitUs);
             setProperty("NVPipeFlips", m);
@@ -1976,7 +1992,6 @@ void NVBringup::dispLost()
     for (NVDispMem *m : surfaces)
         *m = NVDispMem();
     d.cursChan = d.cursOn = d.cursHave = false;     // the channel goes with the client
-    d.pipePend = -1;
     d.ready = false;
     d.litId = 0;
     g->dispLit = false;

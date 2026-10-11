@@ -399,19 +399,6 @@ void NVFramebuffer::vblFire(thread_call_param_t self, thread_call_param_t)
     }
 
     uint64_t next = deadline + period;
-    // On the head's own vblank: NVBringup reads the raster line, so the timer follows the display's clock instead
-    // of drifting against it (WindowServer paces its frames by this, and NVBringup flips at the real vblank).
-    static const OSSymbol *linesFn;
-    if (!linesFn)
-        linesFn = OSSymbol::withCStringNoCopy(NV_VBLANK_LINES_FN);     // kept for the kext's lifetime
-    uint32_t lines = 0;
-    if (fb->gpu_ && linesFn && fb->htotal_ && fb->pclkKhz_ &&
-        fb->gpu_->callPlatformFunction(linesFn, false, &lines, nullptr, nullptr, nullptr) == kIOReturnSuccess &&
-        lines && lines <= fb->vtotal_) {
-        uint64_t toVbl = 0;
-        nanoseconds_to_absolutetime((uint64_t)lines * fb->htotal_ * 1000000ull / fb->pclkKhz_, &toVbl);
-        next = now + (toVbl < period / 2 ? toVbl + period : toVbl);   // just fired near a vblank: the one after
-    }
     if (next <= now)                                    // fell behind: skip to the next frame from now
         next = now + period;
     IOSimpleLockLock(fb->vblLock_);
