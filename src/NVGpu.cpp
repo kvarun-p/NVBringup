@@ -1451,6 +1451,7 @@ void NVBringup::dispNubSync()
                         n->registerService();
                         dispNub_ = n;
                         LOG("display: published NVDisplayNub for NVFramebuffer");
+                        bootBusyRelease("display nub registered");
                     } else {
                         n->release();
                     }

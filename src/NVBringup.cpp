@@ -75,6 +75,17 @@ bool NVBringup::start(IOService *provider)
     uint32_t pipe = 0;
     dispPipeArmed_ = (PE_parse_boot_argn("nvdpipe", &pipe, sizeof(pipe)) && pipe) || pipeOnce;
     if (dispPipeArmed_) {
+        // WindowServer adopts only the framebuffers present when it lists the GPUs, and NVFramebuffer comes after
+        // the GSP boot: about a second too late on some boots (2026-10-10 13:40, 2026-10-11 21:04). WSInitialize
+        // waits for IOKit to go quiet first (IOKitWaitQuiet, 60 s), so stay busy until the nub is registered.
+        bootBusyCall_ = thread_call_allocate(&NVBringup::bootBusyThunk, this);
+        if (bootBusyCall_) {
+            bootBusy_ = 1;
+            adjustBusy(1);
+            uint64_t dl;
+            clock_interval_to_deadline(15, kSecondScale, &dl);
+            thread_call_enter_delayed(bootBusyCall_, dl);
+        }
         setProperty("NVDisplayPipeArmed", kOSBooleanTrue);
         LOG("display pipe armed (%s): NVFramebuffer and the accelerator take part this boot",
             pipeOnce ? "nvdpipe-once" : "boot-arg nvdpipe=1");
@@ -117,8 +128,29 @@ bool NVBringup::start(IOService *provider)
 }
 
 // Stops GSP-RM, releases BAR0/ACPI and closes the PCI device. Idempotent.
+// Drops start()'s busy hold once: when the first NVDisplayNub is registered (its own matching keeps IOKit busy until
+// NVFramebuffer has started), or after 15 s, or at shutdown.
+void NVBringup::bootBusyRelease(const char *why)
+{
+    if (OSCompareAndSwap(1, 0, &bootBusy_)) {
+        adjustBusy(-1);
+        LOG("display: boot busy hold released (%s)", why);
+    }
+}
+
+void NVBringup::bootBusyThunk(thread_call_param_t self, thread_call_param_t)
+{
+    ((NVBringup *)self)->bootBusyRelease("15 s without a display nub");
+}
+
 void NVBringup::shutdownHw()
 {
+    if (bootBusyCall_) {
+        thread_call_cancel_wait(bootBusyCall_);
+        thread_call_free(bootBusyCall_);
+        bootBusyCall_ = nullptr;
+    }
+    bootBusyRelease("shutdown");
     powerFree();                                    // no idle power-off from here on
     if (gspLock_) {                                 // before BAR0 and the device go away
         IOLockLock(gspLock_);

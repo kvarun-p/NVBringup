@@ -247,6 +247,12 @@ private:
     uint32_t dispNubGen_ = 0;                   // the generation dispNub_ was applied for (dispNubLock_)
     IOLock   *dispNubLock_ = nullptr;           // orders dispNubSync; taken before gspLock_, never under it
     bool     dispPipeArmed_ = false;            // the display pipe gate (nvdpipe=1 or nvdpipe-once), set in start()
+    // Armed, start() holds this service busy until the first NVDisplayNub is registered, so WindowServer's
+    // IOKitWaitQuiet (WSInitialize, 60 s) waits for NVFramebuffer; bootBusyCall_ drops it after 15 s regardless.
+    volatile uint32_t bootBusy_ = 0;
+    thread_call_t bootBusyCall_ = nullptr;
+    void bootBusyRelease(const char *why);
+    static void bootBusyThunk(thread_call_param_t self, thread_call_param_t);
     int      fbWanted_ = -1;        // -1: not decided yet (see fbWanted)
     bool     fbWanted();
     bool     nvramOneShot(const char *name);    // reads and deletes an NVRAM one-shot; true if it was set
