@@ -10,8 +10,10 @@
 // that ancestor for this class, so both keys are the accelerator's registry ID. Beside NVFramebuffer, the keys differed
 // and IOPresentment failed with "Interface creation error: 0x815". The kernel's AGDC does the
 // rest: its user client (IOServiceOpen type 2, authorized as WindowServer), its start() queries, and its selector dispatch.
-// This class answers the vendor hook for selector 1 (vendor info) and selector 0x980 (GPU capability), and returns
-// kIOReturnUnsupported for every other selector.
+// This class answers the vendor hook for selector 1 (vendor info), 0x980 (GPU capability), 0x921 (link config: the
+// display's timing) and 0x711 (display pipe capability: the plane and pipeline-scaler blocks), and returns
+// kIOReturnUnsupported for every other selector. 0x921 and 0x711 feed IOPresentment's capability set, without which
+// CoreDisplay never presents to the display (scratchpad/accel-displaypipe/s3/S3-A, S3-B).
 //
 // Byte layouts, from the reads of IOPresentment's CreateAssociationMap (selector 1: +0x24 platform u16, +0x28 kind u32;
 // selector 0x980: +0x30 count u32, +0x3c u64 framebuffer registry IDs) and AGDC's start (vendor class at +0x28 must be 1
@@ -48,12 +50,25 @@ class NVAGDCControl : public AppleGraphicsDeviceControl {
     static constexpr UInt32 kListOffset = 0x3c;
     static constexpr UInt32 kListSlots = 8;            // AGDC converts at most 8 entries
 
+    static constexpr UInt32 kCmdLinkConfig = 0x921;        // GetLinkConfig (IOPresentment: logical device caps)
+    static constexpr UInt32 kCmdPipeCapability = 0x711;    // getDisplayPipeCapabilityExtended
+    static constexpr UInt32 kLinkConfigBytes = 0xb0;
+    static constexpr UInt32 kPipeCapBytes = 0x196c;
+    static constexpr UInt32 kPipeMaskPlanes = 0x10;        // plane scaler: the planes and their pixel formats
+    static constexpr UInt32 kPipeMaskScaler = 0x8;         // pipeline scaler
+    static constexpr UInt32 kAGDCFormatBGRA8 = 0x10000;    // AGDCPixelFormatTypeToIOPresentment: IOP bit 48 (BGRA)
+
     static bool gateArmed(IOService *accel);
+    static void put16(uint8_t *b, UInt32 off, UInt16 v) { memcpy(b + off, &v, 2); }
     static void put32(uint8_t *b, UInt32 off, UInt32 v) { memcpy(b + off, &v, 4); }
     static void put64(uint8_t *b, UInt32 off, UInt64 v) { memcpy(b + off, &v, 8); }
     UInt32 listFramebuffers(uint8_t *out, UInt32 slots) const;
     IOReturn vendorInfo(unsigned long *out, unsigned long *outCount);
     IOReturn gpuCapability(unsigned long *out, unsigned long *outCount);
+    OSDictionary *copyDisplayFB() const;
+    IOReturn linkConfig(const unsigned long *in, unsigned long inCount, unsigned long *out, unsigned long *outCount);
+    IOReturn pipeCapability(const unsigned long *in, unsigned long inCount, unsigned long *out,
+                            unsigned long *outCount);
 
 public:
     using AppleGraphicsDeviceControl::vendor_doDeviceAttribute;   // the kernel's slot 267 stays visible past our slot 266
@@ -150,19 +165,158 @@ IOReturn NVAGDCControl::gpuCapability(unsigned long *out, unsigned long *outCoun
     return kIOReturnSuccess;
 }
 
+// The lit display's NVDisplayFB (NVBringup's mode record: Width, Height, PixelClockKHz, HTotal, VTotal, HSyncStart,
+// HSyncWidth, VSyncStart, VSyncWidth, Flags), from the first NVFramebuffer's nub. Retained, or nullptr.
+OSDictionary *NVAGDCControl::copyDisplayFB() const
+{
+    uint8_t ptr[8] = {};
+    if (!listFramebuffers(ptr, 1))
+        return nullptr;
+    IOService *fb;
+    memcpy(&fb, ptr, sizeof(fb));
+    IOService *nub = fb->getProvider();
+    OSDictionary *d = nub ? OSDynamicCast(OSDictionary, nub->getProperty("NVDisplayFB")) : nullptr;
+    if (d)
+        d->retain();
+    return d;
+}
+
+static UInt32 dictU32(OSDictionary *d, const char *k)
+{
+    OSNumber *n = d ? OSDynamicCast(OSNumber, d->getObject(k)) : nullptr;
+    return n ? n->unsigned32BitValue() : 0;
+}
+
+// 0x921, Intel's GetLinkConfig (S3-B §GetLinkConfig; IOPresentment's __GatherAGDCLogicalDeviceCapabilities, S3-A):
+// 176 bytes in and out, in+0 the 0-based index into the 0x980 list. The reply carries the current detailed timing
+// (IODetailedTimingInformationV2 laid at +4): IOPresentment fails the whole capability set (0x80e) without it, and
+// CoreDisplay then has no capabilities for the display and never presents to it ("Attempting to get capabilities
+// when none exist", 2026-10-11 21:20). +0x08 bit0 asks IOPresentment for link capabilities (0x925/0x988, tolerated if
+// they fail): left clear. No pointer conversion in the base class for this selector.
+IOReturn NVAGDCControl::linkConfig(const unsigned long *in, unsigned long inCount, unsigned long *out,
+                                   unsigned long *outCount)
+{
+    if (!in || !out || !outCount || inCount != kLinkConfigBytes || *outCount < kLinkConfigBytes)
+        return kIOReturnBadArgument;
+    UInt32 index;
+    memcpy(&index, in, 4);
+    if (index != 0)
+        return kIOReturnNotFound;
+    OSDictionary *d = copyDisplayFB();
+    const UInt32 w = dictU32(d, "Width"), h = dictU32(d, "Height"), ht = dictU32(d, "HTotal"), vt = dictU32(d, "VTotal");
+    const UInt32 hss = dictU32(d, "HSyncStart"), hsw = dictU32(d, "HSyncWidth");
+    const UInt32 vss = dictU32(d, "VSyncStart"), vsw = dictU32(d, "VSyncWidth");
+    const UInt32 flags = dictU32(d, "Flags");                      // bit0 -hsync, bit1 -vsync (NVGpu.cpp)
+    const UInt64 pclk = (UInt64)dictU32(d, "PixelClockKHz") * 1000;
+    OSSafeReleaseNULL(d);
+    if (!w || !h || ht <= w || vt <= h || !pclk || hss < w || vss < h)
+        return kIOReturnNotReady;                                  // no lit mode yet
+
+    uint8_t *b = (uint8_t *)out;
+    memset(b, 0, kLinkConfigBytes);
+    put32(b, 0x08, 0x4);                // bit2 as Intel always sets; bit0 (link capabilities) clear
+    put64(b, 0x2c, pclk);               // pixel clock, min, max (Hz)
+    put64(b, 0x34, pclk);
+    put64(b, 0x3c, pclk);
+    put32(b, 0x44, w);                  // HActive, HBlank, HSyncOffset, HSyncPulseWidth
+    put32(b, 0x48, ht - w);
+    put32(b, 0x4c, hss - w);
+    put32(b, 0x50, hsw);
+    put32(b, 0x54, h);                  // VActive, VBlank, VSyncOffset, VSyncPulseWidth
+    put32(b, 0x58, vt - h);
+    put32(b, 0x5c, vss - h);
+    put32(b, 0x60, vsw);
+    put32(b, 0x74, (flags & 1) ? 0 : 1);  // HSyncConfig: kIOSyncPositivePolarity
+    put32(b, 0x7c, (flags & 2) ? 0 : 1);  // VSyncConfig
+    put32(b, 0x84, 1);                  // numLinks
+    put16(b, 0x8c, 1);                  // pixel encoding RGB 4:4:4
+    put16(b, 0x8e, 2);                  // 8 bits per colour
+    put16(b, 0x90, 2);                  // colorimetry sRGB
+    put16(b, 0x92, 1);                  // dynamic range
+    put64(b, 0xa4, 1);                  // {1-based port, 0}
+    put32(b, 0xac, 1);
+    *outCount = kLinkConfigBytes;
+    return kIOReturnSuccess;
+}
+
+// 0x711, Intel's getDisplayPipeCapabilityExtended (S3-B §0x711): 0x196c bytes in and out (the base class checks
+// both), in+0 index, in+4 the capability block (one bit), in+8 the entry limit (1..8). Reply: the header echoed,
+// out+8 the entry count, entries from out+12. IOPresentment needs two blocks: the planes (0x10; no plane, no
+// capabilities) and the pipeline scaler (0x8, at least one entry). The other blocks may fail.
+IOReturn NVAGDCControl::pipeCapability(const unsigned long *in, unsigned long inCount, unsigned long *out,
+                                       unsigned long *outCount)
+{
+    if (!in || !out || !outCount || inCount != kPipeCapBytes || *outCount < kPipeCapBytes)
+        return kIOReturnBadArgument;
+    UInt32 hdr[3];
+    memcpy(hdr, in, sizeof(hdr));
+    if (hdr[0] != 0)
+        return kIOReturnNotFound;
+    if (hdr[2] < 1 || hdr[2] > 8)
+        return kIOReturnBadArgument;
+    if (hdr[1] != kPipeMaskPlanes && hdr[1] != kPipeMaskScaler)
+        return kIOReturnUnsupported;
+
+    uint8_t *b = (uint8_t *)out;
+    memset(b, 0, kPipeCapBytes);
+    memcpy(b, hdr, sizeof(hdr));
+    put32(b, 8, 1);                     // one entry
+    // Size limits: Intel reads two min/max pairs from the framebuffer; the order inside a pair is not decoded, so both
+    // are given the same wide range (64 .. 4096), which satisfies min != max either way.
+    if (hdr[1] == kPipeMaskPlanes) {
+        uint8_t *e = b + 12;            // plane 0 (812-byte entries)
+        put32(e, 0x00, 0x000A01C4);     // Intel's plane flags
+        put64(e, 0x04, 1);
+        put64(e, 0x1c, 1);              // one pixel-format record
+        put32(e, 0x24, 64);             // record 0: the two size pairs, the format bits, 2
+        put32(e, 0x28, 64);
+        put32(e, 0x2c, 4096);
+        put32(e, 0x30, 4096);
+        put32(e, 0x34, kAGDCFormatBGRA8);
+        put32(e, 0x38, 2);
+    } else {
+        put32(b, 12, 0xC5);             // Intel's pipeline scaler entry, values as Intel writes them
+        put64(b, 40, 1);
+        put32(b, 48, 64);
+        put32(b, 52, 64);
+        put32(b, 56, 4096);
+        put32(b, 60, 4096);
+        put32(b, 64, 0x301);
+        put32(b, 68, 2);
+        put64(b, 432, 1);
+        put32(b, 440, 64);
+        put32(b, 444, 64);
+        put32(b, 448, 4096);
+        put32(b, 452, 4096);
+        put64(b, 456, 0x200000301ULL);
+    }
+    *outCount = kPipeCapBytes;
+    return kIOReturnSuccess;
+}
+
 IOReturn NVAGDCControl::vendor_doDeviceAttribute(UInt32 cmd, unsigned long *in, unsigned long inCount,
                                                  unsigned long *out, unsigned long *outCount,
                                                  IOExternalMethodArguments *args)
 {
-    (void)in;
-    (void)inCount;
     (void)args;
+    IOReturn r;
     switch (cmd) {
     case kCmdVendorInfo:
         return vendorInfo(out, outCount);
     case kCmdGPUCapability:
         return gpuCapability(out, outCount);
+    case kCmdLinkConfig:
+        r = linkConfig(in, inCount, out, outCount);
+        break;
+    case kCmdPipeCapability:
+        r = pipeCapability(in, inCount, out, outCount);
+        break;
     default:
         return kIOReturnUnsupported;
     }
+    // The first answers in the log: these build CoreDisplay's capabilities for the display
+    static volatile SInt32 logged = 0;
+    if (OSIncrementAtomic(&logged) < 12)
+        LOG("selector %#x (in %lu bytes, header %#lx): %#x", cmd, inCount, in ? in[0] : 0UL, r);
+    return r;
 }

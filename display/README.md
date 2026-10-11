@@ -83,6 +83,10 @@ WindowServer draws into the aperture with the CPU. The vertical blank comes from
   class-code (docs/hackintosh.md), so the GPU can't be that ancestor. Instead NVMetalAccelerator, in display-pipe mode,
   sets class-code 0x030000 on itself, and NVAGDCControl matches on it (IOProviderClass NVMetalAccelerator, IOPropertyMatch
   NVDisplayPipeMode): both keys are then the accelerator's registry ID. Intel's pair keys on IGPU@2.
+  After the association, IOPresentment gathers the display's capabilities through two more selectors: 0x921 (Intel's
+  GetLinkConfig: the current detailed timing, which NVAGDCControl takes from the nub's NVDisplayFB) and 0x711 (the
+  plane block, one BGRA8 plane, and the pipeline-scaler block). Without them the set fails with 0x80e and CoreDisplay
+  logs "Attempting to get capabilities when none exist" and presents nothing.
 
 On hardware (2026-10-09) WindowServer opens it as an unaccelerated display, then CoreDisplay looks for its display
 pipe every frame (`Unable to find display pipe for IOFB service`) and its compositor stops within a minute, the
