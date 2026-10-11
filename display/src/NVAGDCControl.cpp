@@ -169,18 +169,32 @@ IOReturn NVAGDCControl::gpuCapability(unsigned long *out, unsigned long *outCoun
 }
 
 // The lit display's NVDisplayFB (NVBringup's mode record: Width, Height, PixelClockKHz, HTotal, VTotal, HSyncStart,
-// HSyncWidth, VSyncStart, VSyncWidth, Flags), from the first NVFramebuffer's nub. Retained, or nullptr.
+// HSyncWidth, VSyncStart, VSyncWidth, Flags), from the first NVFramebuffer's nub. Retained, or nullptr. Found by its
+// own walk, not listFramebuffers: those pointers are unretained (fine for 0x980, converted in the same call).
 OSDictionary *NVAGDCControl::copyDisplayFB() const
 {
-    uint8_t ptr[8] = {};
-    if (!listFramebuffers(ptr, 1))
+    IOService *accel = getProvider();
+    IOService *pci = accel ? accel->getProvider() : nullptr;
+    if (!pci)
         return nullptr;
-    IOService *fb;
-    memcpy(&fb, ptr, sizeof(fb));
-    IOService *nub = fb->getProvider();
-    OSDictionary *d = nub ? OSDynamicCast(OSDictionary, nub->getProperty("NVDisplayFB")) : nullptr;
-    if (d)
-        d->retain();
+    IORegistryIterator *it = IORegistryIterator::iterateOver(pci, gIOServicePlane, kIORegistryIterateRecursively);
+    if (!it)
+        return nullptr;
+    OSDictionary *d = nullptr;
+    while (IORegistryEntry *e = it->getNextObject()) {
+        IOService *s = OSDynamicCast(IOService, e);
+        if (!s || s->isInactive() || strcmp(s->getMetaClass()->getClassName(), "NVFramebuffer") != 0)
+            continue;
+        // Both retained while used: the nub (provider) and its NVDisplayFB, which NVBringup replaces on a replug.
+        IORegistryEntry *nub = s->copyParentEntry(gIOServicePlane);
+        OSObject *o = nub ? nub->copyProperty("NVDisplayFB") : nullptr;
+        d = OSDynamicCast(OSDictionary, o);
+        if (!d)
+            OSSafeReleaseNULL(o);
+        OSSafeReleaseNULL(nub);
+        break;
+    }
+    it->release();
     return d;
 }
 

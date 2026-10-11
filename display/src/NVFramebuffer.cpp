@@ -167,7 +167,10 @@ bool NVFramebuffer::applyNub()
         return false;
     IOLockLock(applyLock_);
     bool changed = false;
-    OSDictionary *d = OSDynamicCast(OSDictionary, nub_->getProperty("NVDisplayFB"));
+    // copyProperty: NVBringup replaces NVDisplayFB on a replug, and getProperty's unretained dictionary can be freed
+    // between the read and the retain below.
+    OSObject *o = nub_->copyProperty("NVDisplayFB");
+    OSDictionary *d = OSDynamicCast(OSDictionary, o);
     const bool online = nubOnline(nub_);
     if (d && !(seen_ && online == online_ && d->isEqualTo(seen_))) {
         const uint64_t oldPhys = phys_, oldSize = size_;
@@ -202,6 +205,7 @@ bool NVFramebuffer::applyNub()
                 online ? "yes" : "no");
         }
     }
+    OSSafeReleaseNULL(o);
     IOLockUnlock(applyLock_);
     return changed;
 }
@@ -251,7 +255,10 @@ uint64_t NVFramebuffer::framePeriod() const
 
 IOService *NVFramebuffer::probe(IOService *provider, SInt32 *score)
 {
-    if (!readDisplay(OSDynamicCast(OSDictionary, provider->getProperty("NVDisplayFB"))))
+    OSObject *o = provider->copyProperty("NVDisplayFB");
+    const bool ok = readDisplay(OSDynamicCast(OSDictionary, o));
+    OSSafeReleaseNULL(o);
+    if (!ok)
         return nullptr;
     return IOFramebuffer::probe(provider, score);
 }

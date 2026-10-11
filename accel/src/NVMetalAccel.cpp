@@ -651,18 +651,19 @@ void NVMetalAccelerator::bindPendingFB()
 }
 
 // The pipe takes transactions only once active (pipe+664), set by the family's init_framebuffer_resource from the
-// pipe's displayModeDidChange, which only the machine's display_mode_did_change calls, after a will_change (S4-B
-// §0, §6.2; NullMoth does the same after its count grows). NVFramebuffer posts no mode-change notifications, so run
-// the pair once here; the pipe's initFramebufferResource (above) supplies the resource memory.
+// pipe's displayModeDidChange, which the machine's display_mode_will_change/did_change pair runs (S4-B §0). IOFramebuffer
+// posts that pair itself when WindowServer opens the framebuffer (IOFramebuffer::open -> deliverFramebufferNotification
+// -> display_change_handler, seen in the 2026-10-11 22:44 panic), serialized by IOFramebuffer. Running the pair here
+// too, from our own work loop, could race that pass over the same framebuffer resource; so this only reports the
+// state at bind time (normally not active yet). The pipe's initFramebufferResource logs when activation runs.
 void NVMetalAccelerator::activatePipe(uint32_t index)
 {
-    machine_->display_mode_will_change(0);
-    machine_->display_mode_did_change(0);
     IOAccelDisplayPipe *pipe = nullptr;
     if (index < pipeCount(machine_))
         pipe = *(IOAccelDisplayPipe * volatile *)((uint8_t *)machine_ + 136 + 8 * index);
     const uint8_t active = pipe ? *(volatile uint8_t *)((uint8_t *)pipe + 664) : 0;
-    LOG("display pipe %u %s after the mode change pass", index, active ? "is active" : "is NOT active");
+    LOG("display pipe %u %s at bind; WindowServer's open of the framebuffer activates it", index,
+        active ? "is active" : "is not active yet");
     publishU("NVPipeActive", active);
 }
 
@@ -774,6 +775,8 @@ n_ret NVDisplayPipe::initFramebufferResource(unsigned int index, IOAccelResource
     static volatile SInt32 logged = 0;
     if (!m || OSIncrementAtomic(&logged) < 4)
         LOG("initFramebufferResource(%u): %s", index, m ? "framebuffer aperture wrapped" : "wrap failed");
+    if (m)
+        publishU("NVPipeActive", 1);    // the family sets pipe+664 once this returns non-NULL (S4-B §0)
     return (n_ret)(uintptr_t)m;
 }
 
