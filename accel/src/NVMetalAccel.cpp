@@ -71,7 +71,11 @@ public:
     n_ret validateTransaction(IOAccelDisplayPipeTransaction2 *txn) override;
     n_ret isTransactionComplete(IOAccelDisplayPipeTransaction2 *txn) override;
     n_ret submitTransaction(IOAccelDisplayPipeTransaction2 *txn) override;
+    n_ret initFramebufferResource(unsigned int index, IOAccelResource2 *res) override;
+    n_ret destroyFramebufferResource(unsigned int index, IOAccelResource2 *res) override;
+    void free() override;
 private:
+    IOAccelSysMemory *fbMem_ = nullptr;     // the framebuffer aperture as the pipe's framebuffer resource memory
     static const uint32_t kDoneRing = 16;   // more than the 4 transactions the family keeps in flight
     uint64_t done_[kDoneRing] = {};         // transaction id + 1 of recently copied transactions; 0 = empty
     uint32_t doneNext_ = 0;
@@ -118,6 +122,7 @@ public:
     // bindTimer_'s work loop (not inside the notification), and bound once (S1 does not rebind).
     IOService *pci_ = nullptr;                  // the provider: the GPU's IOPCIDevice (held by the family)
     IOAccelDisplayMachine *machine_ = nullptr;  // the display machine newDisplayMachine made (family-owned)
+    void activatePipe(uint32_t index);
     IOWorkLoop *bindLoop_ = nullptr;
     IOTimerEventSource *bindTimer_ = nullptr;
     IOSimpleLock *bindLock_ = nullptr;
@@ -630,6 +635,7 @@ void NVMetalAccelerator::bindPendingFB()
         fbInterestNote_ = fb->registerInterest(gIOGeneralInterest, fbInterest, this, nullptr);
         publishBound(true);
         LOG("%s already has display pipe %u", fb->getName(), after - 1);
+        activatePipe(after - 1);
         return;
     }
     if (!ok || after <= before) {
@@ -643,6 +649,23 @@ void NVMetalAccelerator::bindPendingFB()
     fbInterestNote_ = fb->registerInterest(gIOGeneralInterest, fbInterest, this, nullptr);
     publishBound(true);
     LOG("bound display pipe %u to %s", after - 1, fb->getName());
+    activatePipe(after - 1);
+}
+
+// The pipe takes transactions only once active (pipe+664), set by the family's init_framebuffer_resource from the
+// pipe's displayModeDidChange, which only the machine's display_mode_did_change calls, after a will_change (S4-B
+// §0, §6.2; NullMoth does the same after its count grows). NVFramebuffer posts no mode-change notifications, so run
+// the pair once here; the pipe's initFramebufferResource (above) supplies the resource memory.
+void NVMetalAccelerator::activatePipe(uint32_t index)
+{
+    machine_->display_mode_will_change(0);
+    machine_->display_mode_did_change(0);
+    IOAccelDisplayPipe *pipe = nullptr;
+    if (index < pipeCount(machine_))
+        pipe = *(IOAccelDisplayPipe * volatile *)((uint8_t *)machine_ + 136 + 8 * index);
+    const uint8_t active = pipe ? *(volatile uint8_t *)((uint8_t *)pipe + 664) : 0;
+    LOG("display pipe %u %s after the mode change pass", index, active ? "is active" : "is NOT active");
+    publishU("NVPipeActive", active);
 }
 
 IOReturn NVMetalAccelerator::fbInterest(void *target, void *, UInt32 type, IOService *provider, void *, vm_size_t)
@@ -720,6 +743,51 @@ static inline uint32_t ceilClamp(float v, uint32_t max)
         return max;
     uint32_t i = (uint32_t)v;
     return (float)i < v ? i + 1 : i;
+}
+
+// IOAccelSysMemory::withMemoryDescriptor(IOGraphicsAccelerator2*, IOAccelResource2*, IOMemoryDescriptor*), exported by
+// IOAcceleratorFamily2. A static member, not a slot, so not in the generated IOAccelFamily2_decl.h: bound by name.
+extern IOAccelSysMemory *nvAccelSysMemoryWithDescriptor(IOGraphicsAccelerator2 *, IOAccelResource2 *, IOMemoryDescriptor *)
+    __asm__("__ZN16IOAccelSysMemory20withMemoryDescriptorEP22IOGraphicsAccelerator2P16IOAccelResource2P18IOMemoryDescriptor");
+
+// The pipe's framebuffer resource (S4-B §6.1). IOAccelDisplayPipeUserClient2::transactionEnd refuses every
+// transaction with NotReady until the pipe is active (pipe+664), and the only path that sets it is the family's
+// init_framebuffer_resource, run from the pipe's displayModeDidChange: it needs this slot to return the memory for
+// the framebuffer resource (the base forwards to the display machine's slot 271, a stub that returns NULL). As
+// AppleParavirtDisplayPipe does, the framebuffer's memory (here its system aperture, BAR1) wrapped for the resource;
+// the caller stores it at res+136 and prepares it. Kept here and released in 268.
+n_ret NVDisplayPipe::initFramebufferResource(unsigned int index, IOAccelResource2 *res)
+{
+    IOFramebuffer *fb = getFramebuffer();
+    NVMetalAccelerator *a = gAccel;
+    if (!fb || !a || !res) {
+        LOG("initFramebufferResource(%u): no %s", index, !fb ? "framebuffer" : !a ? "accelerator" : "resource");
+        return 0;
+    }
+    if (fbMem_)
+        return (n_ret)(uintptr_t)fbMem_;
+    IODeviceMemory *ap = fb->getApertureRange(kIOFBSystemAperture);
+    if (!ap) {
+        LOG("initFramebufferResource(%u): the framebuffer has no aperture", index);
+        return 0;
+    }
+    fbMem_ = nvAccelSysMemoryWithDescriptor(a, res, ap);
+    ap->release();          // getApertureRange returns it retained; the wrapper keeps its own reference
+    LOG("initFramebufferResource(%u): %s", index, fbMem_ ? "framebuffer aperture wrapped" : "wrap failed");
+    return (n_ret)(uintptr_t)fbMem_;
+}
+
+n_ret NVDisplayPipe::destroyFramebufferResource(unsigned int index, IOAccelResource2 *)
+{
+    (void)index;
+    OSSafeReleaseNULL(fbMem_);
+    return 0;
+}
+
+void NVDisplayPipe::free()
+{
+    OSSafeReleaseNULL(fbMem_);
+    IOAccelDisplayPipe::free();
 }
 
 // Plane 0 of the transaction, if it is a 'BGRA' IOSurface. Otherwise the reason it is refused.

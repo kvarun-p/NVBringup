@@ -56,6 +56,9 @@ class NVAGDCControl : public AppleGraphicsDeviceControl {
     static constexpr UInt32 kPipeCapBytes = 0x196c;
     static constexpr UInt32 kPipeMaskPlanes = 0x10;        // plane scaler: the planes and their pixel formats
     static constexpr UInt32 kPipeMaskScaler = 0x8;         // pipeline scaler
+    static constexpr UInt32 kPipeMaskCSC = 0x1;
+    static constexpr UInt32 kPipeMaskGamma = 0x2;
+    static constexpr UInt32 kPipeMaskLinearize = 0x4;
     static constexpr UInt32 kAGDCFormatBGRA8 = 0x10000;    // AGDCPixelFormatTypeToIOPresentment: IOP bit 48 (BGRA)
 
     static bool gateArmed(IOService *accel);
@@ -242,7 +245,8 @@ IOReturn NVAGDCControl::linkConfig(const unsigned long *in, unsigned long inCoun
 // 0x711, Intel's getDisplayPipeCapabilityExtended (S3-B §0x711): 0x196c bytes in and out (the base class checks
 // both), in+0 index, in+4 the capability block (one bit), in+8 the entry limit (1..8). Reply: the header echoed,
 // out+8 the entry count, entries from out+12. IOPresentment needs two blocks: the planes (0x10; no plane, no
-// capabilities) and the pipeline scaler (0x8, at least one entry). The other blocks may fail.
+// capabilities) and the pipeline scaler (0x8, at least one entry). Gamma (0x2), linearization (0x4) and CSC (0x1) are
+// optional to IOPresentment, but without them CoreDisplay does those steps on the GPU; the others may fail.
 IOReturn NVAGDCControl::pipeCapability(const unsigned long *in, unsigned long inCount, unsigned long *out,
                                        unsigned long *outCount)
 {
@@ -254,7 +258,8 @@ IOReturn NVAGDCControl::pipeCapability(const unsigned long *in, unsigned long in
         return kIOReturnNotFound;
     if (hdr[2] < 1 || hdr[2] > 8)
         return kIOReturnBadArgument;
-    if (hdr[1] != kPipeMaskPlanes && hdr[1] != kPipeMaskScaler)
+    if (hdr[1] != kPipeMaskPlanes && hdr[1] != kPipeMaskScaler && hdr[1] != kPipeMaskCSC &&
+        hdr[1] != kPipeMaskGamma && hdr[1] != kPipeMaskLinearize)
         return kIOReturnUnsupported;
 
     uint8_t *b = (uint8_t *)out;
@@ -274,6 +279,29 @@ IOReturn NVAGDCControl::pipeCapability(const unsigned long *in, unsigned long in
         put32(e, 0x30, 4096);
         put32(e, 0x34, kAGDCFormatBGRA8);
         put32(e, 0x38, 2);
+    } else if (hdr[1] == kPipeMaskGamma || hdr[1] == kPipeMaskLinearize) {
+        // Intel's gamma and linearization entries (S4-B §5; fields per S4-A §6.3): flags, the table-enable mask,
+        // NonAtomicApplicationPeriod (3 frames for gamma, 1 for linearization, in ms at the refresh rate: Intel divides
+        // 3000.0 and 1000.0 by its FB+41416), the gamma type (256 = AGDC bit 8, IOP 0x100: EOTF in the pipe), then
+        // MaximumValue 1.0 and MaximumSize 1024 entries. Without the gamma block CoreDisplay logs "plane with no gamma"
+        // and runs EOTF on the GPU (the fallback path).
+        const bool gamma = hdr[1] == kPipeMaskGamma;
+        const float period = (gamma ? 3000.0f : 1000.0f) / 60.0f;
+        put32(b, 12, gamma ? 0x00101001 : 0x00100000);
+        put64(b, 16, gamma ? 3 : 1);
+        memcpy(b + 24, &period, 4);
+        put64(b, 28, gamma ? 256 : 8);
+        const float one = 1.0f;
+        memcpy(b + 48, &one, 4);
+        put64(b, 52, 1024);
+    } else if (hdr[1] == kPipeMaskCSC) {
+        // Intel's CSC entry (S4-B §5): 5, a 3x3 (8 = its matrix kind), 0x30300, coefficient range -1.0 .. 1.0
+        put32(b, 12, 5);
+        put64(b, 24, 0x800000000ULL);
+        put32(b, 44, 0x00030300);
+        const float lo = -1.0f, hi = 1.0f;
+        memcpy(b + 48, &lo, 4);
+        memcpy(b + 52, &hi, 4);
     } else {
         put32(b, 12, 0xC5);             // Intel's pipeline scaler entry, values as Intel writes them
         put64(b, 40, 1);
