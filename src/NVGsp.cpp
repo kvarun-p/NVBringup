@@ -706,7 +706,12 @@ IOReturn NVBringup::unloadGsp(const char *why)
     IOLockLock(gspLock_);
     IOReturn r = unloadGspLocked(why);
     IOLockUnlock(gspLock_);
-    dispNubSync();      // dispLost took the display away: its nub goes outside gspLock_
+    // dispLost took the display away: its nub goes outside gspLock_. Not at restart or power off: terminating
+    // NVFramebuffer while the platform halts page-faulted in IOFramebuffer::terminate (2026-10-11 21:57), and
+    // nothing will use the display again.
+    const bool halting = why && (!strcmp(why, "restart") || !strcmp(why, "power off") || !strcmp(why, "shutdown"));
+    if (!halting)
+        dispNubSync();
     return r;
 }
 
