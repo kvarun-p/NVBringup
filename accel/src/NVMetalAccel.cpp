@@ -622,6 +622,16 @@ void NVMetalAccelerator::bindPendingFB()
     uint32_t before = pipeCount(machine_);
     bool ok = machine_->found_framebuffer(static_cast<IOFramebuffer *>(fb));
     uint32_t after = pipeCount(machine_);
+    // found_framebuffer answers true without adding a pipe when the framebuffer already has one (the family's own
+    // scan, or a second publish notification, got there first: 2026-10-11 21:59). Its pipe init wrote IOAccelIndex.
+    const bool already = ok && after == before && after > 0 && fb->getProperty("IOAccelIndex");
+    if (already) {
+        boundFB_ = fb;
+        fbInterestNote_ = fb->registerInterest(gIOGeneralInterest, fbInterest, this, nullptr);
+        publishBound(true);
+        LOG("%s already has display pipe %u", fb->getName(), after - 1);
+        return;
+    }
     if (!ok || after <= before) {
         LOG("found_framebuffer(%s) did not add a pipe (returned %d, count %u -> %u)",
             fb->getName(), ok, before, after);
