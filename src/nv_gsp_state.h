@@ -205,6 +205,10 @@ struct NVBringup::GspState {
     // (dispSetMode, from the boot probe or the hot-plug poll). Kernel CPU mappings through BAR1.
     struct DispHw {
         NVDispMem inst, pbCore, pbWndw, sync, ilut, olut, fb, fbB, fbC; // fb, fbB, fbC: the scanout buffers
+        NVDispMem curs;                 // the hardware cursor's image: 256x256 A8R8G8B8, head 0
+        bool     cursChan = false;      // the cursor channel (C57A, PIO) is allocated
+        bool     cursOn = false;        // head 0's cursor is enabled (core methods since the last modeset)
+        bool     cursHave = false;      // curs holds an image (NVFramebuffer's setCursorImage)
         uint32_t front = 0;             // which one window 0 scans out (0: fb)
         uint32_t flipBy[4] = {};        // flips completed by: timeout (0), notifier (1), armed state (2), armed
                                         // state with the raster not seen passing a vblank (3)

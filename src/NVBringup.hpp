@@ -278,6 +278,16 @@ private:
     int      pipeSrcMap(OSObject *key, IOMemoryDescriptor *md);   // the slot holding the source, or -1
     void     pipeSrcDrop(uint32_t i, bool unmap);
     void     pipeSrcFlush(bool unmap);
+    // The hardware cursor (NV_CURSOR_*_FN, nv_pipe_copy.h), head 0. The image and enabling go through the core
+    // channel under gspLock_; moves are PIO writes to the cursor channel under cursLock_ only, since IOFramebuffer
+    // moves the cursor from contexts that must not wait for GPU work. cursLive_: moves reach the hardware.
+    IOSimpleLock *cursLock_ = nullptr;
+    bool     cursLive_ = false;                 // cursLock_
+    int32_t  cursHideX_ = 0, cursHideY_ = 0;    // off the head: where a hidden cursor goes (cursLock_)
+    IOReturn cursorImage(const uint32_t *argb, uint32_t width, uint32_t height);
+    IOReturn cursorMove(int32_t x, int32_t y, bool visible);
+    void     cursorEnableLocked();              // gspLock_: enables head 0's cursor if there is an image
+    void     cursorLive(bool live);
     void     dispNubSync();                     // gspLock_ not held
     void     dispNubStop();                     // shutdownHw: the nub goes with the device
     void     queryGrInfo();

@@ -14,6 +14,16 @@
 #define NV_PIPE_COPY_FN       "NVPipeCopy"
 #define NV_PIPE_COPY_VERSION  1
 
+// The hardware cursor, from NVFramebuffer (display/):
+//   gpu->callPlatformFunction(sym(NV_CURSOR_IMAGE_FN), false, argb, (void *)width, (void *)height, nullptr)
+//       straight-alpha A8R8G8B8 pixels, packed rows, at most 256x256
+//   gpu->callPlatformFunction(sym(NV_CURSOR_MOVE_FN), false, (void *)(intptr_t)x, (void *)(intptr_t)y,
+//                             (void *)(uintptr_t)visible, nullptr)
+//       the image's top-left in framebuffer pixels; doesn't block (callable from IOFramebuffer's cursor paths)
+// NVDisplayFB's CursorSize (256) says the cursor is available.
+#define NV_CURSOR_IMAGE_FN    "NVCursorImage"
+#define NV_CURSOR_MOVE_FN     "NVCursorMove"
+
 struct nv_pipe_copy {
     uint32_t version;                   // NV_PIPE_COPY_VERSION
     uint32_t srcPitch;                  // bytes per row of the source; 4 bytes per pixel on both sides

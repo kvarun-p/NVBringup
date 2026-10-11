@@ -27,6 +27,8 @@
 #include <libkern/c++/OSDictionary.h>
 #include <pexpert/pexpert.h>
 
+#include "../../src/nv_pipe_copy.h"
+
 #define LOG(fmt, ...) IOLog("NVFramebuffer: " fmt "\n", ##__VA_ARGS__)
 
 class NVFramebuffer : public IOFramebuffer {
@@ -62,6 +64,11 @@ class NVFramebuffer : public IOFramebuffer {
     OSDictionary *seen_ = nullptr;      // the NVDisplayFB applied last (retained): an equal one is no change
     bool online_ = true;                // NVDisplayNub's Online, true when absent (a nub from before the pipe)
     bool changed_ = false;              // a change IOGraphics has not acknowledged (kConnectionChanged)
+    // The hardware cursor, NVBringup's (NV_CURSOR_*_FN): offered while NVDisplayFB has CursorSize.
+    IOService *gpu_ = nullptr;          // NVBringup, beside the nub under the PCI device (it outlives the nub)
+    uint32_t cursorSize_ = 0;           // NVDisplayFB's CursorSize: the image's largest side, 0 no cursor
+    uint32_t *cursorBuf_ = nullptr;     // convertCursorImage's output (kCursorBufPx pixels)
+    static constexpr uint32_t kCursorBufPx = 256 * 256;
 
     static constexpr UInt32 kMsgState = 0x4e564442;     // NVBringup's kNVDisplayMsgState ('NVDB'), the nub's change
 
@@ -99,6 +106,8 @@ public:
     IOReturn getTimingInfoForDisplayMode(IODisplayModeID mode, IOTimingInformation *info) override;
     IOReturn getAttribute(IOSelect attribute, uintptr_t *value) override;
     IOReturn setAttribute(IOSelect attribute, uintptr_t value) override;
+    IOReturn setCursorImage(void *cursorImage) override;
+    IOReturn setCursorState(SInt32 x, SInt32 y, bool visible) override;
     IOReturn setGammaTable(UInt32 channelCount, UInt32 dataCount, UInt32 dataWidth, void *data) override;
     IOItemCount getConnectionCount() override;
     IOReturn getAttributeForConnection(IOIndex connect, IOSelect attribute, uintptr_t *value) override;
@@ -143,6 +152,7 @@ bool NVFramebuffer::readDisplay(OSDictionary *d)
     vsyncStart_ = (uint32_t)num("VSyncStart");
     vsyncWidth_ = (uint32_t)num("VSyncWidth");
     syncFlags_ = (uint32_t)num("Flags");
+    cursorSize_ = (uint32_t)num("CursorSize") <= 256 ? (uint32_t)num("CursorSize") : 0;
     haveEdid_ = false;
     if (OSData *e = OSDynamicCast(OSData, d->getObject("EDID")); e && e->getLength() >= sizeof(edid_)) {
         memcpy(edid_, e->getBytesNoCopy(), sizeof(edid_));
@@ -277,6 +287,19 @@ bool NVFramebuffer::start(IOService *provider)
     // NVBringup's state (Online, the mode) before the base start, which may probe the connection. A message from the
     // nub before this point is not lost: it applies the same NVDisplayFB.
     nub_ = provider;
+    if (IOService *pci = provider->getProvider()) {
+        if (OSIterator *it = pci->getChildIterator(gIOServicePlane)) {
+            while (OSObject *o = it->getNextObject())
+                if (o->metaCast("NVBringup")) {
+                    gpu_ = (IOService *)o;
+                    break;
+                }
+            it->release();
+        }
+    }
+    uint32_t sw = 0;                // boot-arg nvswcursor=1: no hardware cursor (WindowServer draws it)
+    if (!cursorBuf_ && !(PE_parse_boot_argn("nvswcursor", &sw, sizeof(sw)) && sw))
+        cursorBuf_ = (uint32_t *)IOMallocZero(kCursorBufPx * 4);
     applyNub();                     // no connect interrupt: IOGraphics hasn't registered for it yet
     if (!IOFramebuffer::start(provider)) {
         nub_ = nullptr;
@@ -339,6 +362,10 @@ void NVFramebuffer::free()
         aperture_ = nullptr;
     }
     OSSafeReleaseNULL(seen_);
+    if (cursorBuf_) {
+        IOFree(cursorBuf_, kCursorBufPx * 4);
+        cursorBuf_ = nullptr;
+    }
     IOFramebuffer::free();
 }
 
@@ -561,6 +588,11 @@ IOReturn NVFramebuffer::getTimingInfoForDisplayMode(IODisplayModeID mode, IOTimi
 // WindowServer's active state: IOFramebuffer keeps it; this only answers when the base class doesn't.
 IOReturn NVFramebuffer::getAttribute(IOSelect attribute, uintptr_t *value)
 {
+    if (attribute == kIOHardwareCursorAttribute) {
+        if (value)
+            *value = gpu_ && cursorBuf_ && cursorSize_ ? 1 : 0;
+        return kIOReturnSuccess;
+    }
     IOReturn r = IOFramebuffer::getAttribute(attribute, value);
     if (r == kIOReturnUnsupported && attribute == kIOWindowServerActiveAttribute) {
         if (value)
@@ -568,6 +600,59 @@ IOReturn NVFramebuffer::getAttribute(IOSelect attribute, uintptr_t *value)
         r = kIOReturnSuccess;
     }
     return r;
+}
+
+// ---- The hardware cursor --------------------------------------------------------------------------
+//
+// NVBringup's head 0 cursor: a 256x256 A8R8G8B8 image, straight alpha (what convertCursorImage writes for a 32-bit
+// descriptor), positioned by its top-left corner. setCursorState must not block: NVBringup's move is a few
+// register writes under a spin lock.
+
+static const OSSymbol *nvSym(const OSSymbol *&s, const char *name)
+{
+    if (!s)
+        s = OSSymbol::withCStringNoCopy(name);      // kept for the kext's lifetime
+    return s;
+}
+
+IOReturn NVFramebuffer::setCursorImage(void *cursorImage)
+{
+    static const OSSymbol *fn;
+    if (!gpu_ || !cursorBuf_ || !cursorSize_ || !nvSym(fn, NV_CURSOR_IMAGE_FN))
+        return kIOReturnUnsupported;
+    IOHardwareCursorDescriptor desc;
+    bzero(&desc, sizeof(desc));
+    desc.majorVersion = kHardwareCursorDescriptorMajorVersion;
+    desc.minorVersion = kHardwareCursorDescriptorMinorVersion;
+    desc.width = desc.height = cursorSize_;
+    desc.bitDepth = 32;
+    desc.supportedSpecialEncodings = kTransparentEncodedPixel;
+    IOHardwareCursorInfo info;
+    bzero(&info, sizeof(info));
+    info.majorVersion = kHardwareCursorInfoMajorVersion;
+    info.minorVersion = kHardwareCursorInfoMinorVersion;
+    info.hardwareCursorData = (UInt8 *)cursorBuf_;
+    bzero(cursorBuf_, kCursorBufPx * 4);
+    if (!convertCursorImage(cursorImage, &desc, &info) || !info.cursorWidth || !info.cursorHeight ||
+        info.cursorWidth > cursorSize_ || info.cursorHeight > cursorSize_)
+        return kIOReturnUnsupported;
+    IOReturn r = gpu_->callPlatformFunction(fn, false, cursorBuf_, (void *)(uintptr_t)info.cursorWidth,
+                                            (void *)(uintptr_t)info.cursorHeight, nullptr);
+    static uint32_t logged;
+    if (logged++ < 4)
+        LOG("cursor image %ux%u (hot spot %u,%u): %#x", (unsigned)info.cursorWidth, (unsigned)info.cursorHeight,
+            (unsigned)info.cursorHotSpotX, (unsigned)info.cursorHotSpotY, r);
+    return r == kIOReturnSuccess ? kIOReturnSuccess : kIOReturnUnsupported;
+}
+
+IOReturn NVFramebuffer::setCursorState(SInt32 x, SInt32 y, bool visible)
+{
+    static const OSSymbol *fn;
+    if (!gpu_ || !cursorSize_ || !nvSym(fn, NV_CURSOR_MOVE_FN))
+        return kIOReturnUnsupported;
+    gpu_->callPlatformFunction(fn, false, (void *)(intptr_t)x, (void *)(intptr_t)y, (void *)(uintptr_t)visible,
+                               nullptr);
+    return kIOReturnSuccess;
 }
 
 // IOFramebuffer runs power management and asks for each change through kIOPowerAttribute. The display's

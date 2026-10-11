@@ -46,6 +46,7 @@ bool NVBringup::start(IOService *provider)
     gspLock_ = IOLockAlloc();
     waitLock_ = IOLockAlloc();
     dispNubLock_ = IOLockAlloc();
+    cursLock_ = IOSimpleLockAlloc();
     powerInit();
     if (!gspLock_ || !waitLock_ || !dispNubLock_ || !powerLock_) {
         stop(provider);
@@ -227,6 +228,10 @@ void NVBringup::free()
     if (dispNubLock_) {
         IOLockFree(dispNubLock_);
         dispNubLock_ = nullptr;
+    }
+    if (cursLock_) {
+        IOSimpleLockFree(cursLock_);
+        cursLock_ = nullptr;
     }
     OSSafeReleaseNULL(dispWant_);                   // shutdownHw has taken the nub down
     if (bar1Held_)

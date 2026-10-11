@@ -931,6 +931,19 @@ bool NVBringup::dispInit()
         }
     }
     d.coreCur = d.wndwCur = 0;
+    // The cursor channel, head 0 (nouveau r535_curs_init; NV50VAIO_CHANNELPIO_ALLOCATION_PARAMETERS: instance,
+    // hObjectNotify, pControl), and its image surface. Without them there is no hardware cursor, nothing else.
+    {
+        uint8_t args[16] = {};
+        d.cursChan = gspRmAlloc(g->hClient, d.hRoot, 0xc57a0000, 0xc57a, args, sizeof(args), &st);
+        if (!d.cursChan)
+            LOG("GSP: display: cursor channel allocation failed (status 0x%x): no hardware cursor", st);
+        else if (!dispMemAlloc(d.curs, 256 * 256 * 4, 0)) {
+            LOG("GSP: display: no VRAM for the cursor: no hardware cursor");
+            OSSafeReleaseNULL(d.curs.map);
+            d.curs = NVDispMem();
+        }
+    }
 
     // Core init: notifier ctxdma and the usage bounds of the eight windows (corec57d_init).
     dispMthd(false, 0x208, kDispHandleSync);
@@ -1175,6 +1188,12 @@ void NVBringup::dispBlank()
     dispMthd(true, 0x374, 1);
     dispMthd(true, 0x200, 1);
     dispKick(true);
+    cursorLive(false);
+    if (d.cursOn) {
+        dispMthd(false, 0x209c, 0xcf);                                            // CONTROL_CURSOR: disabled
+        dispMthd(false, 0x2088, 0);                                               // CONTEXT_DMA_CURSOR: none
+        d.cursOn = false;
+    }
     if (d.sorIdx != ~0u)
         dispMthd(false, 0x300 + d.sorIdx * 0x20, 0);                              // SOR_SET_CONTROL: no owner
     dispCoreUpdate(1);
@@ -1261,6 +1280,7 @@ void NVBringup::dispHotplugTick()
                 dispPublish();
             return;
         }
+        cursorEnableLocked();
     }
     dispPublish();
 }
@@ -1306,6 +1326,8 @@ void NVBringup::dispPublish()
     num("VSyncWidth", d.vsyncWidth, 32);
     num("Flags", d.syncFlags, 32);
     num("DisplayID", d.litId, 32);
+    if (d.cursChan && d.curs.cpu)
+        num("CursorSize", 256, 32);         // NVFramebuffer offers a hardware cursor (NV_CURSOR_*_FN)
     if (d.edidValid) {              // the last lit display's: it stays while unlit (Online false)
         if (OSData *e = OSData::withBytes(d.edid, sizeof(d.edid))) {
             dict->setObject("EDID", e);
@@ -1589,6 +1611,99 @@ IOReturn NVBringup::displayFlip(GpuConn *c, uint32_t buffer)
     return r;
 }
 
+// ---- The hardware cursor (nv_pipe_copy.h) ----------------------------------------------------------
+//
+// Head 0's cursor (nvdisplay 3: NVKMS EvoSetCursorImageC3, MoveCursorC3; nouveau headc37d_curs_set): a 256x256
+// A8R8G8B8 surface in VRAM through the core channel's VRAM context DMA, blended without premultiplication
+// (convertCursorImage hands straight alpha), positioned through the cursor channel's PIO area at BAR0 0x6d8000
+// (NV_UDISP_FE_CHN_ASSY_BASEADR_CURS(0)). The position is the image's top-left in head coordinates; IOFramebuffer
+// has already taken the hot spot off.
+
+static const uint32_t kCursUser = 0x6d8000, kCursMax = 256;
+
+void NVBringup::cursorLive(bool live)
+{
+    if (!cursLock_)
+        return;
+    IOSimpleLockLock(cursLock_);
+    cursLive_ = live;
+    if (live && gsp_) {
+        cursHideX_ = (int32_t)gsp_->disp.w;
+        cursHideY_ = (int32_t)gsp_->disp.h;
+    }
+    IOSimpleLockUnlock(cursLock_);
+}
+
+void NVBringup::cursorEnableLocked()
+{
+    GspState *g = gsp_;
+    if (!g || !g->disp.ready || !g->disp.litId)
+        return;
+    GspState::DispHw &d = g->disp;
+    if (!d.cursChan || !d.curs.cpu || !d.cursHave || d.cursOn)
+        return;
+    dispMthd(false, 0x2088, kDispHandleVram);                                // CONTEXT_DMA_CURSOR(0, 0)
+    dispMthd(false, 0x2090, (uint32_t)(d.curs.pa >> 8));                     // OFFSET_CURSOR(0, 0)
+    dispMthd(false, 0x2098, 0);                                              // PRESENT_CONTROL_CURSOR: MONO
+    dispMthd(false, 0x209c, 1u << 31 | 3u << 8 | 0xcf);                      // CONTROL_CURSOR: on, 256x256, A8R8G8B8
+    dispMthd(false, 0x20a0, 0xff | 5u << 8 | 7u << 12);                      // COMPOSITION: K1 255, K1*src over (1-K1*src)
+    dispCoreUpdate(0);
+    d.cursOn = true;
+    cursorLive(true);
+    static uint32_t logged;
+    if (logged++ < 4)
+        LOG("GSP: display: hardware cursor on (surface 0x%llx)", (unsigned long long)d.curs.pa);
+}
+
+// NV_CURSOR_IMAGE_FN: width x height straight-alpha ARGB pixels, packed; the rest of the 256x256 is transparent.
+IOReturn NVBringup::cursorImage(const uint32_t *argb, uint32_t width, uint32_t height)
+{
+    if (!argb || !width || !height || width > kCursMax || height > kCursMax || !gspLock_)
+        return kIOReturnBadArgument;
+    IOLockLock(gspLock_);
+    GspState *g = gsp_;
+    if (!g || !g->booted || !g->disp.ready || !g->disp.cursChan || !g->disp.curs.cpu) {
+        IOLockUnlock(gspLock_);
+        return kIOReturnNotReady;
+    }
+    GspState::DispHw &d = g->disp;
+    for (uint32_t y = 0; y < kCursMax; y++)
+        for (uint32_t x = 0; x < kCursMax; x++)
+            dispW32(d.curs, (y * kCursMax + x) * 4, x < width && y < height ? argb[y * width + x] : 0);
+    bar1Flush();
+    d.cursHave = true;
+    cursorEnableLocked();               // once per modeset; later images replace the pixels in place
+    IOLockUnlock(gspLock_);
+    return kIOReturnSuccess;
+}
+
+// NV_CURSOR_MOVE_FN: no gspLock_, no sleeping. A hidden cursor is moved off the head.
+IOReturn NVBringup::cursorMove(int32_t x, int32_t y, bool visible)
+{
+    if (!cursLock_)
+        return kIOReturnNotReady;
+    IOSimpleLockLock(cursLock_);
+    if (!cursLive_) {
+        IOSimpleLockUnlock(cursLock_);
+        return kIOReturnNotReady;
+    }
+    if (!visible) {
+        x = cursHideX_;
+        y = cursHideY_;
+    }
+    x = x < -(int32_t)kCursMax ? -(int32_t)kCursMax : x > 0x7fff ? 0x7fff : x;
+    y = y < -(int32_t)kCursMax ? -(int32_t)kCursMax : y > 0x7fff ? 0x7fff : y;
+    bool room = false;
+    for (int i = 0; i < 100 && !(room = (rd32(kCursUser + 0x008) & 0x3f) >= 2); i++)     // FREE count
+        IODelay(1);
+    if (room) {
+        wr32(kCursUser + 0x208, (uint32_t)(y & 0xffff) << 16 | (uint32_t)(x & 0xffff));   // HOT_SPOT_POINT_OUT(0)
+        wr32(kCursUser + 0x200, 0);                                                     // UPDATE
+    }
+    IOSimpleLockUnlock(cursLock_);
+    return room ? kIOReturnSuccess : kIOReturnBusy;
+}
+
 // ---- The display pipe's frame copy (nv_pipe_copy.h) -----------------------------------------------
 //
 // NVMetalAccel's NVDisplayPipe calls this for every transaction: the copy engine copies plane 0 of WindowServer's
@@ -1602,6 +1717,10 @@ IOReturn NVBringup::callPlatformFunction(const OSSymbol *functionName, bool wait
 {
     if (functionName && functionName->isEqualTo(NV_PIPE_COPY_FN))
         return pipeCopy((OSObject *)param1, (IOMemoryDescriptor *)param2, (nv_pipe_copy *)param3);
+    if (functionName && functionName->isEqualTo(NV_CURSOR_IMAGE_FN))
+        return cursorImage((const uint32_t *)param1, (uint32_t)(uintptr_t)param2, (uint32_t)(uintptr_t)param3);
+    if (functionName && functionName->isEqualTo(NV_CURSOR_MOVE_FN))
+        return cursorMove((int32_t)(intptr_t)param1, (int32_t)(intptr_t)param2, param3 != nullptr);
     return IOService::callPlatformFunction(functionName, waitForFunction, param1, param2, param3, param4);
 }
 
@@ -1763,14 +1882,16 @@ void NVBringup::dispLost()
     if (!g || !g->disp.ready)
         return;
     GspState::DispHw &d = g->disp;
-    NVDispMem *mems[] = { &d.inst, &d.pbCore, &d.pbWndw, &d.sync, &d.ilut, &d.olut, &d.fb, &d.fbB, &d.fbC };
+    cursorLive(false);
+    NVDispMem *mems[] = { &d.inst, &d.pbCore, &d.pbWndw, &d.sync, &d.ilut, &d.olut, &d.fb, &d.fbB, &d.fbC, &d.curs };
     for (NVDispMem *m : mems)
         OSSafeReleaseNULL(m->map);
     // The scanout surfaces are in the VRAM heap, which is rebuilt at the next boot: forgotten here, so that
     // dispInit and dispSetMode allocate them again instead of writing through the released mappings.
-    NVDispMem *surfaces[] = { &d.fb, &d.fbB, &d.fbC };
+    NVDispMem *surfaces[] = { &d.fb, &d.fbB, &d.fbC, &d.curs };
     for (NVDispMem *m : surfaces)
         *m = NVDispMem();
+    d.cursChan = d.cursOn = d.cursHave = false;     // the channel goes with the client
     d.ready = false;
     d.litId = 0;
     g->dispLit = false;
