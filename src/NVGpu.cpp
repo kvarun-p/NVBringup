@@ -1027,11 +1027,13 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
             OSSafeReleaseNULL(b->map);
             *b = nf;
         }
+        // Colour bars show the output is lit before anything draws. On a display-pipe boot, black: WindowServer
+        // shows the framebuffer's contents for a moment when it takes the display over (mirrored, on both screens).
         static const uint32_t bars[8] = { 0xffffff, 0xffff00, 0x00ffff, 0x00ff00, 0xff00ff, 0xff0000, 0x0000ff, 0x000000 };
         for (uint32_t y = 0; y < vact; y++)
             for (uint32_t x = 0; x < hact; x++) {
                 const bool frame = x < 16 || y < 16 || x >= hact - 16 || y >= vact - 16;
-                dispW32(*b, y * pitch + x * 4, frame ? 0xffffff : bars[x * 8 / hact]);
+                dispW32(*b, y * pitch + x * 4, dispPipeArmed_ ? 0 : frame ? 0xffffff : bars[x * 8 / hact]);
             }
     }
     bar1Flush();

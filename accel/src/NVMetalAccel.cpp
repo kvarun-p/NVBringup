@@ -894,11 +894,24 @@ IOReturn NVDisplayPipe::copyPlane0(IOAccelDisplayPipeTransaction2 *txn)
         const uint8_t *s8 = (const uint8_t *)smap->getVirtualAddress();
         uint8_t *d8 = (uint8_t *)dmap->getVirtualAddress();
         const uint32_t cols = x1 - x0;
+        const uint64_t t0 = mach_absolute_time();
         for (uint32_t y = y0; y < y1; y++) {
             const uint32_t *srow = (const uint32_t *)(s8 + (size_t)y * spitch + (size_t)x0 * 4);
             uint32_t *drow = (uint32_t *)(d8 + (size_t)y * fpitch + (size_t)x0 * 4);
             for (uint32_t x = 0; x < cols; x++)
                 drow[x] = srow[x];
+        }
+        // How much of each frame CoreDisplay marks dirty, and what the copy costs (WindowServer waits for it):
+        // NVPipeCopiedPct (copied pixels / frame pixels, running) and NVPipeCopyUs (mean per frame), every 60 frames.
+        static uint64_t copied, whole, ticks, frames;
+        copied += (uint64_t)cols * (y1 - y0);
+        whole += (uint64_t)w * h;
+        ticks += mach_absolute_time() - t0;
+        if (++frames % 60 == 0) {
+            uint64_t ns;
+            absolutetime_to_nanoseconds(ticks / frames, &ns);
+            publishU("NVPipeCopiedPct", whole ? copied * 100 / whole : 0);
+            publishU("NVPipeCopyUs", ns / 1000);
         }
     }
     if (dmap)
