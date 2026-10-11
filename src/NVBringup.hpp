@@ -13,6 +13,7 @@
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOUserClient.h>
+#include <IOKit/IODMACommand.h>
 
 #include "nv_fwsec.h"
 #include "nv_hal.h"
@@ -29,6 +30,9 @@ public:
     bool didTerminate(IOService *provider, IOOptionBits options, bool *defer) override;
     void stop(IOService *provider) override;
     void free() override;
+    // NV_PIPE_COPY_FN (nv_pipe_copy.h): NVMetalAccel's display pipe has the copy engine copy its frames.
+    IOReturn callPlatformFunction(const OSSymbol *functionName, bool waitForFunction,
+                                  void *param1, void *param2, void *param3, void *param4) override;
 
 private:
     IOPCIDevice          *pci_  = nullptr;
@@ -258,6 +262,22 @@ private:
     bool     fbWanted();
     bool     nvramOneShot(const char *name);    // reads and deletes an NVRAM one-shot; true if it was set
     void     dispNubWant(OSDictionary *fb, bool online);   // gspLock_ held
+    // The display pipe's sources (nv_pipe_copy.h), mapped read-only into the kernel VA space, one 64 MiB slot each
+    // from kPipeVa. All under gspLock_.
+    struct PipeSrc {
+        OSObject *key = nullptr;                // retained
+        IOMemoryDescriptor *md = nullptr;       // retained, prepared
+        IODMACommand *dma = nullptr;
+        uint64_t *pages = nullptr, npages = 0, lastUse = 0;
+    };
+    static const uint32_t kPipeSrcs = 4;
+    static const uint64_t kPipeVa = 0x200000000ull, kPipeVaSlot = 0x4000000ull;   // above GSP-RM's 0x1_0000_0000+512 MiB
+    PipeSrc  pipeSrc_[kPipeSrcs];
+    uint64_t pipeUse_ = 0;
+    IOReturn pipeCopy(OSObject *key, IOMemoryDescriptor *md, struct nv_pipe_copy *a);
+    int      pipeSrcMap(OSObject *key, IOMemoryDescriptor *md);   // the slot holding the source, or -1
+    void     pipeSrcDrop(uint32_t i, bool unmap);
+    void     pipeSrcFlush(bool unmap);
     void     dispNubSync();                     // gspLock_ not held
     void     dispNubStop();                     // shutdownHw: the nub goes with the device
     void     queryGrInfo();

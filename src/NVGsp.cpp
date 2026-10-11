@@ -93,6 +93,7 @@ void NVBringup::freeGsp(bool stopFalcons)
 {
     if (!gsp_)
         return;
+    pipeSrcFlush(false);            // the display pipe's sources: their VA space goes with GSP-RM
     if (stopFalcons && gsp_->touched && bar0_) {
         falconReset(NV_PGSP_BASE);
         falconReset(NV_PSEC_BASE);
@@ -734,6 +735,7 @@ IOReturn NVBringup::unloadGspLocked(const char *why)
     // User connections lose their contexts, memory and VA spaces (device lost); then our
     // entries come out of GSP-RM's BAR1 tables (they point into our heap).
     gpuTeardownAll(why);
+    pipeSrcFlush(false);            // the display pipe's sources: the kernel VA space goes with the client
     bar1Cleanup();
 
     // 0. Free our client; GSP-RM frees its device, subdevice and channels with it.

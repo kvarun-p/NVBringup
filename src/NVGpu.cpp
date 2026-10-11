@@ -21,6 +21,7 @@
 #include "nv_gsp_state.h"
 #include "nv_regs.h"
 #include "nv_uapi.h"
+#include "nv_pipe_copy.h"
 #include "NVGpuUserClient.hpp"
 
 #include <IOKit/IODeviceTreeSupport.h>
@@ -1586,6 +1587,172 @@ IOReturn NVBringup::displayFlip(GpuConn *c, uint32_t buffer)
     IOLockUnlock(gspLock_);
     keep->release();
     return r;
+}
+
+// ---- The display pipe's frame copy (nv_pipe_copy.h) -----------------------------------------------
+//
+// NVMetalAccel's NVDisplayPipe calls this for every transaction: the copy engine copies plane 0 of WindowServer's
+// frame (system memory) into the lit scanout surface (VRAM) on the utility channel, instead of a CPU copy through
+// the BAR1 aperture inside WindowServer's submit (~6 ms a 1080p frame, and CoreDisplay marks every frame wholly
+// dirty). The source is mapped into the kernel VA space once per surface (read-only, coherent system memory) and
+// kept, with the surface retained and its pages wired, until another surface needs the slot or GSP-RM goes away.
+
+IOReturn NVBringup::callPlatformFunction(const OSSymbol *functionName, bool waitForFunction,
+                                         void *param1, void *param2, void *param3, void *param4)
+{
+    if (functionName && functionName->isEqualTo(NV_PIPE_COPY_FN))
+        return pipeCopy((OSObject *)param1, (IOMemoryDescriptor *)param2, (nv_pipe_copy *)param3);
+    return IOService::callPlatformFunction(functionName, waitForFunction, param1, param2, param3, param4);
+}
+
+void NVBringup::pipeSrcDrop(uint32_t i, bool unmap)
+{
+    PipeSrc &s = pipeSrc_[i];
+    if (unmap && s.npages && gsp_ && gsp_->pd3) {
+        const nv_mmu_ops ops = { this, mmuAlloc, mmuRd64, mmuWr64, nullptr, false };
+        nv_mmu_unmap_4k(&ops, gsp_->pd3, kPipeVa + i * kPipeVaSlot, s.npages * PAGE_4K);
+        praminRestore();
+        tlbFlush(gsp_->pd3);
+    }
+    if (s.dma) {
+        s.dma->clearMemoryDescriptor(true);
+        s.dma->release();
+    }
+    if (s.pages)
+        IOFree(s.pages, s.npages * sizeof(uint64_t));
+    if (s.md) {
+        s.md->complete(kIODirectionOut);
+        s.md->release();
+    }
+    OSSafeReleaseNULL(s.key);
+    s = PipeSrc();
+}
+
+// unmap false: the VA space is going away with GSP-RM (freeGsp), only our references are dropped.
+void NVBringup::pipeSrcFlush(bool unmap)
+{
+    for (uint32_t i = 0; i < kPipeSrcs; i++)
+        if (pipeSrc_[i].key)
+            pipeSrcDrop(i, unmap);
+}
+
+int NVBringup::pipeSrcMap(OSObject *key, IOMemoryDescriptor *md)
+{
+    GspState *g = gsp_;
+    uint32_t slot = 0;
+    for (uint32_t i = 0; i < kPipeSrcs; i++) {
+        if (pipeSrc_[i].key == key && pipeSrc_[i].md == md) {
+            pipeSrc_[i].lastUse = ++pipeUse_;
+            return (int)i;
+        }
+        if (pipeSrc_[i].lastUse < pipeSrc_[slot].lastUse)
+            slot = i;
+    }
+    pipeSrcDrop(slot, true);                        // the least recently used, or an empty slot
+
+    const uint64_t size = (md->getLength() + PAGE_4K - 1) & ~(uint64_t)(PAGE_4K - 1);
+    if (!size || size > kPipeVaSlot)
+        return -1;
+    PipeSrc &s = pipeSrc_[slot];
+    if (md->prepare(kIODirectionOut) != kIOReturnSuccess)
+        return -1;
+    md->retain();
+    s.md = md;
+    key->retain();
+    s.key = key;
+    s.npages = size / PAGE_4K;
+    s.pages = (uint64_t *)IOMalloc(s.npages * sizeof(uint64_t));
+    s.dma = IODMACommand::withSpecification(kIODMACommandOutputHost64, 40, 0, IODMACommand::kMapped, 0, PAGE_4K);
+    if (!s.pages || !s.dma || s.dma->setMemoryDescriptor(md, true) != kIOReturnSuccess) {
+        pipeSrcDrop(slot, false);
+        return -1;
+    }
+    uint64_t off = 0, n = 0;
+    while (off < md->getLength() && n < s.npages) {
+        IODMACommand::Segment64 seg[16];
+        UInt32 nseg = 16;
+        if (s.dma->gen64IOVMSegments(&off, seg, &nseg) != kIOReturnSuccess || !nseg)
+            break;
+        for (UInt32 k = 0; k < nseg; k++) {
+            if (seg[k].fIOVMAddr & (PAGE_4K - 1)) {     // a source not page-aligned: not ours to map
+                n = 0;
+                off = ~0ull;
+                break;
+            }
+            for (uint64_t a = 0; a < seg[k].fLength && n < s.npages; a += PAGE_4K)
+                s.pages[n++] = seg[k].fIOVMAddr + a;
+        }
+    }
+    const nv_mmu_ops ops = { this, mmuAlloc, mmuRd64, mmuWr64, nullptr, false };
+    const nv_mmu_target t = { true, 0, s.pages, 0, NV_MMU_PTE_READ_ONLY, 0 };
+    bool ok = n == s.npages && nv_mmu_map(&ops, g->pd3, kPipeVa + slot * kPipeVaSlot, size, &t);
+    praminRestore();
+    if (!ok) {
+        LOG("GSP: display pipe: mapping a %llu KiB source failed (%llu of %llu pages)",
+            (unsigned long long)(size >> 10), (unsigned long long)n, (unsigned long long)s.npages);
+        pipeSrcDrop(slot, false);
+        return -1;
+    }
+    tlbFlush(g->pd3);
+    s.lastUse = ++pipeUse_;
+    static uint32_t logged;
+    if (logged++ < 8)
+        LOG("GSP: display pipe: source %p mapped at VA 0x%llx (%llu KiB)", key,
+            (unsigned long long)(kPipeVa + slot * kPipeVaSlot), (unsigned long long)(size >> 10));
+    return (int)slot;
+}
+
+IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy *a)
+{
+    if (!key || !md || !a || a->version != NV_PIPE_COPY_VERSION || a->x1 <= a->x0 || a->y1 <= a->y0 ||
+        a->srcPitch < a->x1 * 4)
+        return kIOReturnBadArgument;
+    if ((uint64_t)a->srcPitch * (a->y1 - 1) + (uint64_t)a->x1 * 4 > md->getLength())
+        return kIOReturnBadArgument;
+    if (!gspLock_)                              // stopping
+        return kIOReturnNotReady;
+    IOLockLock(gspLock_);
+    GspState *g = gsp_;
+    IOReturn r = kIOReturnNotReady;
+    if (!g || !g->booted || !g->utilOk || !g->pd3 || !g->dispLit || !g->disp.ready) {
+        IOLockUnlock(gspLock_);
+        return r;
+    }
+    GspState::DispHw &d = g->disp;
+    const NVDispMem &f = d.fb;                  // NVDisplayFB's surface: NVFramebuffer's aperture
+    if (!f.pa || a->dstWidth != d.w || a->dstHeight != d.h || a->dstPitch != d.pitch ||
+        a->x1 > d.w || a->y1 > d.h || (uint64_t)d.pitch * (a->y1 - 1) + (uint64_t)a->x1 * 4 > f.size) {
+        IOLockUnlock(gspLock_);
+        return r;
+    }
+    const int slot = pipeSrcMap(key, md);
+    if (slot < 0) {
+        IOLockUnlock(gspLock_);
+        return kIOReturnNoMemory;
+    }
+    const uint64_t in = kPipeVa + (uint64_t)slot * kPipeVaSlot + (uint64_t)a->y0 * a->srcPitch + (uint64_t)a->x0 * 4;
+    const uint64_t out = f.pa + (uint64_t)a->y0 * d.pitch + (uint64_t)a->x0 * 4;
+    const uint32_t subch = 4, payload = 0x5d000000u | (++g->utilSeq & 0xffffff);
+    TestChan &c = g->util;
+    const uint32_t push[] = {
+        pbHeader(subch, 0x000, 1), chip_->arch->cls.copy,                              // SET_OBJECT
+        pbHeader(subch, NVC5B5_SET_DST_PHYS_MODE_, 1), 0,                              // LOCAL_FB
+        pbHeader(subch, 0x400, 4), (uint32_t)(in >> 32), (uint32_t)in, (uint32_t)(out >> 32), (uint32_t)out,
+        pbHeader(subch, 0x410, 4), a->srcPitch, d.pitch, (a->x1 - a->x0) * 4, a->y1 - a->y0,  // PITCH_IN/OUT,
+        pbHeader(subch, 0x240, 3), (uint32_t)(c.vaSem >> 32), (uint32_t)c.vaSem, payload,   // LINE_LENGTH, COUNT
+        // LAUNCH_DMA: non-pipelined, flush, release one word, pitch -> pitch, multi-line, virtual source,
+        // physical destination
+        pbHeader(subch, 0x300, 1), 2u | 1u << 2 | 1u << 3 | 1u << 7 | 1u << 8 | 1u << 9 | 1u << 13,
+    };
+    const uint64_t t0 = mach_absolute_time();
+    const bool ok = submitAndWait(c, push, sizeof(push) / 4, payload, 100, false);
+    uint64_t ns = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+    a->gpuUs = (uint32_t)(ns / 1000);
+    if (!ok)                                    // what the slot held is suspect: map it again next time
+        pipeSrcDrop((uint32_t)slot, true);
+    IOLockUnlock(gspLock_);
+    return ok ? kIOReturnSuccess : kIOReturnTimeout;
 }
 
 // GSP-RM is going down (sleep, idle, unload): the display engine with it. The kernel mappings go; the

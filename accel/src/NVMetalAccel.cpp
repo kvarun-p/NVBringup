@@ -15,6 +15,7 @@
 // The family's classes are declared by IOAccelFamily2_decl.h, generated from the kernel collections
 // by tools/gen_decl.py: rebuild it after a macOS update.
 #include "IOAccelFamily2_decl.h"
+#include "../../src/nv_pipe_copy.h"
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IODeviceMemory.h>
@@ -834,6 +835,70 @@ bool NVDisplayPipe::isDone(uint32_t id)
     return false;
 }
 
+// How much of each frame CoreDisplay marks dirty, and what the copy costs (WindowServer waits for it), every
+// 60 frames: NVPipeCopiedPct (copied pixels / frame pixels, running), NVPipeCopyUs (mean per frame, over the
+// last 60) and NVPipeGpuCopies / NVPipeCpuCopies (frames copied by the copy engine and by the CPU).
+static void noteCopy(uint64_t copiedPx, uint64_t wholePx, uint32_t us, bool gpu)
+{
+    static uint64_t copied, whole, sumUs, frames, gpuFrames;
+    copied += copiedPx;
+    whole += wholePx;
+    sumUs += us;
+    gpuFrames += gpu;
+    if (++frames % 60 == 0) {
+        publishU("NVPipeCopiedPct", whole ? copied * 100 / whole : 0);
+        publishU("NVPipeCopyUs", sumUs / 60);
+        publishU("NVPipeGpuCopies", gpuFrames);
+        publishU("NVPipeCpuCopies", frames - gpuFrames);
+        sumUs = 0;
+    }
+}
+
+// NVBringup on the framebuffer's GPU: NVFramebuffer's provider (NVDisplayNub) is attached to the PCI device, and so
+// is NVBringup. Not retained: the caller holds the framebuffer, whose nub goes before NVBringup does.
+static IOService *gpuOf(IOFramebuffer *fb)
+{
+    IOService *nub = fb->getProvider(), *pci = nub ? nub->getProvider() : nullptr;
+    OSIterator *it = pci ? pci->getChildIterator(gIOServicePlane) : nullptr;
+    IOService *gpu = nullptr;
+    while (OSObject *o = it ? it->getNextObject() : nullptr)
+        if (o->metaCast("NVBringup")) {
+            gpu = (IOService *)o;
+            break;
+        }
+    OSSafeReleaseNULL(it);
+    return gpu;
+}
+
+// The copy engine copies the rect (nv_pipe_copy.h); false if it can't, and the CPU copies instead. Boot-arg
+// nvpipecpu=1: always the CPU.
+static bool gpuCopy(IOFramebuffer *fb, IOSurface *s, IOMemoryDescriptor *src, uint32_t spitch, uint32_t x0, uint32_t y0,
+                    uint32_t x1, uint32_t y1, uint32_t fw, uint32_t fh, uint32_t fpitch, uint32_t *us)
+{
+    static int mode = -1;       // -1: not read yet, 0: GPU, 1: CPU
+    static const OSSymbol *fn;
+    static uint32_t failures;
+    if (mode < 0) {
+        uint32_t v = 0;
+        mode = PE_parse_boot_argn("nvpipecpu", &v, sizeof(v)) && v ? 1 : 0;
+        fn = OSSymbol::withCStringNoCopy(NV_PIPE_COPY_FN);     // kept for the kext's lifetime
+        LOG("display pipe: frames copied by the %s", mode ? "CPU (nvpipecpu)" : "copy engine");
+    }
+    IOService *gpu = mode == 0 && fn ? gpuOf(fb) : nullptr;
+    if (!gpu)
+        return false;
+    nv_pipe_copy a = { NV_PIPE_COPY_VERSION, spitch, x0, y0, x1, y1, fw, fh, fpitch, 0 };
+    // The kernel's IOSurface is an OSObject; the family header declares it without its base.
+    IOReturn r = gpu->callPlatformFunction(fn, false, (void *)reinterpret_cast<OSObject *>(s), src, &a, nullptr);
+    if (r != kIOReturnSuccess) {
+        if (failures++ < 8)
+            LOG("display pipe: copy engine copy failed (%#x); the CPU copies this frame", r);
+        return false;
+    }
+    *us = a.gpuUs;
+    return true;
+}
+
 // Copies plane 0's dirty rect (or the whole surface when the rect is empty or invalid) from the transaction's
 // IOSurface into the framebuffer's system aperture. The aperture is mapped write-combined per transaction;
 // the source is prepared and mapped per transaction too. Both sides are clamped to the smaller of the two.
@@ -881,6 +946,15 @@ IOReturn NVDisplayPipe::copyPlane0(IOAccelDisplayPipeTransaction2 *txn)
         }
     }
 
+    uint32_t gpuUs = 0;
+    if (gpuCopy(fb, s, src, spitch, x0, y0, x1, y1, fw, fh, fpitch, &gpuUs)) {
+        ap->release();
+        noteCopy((uint64_t)(x1 - x0) * (y1 - y0), (uint64_t)w * h, gpuUs, true);
+        if (gSubmits <= 3)
+            LOG("frame %llu: copy engine copied rows %u..%u cols %u..%u in %u us", (unsigned long long)gSubmits,
+                y0, y1, x0, x1, gpuUs);
+        return kIOReturnSuccess;
+    }
     if (src->prepare() != kIOReturnSuccess) {
         ap->release();
         return kIOReturnNotReady;
@@ -901,18 +975,9 @@ IOReturn NVDisplayPipe::copyPlane0(IOAccelDisplayPipeTransaction2 *txn)
             for (uint32_t x = 0; x < cols; x++)
                 drow[x] = srow[x];
         }
-        // How much of each frame CoreDisplay marks dirty, and what the copy costs (WindowServer waits for it):
-        // NVPipeCopiedPct (copied pixels / frame pixels, running) and NVPipeCopyUs (mean per frame), every 60 frames.
-        static uint64_t copied, whole, ticks, frames;
-        copied += (uint64_t)cols * (y1 - y0);
-        whole += (uint64_t)w * h;
-        ticks += mach_absolute_time() - t0;
-        if (++frames % 60 == 0) {
-            uint64_t ns;
-            absolutetime_to_nanoseconds(ticks / frames, &ns);
-            publishU("NVPipeCopiedPct", whole ? copied * 100 / whole : 0);
-            publishU("NVPipeCopyUs", ns / 1000);
-        }
+        uint64_t ns;
+        absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+        noteCopy((uint64_t)cols * (y1 - y0), (uint64_t)w * h, (uint32_t)(ns / 1000), false);
     }
     if (dmap)
         dmap->release();
