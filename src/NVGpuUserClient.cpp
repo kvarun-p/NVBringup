@@ -24,7 +24,8 @@ bool NVGpuUserClient::initWithTask(task_t owningTask, void *securityToken, UInt3
     // own VA space, unprivileged channels, scrubbed VRAM). nvgpu_users=1 lets anyone in.
     // On a display-pipe boot, also WindowServer: it runs as _windowserver (uid 88), neither admin nor the console
     // user, and NVMetal in it opens the GPU through NVK (refused, NVK found no GPU and CoreDisplay's Metal device had
-    // no library: the WindowServer crashes of 2026-10-11 20:18).
+    // no library: the WindowServer crashes of 2026-10-11 20:18). Both types: NVK lists the GPU through the control
+    // client before it opens the GPU client (refused at 20:26 when only the GPU client admitted it).
     uint32_t users = 0;
     PE_parse_boot_argn("nvgpu_users", &users, sizeof(users));
     if (users != 1 && clientHasPrivilege(securityToken, kIOClientPrivilegeAdministrator) != kIOReturnSuccess &&

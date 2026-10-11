@@ -2394,7 +2394,7 @@ IOReturn NVBringup::newUserClient(task_t owningTask, void *securityID, UInt32 ty
     NVGpuUserClient *c = OSTypeAlloc(NVGpuUserClient);
     if (!c)
         return kIOReturnNoMemory;
-    c->allowWindowServer = dispPipeArmed_ && type == NVMAC_CLIENT_TYPE;
+    c->allowWindowServer = dispPipeArmed_;    // both types: NVK lists the GPU through the control client first
     if (!c->initWithTask(owningTask, securityID, type, properties)) {
         c->release();
         return kIOReturnNotPrivileged;
