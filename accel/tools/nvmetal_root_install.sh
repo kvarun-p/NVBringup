@@ -38,6 +38,7 @@ if [[ $cmd == install ]]; then
     [[ -x $BUNDLE/Contents/MacOS/NVMetal ]] || die "no bundle at $BUNDLE"
     [[ $(plutil -extract NSPrincipalClass raw "$BUNDLE/Contents/Info.plist") == NVMetalDevice ]] ||
         die "$BUNDLE isn't NVMetal.bundle"
+    ICD=${NVMETAL_ICD_SRC:-${BUNDLE:h:h}/vulkan/libvulkan_nouveau.dylib}   # build tree: src/nouveau/{air,vulkan}
 fi
 
 # The booted system is a snapshot of the System volume: /dev/diskNsMsK -> /dev/diskNsM.
@@ -59,6 +60,16 @@ trap 'umount $MNT 2>/dev/null || true' EXIT
 # doesn't (MacPorts' libLLVM: "mapped file has no cdhash", 2026-10-10). So the bundle carries its own copies of every
 # non-system library it needs, in Contents/Frameworks, renamed to @rpath/<name> and ad-hoc signed, and its rpath is
 # only @loader_path/../Frameworks. The build tree and /opt/local are left as they are.
+# Only the bundle's own Frameworks on a library's rpath: its build-time ones (/opt/local, the build tree) would be searched
+# first and their unsigned copies refused.
+own_rpath() {   # $1 = library in Contents/Frameworks
+    local r
+    for r in ${(f)"$(otool -l $1 | awk '/LC_RPATH/ { getline; getline; print $2 }')"}; do
+        install_name_tool -delete_rpath $r $1 2>/dev/null || true
+    done
+    install_name_tool -add_rpath @loader_path $1 2>/dev/null || true
+}
+
 embed_libs() {   # $1 = staged bundle
     local fw=$1/Contents/Frameworks bin=$1/Contents/MacOS/NVMetal
     local -a todo rpaths
@@ -67,6 +78,18 @@ embed_libs() {   # $1 = staged bundle
     rpaths=(${(f)"$(otool -l $bin | awk '/LC_RPATH/ { getline; getline; print $2 }')"})
     mkdir -p $fw
     todo=($bin)
+    # The NVK ICD isn't linked: NVMetal dlopens it at run time from the bundle's NVMetalICD key, else the build tree
+    # (library validation refused that copy in WindowServer, 2026-10-11 20:09). Embed it like the rest and point the
+    # key at the installed copy.
+    [[ -f $ICD ]] || die "no NVK ICD at $ICD (set NVMETAL_ICD_SRC)"
+    cp -L $ICD $fw/${ICD:t}
+    chmod 755 $fw/${ICD:t}
+    install_name_tool -id @rpath/${ICD:t} $fw/${ICD:t} 2>/dev/null
+    own_rpath $fw/${ICD:t}
+    done[${ICD:t}]=1
+    todo+=($fw/${ICD:t})
+    plutil -replace NVMetalICD -string "/$DEST/Contents/Frameworks/${ICD:t}" $1/Contents/Info.plist
+    print "embedded ${ICD:t} ($ICD), NVMetalICD set"
     while (( $#todo )); do
         obj=$todo[1]; todo=(${todo[2,-1]})
         for dep in ${(f)"$(otool -L $obj | tail -n +2 | awk '{ print $1 }')"}; do
@@ -86,7 +109,7 @@ embed_libs() {   # $1 = staged bundle
             cp -L $src $fw/$name
             chmod 755 $fw/$name
             install_name_tool -id @rpath/$name $fw/$name 2>/dev/null
-            install_name_tool -add_rpath @loader_path $fw/$name 2>/dev/null || true
+            own_rpath $fw/$name
             done[$name]=1
             todo+=($fw/$name)
             print "embedded $name ($src)"
