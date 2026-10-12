@@ -683,8 +683,10 @@ IOReturn NVFramebuffer::getAttributeForConnection(IOIndex connect, IOSelect attr
         return kIOReturnBadArgument;
     switch (attribute) {
     case kConnectionCheckEnable:
+        // IOFramebuffer::updateOnline: the framebuffer is online exactly when this is non-zero (re-read at every
+        // connect interrupt). Always 1 kept an unplugged HDMI display online, nameless ("Unknown Display").
         if (value)
-            *value = 1;             // sensing stays on, or a hot-plug never reaches IOGraphics
+            *value = online_ ? 1 : 0;
         return kIOReturnSuccess;
     case kConnectionEnable:
         if (value)

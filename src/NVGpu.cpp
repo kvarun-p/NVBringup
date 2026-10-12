@@ -1239,11 +1239,10 @@ void NVBringup::dispHotplugTick()
         mask |= d.candId[i];
     uint8_t cs[NV0073_CONNECT_SIZE] = {};
     put32(cs, NV0073_CONNECT_displayMask, mask);
-    // While lit, GSP-RM's cached state (METHOD_CACHED; it handles the hot-plug interrupts) every second and the
-    // full detection only every 15 s: the full one held gspLock_ 20-67 ms each time, DDC and load detection
-    // disabled or not, stalling every GPU submission behind it (NVPollHold, 2026-10-12). Nothing lit, the full
-    // detection every second, as before.
-    if (d.litId && d.tick % 150)
+    // While lit, GSP-RM's cached state (METHOD_CACHED; it handles the hot-plug interrupts: an unplug showed in
+    // 1-2 s). The full detection held gspLock_ 20-67 ms each time, DDC and load detection disabled or not,
+    // stalling every GPU submission behind it (NVPollHold, 2026-10-12). Nothing lit, the full detection, as before.
+    if (d.litId)
         put32(cs, 4, 1u | 1u << 4 | 1u << 5);
     if (!gspRmControl(g->hClient, g->hDisp, NV0073_CTRL_CMD_SYSTEM_GET_CONNECT_STATE_, cs, sizeof(cs), &st,
                       true))      // once a second: logged only when it fails
