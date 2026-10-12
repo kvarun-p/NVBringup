@@ -20,6 +20,8 @@
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOLib.h>
+#include <kern/thread_call.h>
+#include <libkern/OSAtomic.h>
 #include <IOKit/IOLocks.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOMapTypes.h>
@@ -64,8 +66,11 @@ public:
     bool displayModeDidChange() override;   // keeps the accelerator enabled (S0-4 R4)
 };
 
-// The S1 display pipe: a plane-0 CPU copy into NVBringup's scanout. Completion is synchronous, so 278
-// reports a transaction done once its copy has finished (S0-4 R1). Init is the family's own (not overridden).
+// The S1 display pipe: a plane-0 copy into NVBringup's scanout (the copy engine, else the CPU), done in submit.
+// A copied transaction completes kScanoutHoldMs later, not at once: in a mirror set CoreDisplay treats the pair
+// as a hardware mirror, and the built-in panel's Intel pipe scans out the same IOSurface; completing at once let
+// WindowServer draw the next frame into a surface the panel was still showing (black flashes, 2026-10-12).
+// Init is the family's own (not overridden).
 class NVDisplayPipe : public IOAccelDisplayPipe {
     OSDeclareDefaultStructors(NVDisplayPipe)
 public:
@@ -81,6 +86,16 @@ private:
     IOReturn copyPlane0(IOAccelDisplayPipeTransaction2 *txn);
     void markDone(uint32_t id);
     bool isDone(uint32_t id);
+    // Copied transactions waiting out kScanoutHoldMs (pendLock_), and the thread call that completes them.
+    static const uint32_t kScanoutHoldMs = 20, kPend = 8;
+    struct Pending { uint32_t id; uint64_t due; bool used; } pend_[kPend] = {};
+    IOSimpleLock *pendLock_ = nullptr;
+    thread_call_t pendCall_ = nullptr;
+    uint64_t pendArmed_ = 0;                // the deadline pendCall_ is armed for, 0: not armed (pendLock_)
+    bool holdCompletion(uint32_t id);      // false: couldn't, complete now
+    static void pendFire(thread_call_param_t self, thread_call_param_t);
+public:
+    void free() override;
 };
 
 class NVMetalAccelerator : public IOGraphicsAccelerator2 {
@@ -798,8 +813,9 @@ n_ret NVDisplayPipe::validateTransaction(IOAccelDisplayPipeTransaction2 *txn)
     return (uint32_t)r;
 }
 
-// The copy is done here, so the transaction is complete when this returns. An error still completes the
-// transaction (so WindowServer does not stall on the fifth submit) and is reported through txn+88.
+// The copy is done here; the transaction completes kScanoutHoldMs later (holdCompletion), while another display
+// may still scan out its surface. An error completes the transaction at once (so WindowServer does not stall on
+// the fifth submit) and is reported through txn+88.
 n_ret NVDisplayPipe::submitTransaction(IOAccelDisplayPipeTransaction2 *txn)
 {
     const uint32_t id = txn->getTransactionID();
@@ -809,7 +825,8 @@ n_ret NVDisplayPipe::submitTransaction(IOAccelDisplayPipeTransaction2 *txn)
         gCompletes++;
     else
         noteError(r);
-    markDone(id);
+    if (r != kIOReturnSuccess || !holdCompletion(id))
+        markDone(id);
     publishU("NVPipeSubmits", gSubmits);
     publishU("NVPipeCompletes", gCompletes);
     signalTransactionInterrupt(nullptr);    // kicks completion: the next poll of 278 finds this one done
@@ -819,6 +836,81 @@ n_ret NVDisplayPipe::submitTransaction(IOAccelDisplayPipeTransaction2 *txn)
 n_ret NVDisplayPipe::isTransactionComplete(IOAccelDisplayPipeTransaction2 *txn)
 {
     return isDone(txn->getTransactionID()) ? 1 : 0;
+}
+
+bool NVDisplayPipe::holdCompletion(uint32_t id)
+{
+    if (!pendLock_) {
+        IOSimpleLock *l = IOSimpleLockAlloc();
+        if (l && !OSCompareAndSwapPtr(nullptr, l, &pendLock_))
+            IOSimpleLockFree(l);
+    }
+    if (!pendCall_) {
+        thread_call_t c = thread_call_allocate_with_options(pendFire, this, THREAD_CALL_PRIORITY_HIGH, 0);
+        if (c && !OSCompareAndSwapPtr(nullptr, c, &pendCall_))
+            thread_call_free(c);
+    }
+    if (!pendLock_ || !pendCall_)
+        return false;
+    uint64_t due = 0;
+    clock_interval_to_deadline(kScanoutHoldMs, kMillisecondScale, &due);
+    bool held = false, arm = false;
+    IOSimpleLockLock(pendLock_);
+    for (uint32_t i = 0; i < kPend && !held; i++)
+        if (!pend_[i].used) {
+            pend_[i] = { id, due, true };
+            held = true;
+        }
+    // Armed already for an earlier deadline: that fire reschedules for this one. (Arming again would move the
+    // call later each frame, and at 60 Hz it would never fire.)
+    if (held && !pendArmed_) {
+        pendArmed_ = due;
+        arm = true;
+    }
+    IOSimpleLockUnlock(pendLock_);
+    if (arm)
+        thread_call_enter_delayed(pendCall_, due);
+    return held;
+}
+
+void NVDisplayPipe::pendFire(thread_call_param_t self, thread_call_param_t)
+{
+    NVDisplayPipe *p = (NVDisplayPipe *)self;
+    const uint64_t now = mach_absolute_time();
+    uint64_t next = 0;
+    bool any = false;
+    IOSimpleLockLock(p->pendLock_);
+    for (uint32_t i = 0; i < kPend; i++) {
+        if (!p->pend_[i].used)
+            continue;
+        if (p->pend_[i].due <= now) {
+            p->markDone(p->pend_[i].id);
+            p->pend_[i].used = false;
+            any = true;
+        } else if (!next || p->pend_[i].due < next) {
+            next = p->pend_[i].due;
+        }
+    }
+    p->pendArmed_ = next;
+    IOSimpleLockUnlock(p->pendLock_);
+    if (next)
+        thread_call_enter_delayed(p->pendCall_, next);
+    if (any)
+        p->signalTransactionInterrupt(nullptr);         // the family polls 278 and finds them done
+}
+
+void NVDisplayPipe::free()
+{
+    if (pendCall_) {
+        thread_call_cancel_wait(pendCall_);
+        thread_call_free(pendCall_);
+        pendCall_ = nullptr;
+    }
+    if (pendLock_) {
+        IOSimpleLockFree(pendLock_);
+        pendLock_ = nullptr;
+    }
+    IOAccelDisplayPipe::free();
 }
 
 void NVDisplayPipe::markDone(uint32_t id)
