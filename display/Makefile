@@ -58,7 +58,8 @@ verify: $(BUILD)/NVFramebuffer.o $(BUILD)/NVAGDCControl.o | $(BUILD)
 	python3 tools/verify_link.py $(BUILD)/NVFramebuffer.o $(BUILD)/NVAGDCControl.o
 
 check: $(KEXT)
-	kmutil libraries -p $(KEXT) --undef-symbols
+	kmutil libraries -p $(KEXT) --undef-symbols > /dev/null
+	../tools/check_kext_libs.sh $(KEXT)
 
 $(BUILD):
 	mkdir -p $@

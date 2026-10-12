@@ -92,6 +92,8 @@ private:
     IOSimpleLock *pendLock_ = nullptr;
     thread_call_t pendCall_ = nullptr;
     uint64_t pendArmed_ = 0;                // the deadline pendCall_ is armed for, 0: not armed (pendLock_)
+    bool pendStop_ = false;                 // free: no more fires (pendLock_)
+    int pendBusy_ = 0;                      // pendFire calls past their entry check (pendLock_)
     bool holdCompletion(uint32_t id);      // false: couldn't, complete now
     static void pendFire(thread_call_param_t self, thread_call_param_t);
 public:
@@ -880,6 +882,11 @@ void NVDisplayPipe::pendFire(thread_call_param_t self, thread_call_param_t)
     uint64_t next = 0;
     bool any = false;
     IOSimpleLockLock(p->pendLock_);
+    if (p->pendStop_) {
+        IOSimpleLockUnlock(p->pendLock_);
+        return;
+    }
+    p->pendBusy_++;
     for (uint32_t i = 0; i < kPend; i++) {
         if (!p->pend_[i].used)
             continue;
@@ -897,12 +904,30 @@ void NVDisplayPipe::pendFire(thread_call_param_t self, thread_call_param_t)
         thread_call_enter_delayed(p->pendCall_, next);
     if (any)
         p->signalTransactionInterrupt(nullptr);         // the family polls 278 and finds them done
+    IOSimpleLockLock(p->pendLock_);
+    p->pendBusy_--;
+    IOSimpleLockUnlock(p->pendLock_);                   // the last touch: free may go on once this is 0
 }
 
 void NVDisplayPipe::free()
 {
+    // No thread_call_cancel_wait: it is private KPI, and with it the kext didn't link into the auxiliary
+    // collection at all (2026-10-12). Stop new fires, cancel a pending one, wait out one already running.
+    if (pendCall_ && pendLock_) {
+        IOSimpleLockLock(pendLock_);
+        pendStop_ = true;
+        IOSimpleLockUnlock(pendLock_);
+        thread_call_cancel(pendCall_);
+        for (;;) {
+            IOSimpleLockLock(pendLock_);
+            const bool busy = pendBusy_ != 0;
+            IOSimpleLockUnlock(pendLock_);
+            if (!busy)
+                break;
+            IOSleep(1);
+        }
+    }
     if (pendCall_) {
-        thread_call_cancel_wait(pendCall_);
         thread_call_free(pendCall_);
         pendCall_ = nullptr;
     }

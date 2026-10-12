@@ -47,7 +47,8 @@ verify: | $(BUILD)
 	python3 tools/verify_vtables.py $(BUILD)/vtables.txt
 
 check: $(KEXT)
-	kmutil libraries -p $(KEXT) --undef-symbols
+	kmutil libraries -p $(KEXT) --undef-symbols > /dev/null
+	../tools/check_kext_libs.sh $(KEXT)
 
 $(BUILD):
 	mkdir -p $@
