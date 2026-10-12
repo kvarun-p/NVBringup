@@ -68,9 +68,9 @@ public:
 };
 
 // The S1 display pipe: a plane-0 copy into NVBringup's scanout (the copy engine, else the CPU), done in submit.
-// A copied transaction completes gScanoutHoldMs later, not at once: in a mirror set CoreDisplay treats the pair
-// as a hardware mirror, and the built-in panel's Intel pipe scans out the same IOSurface; completing at once let
-// WindowServer draw the next frame into a surface the panel was still showing (black flashes, 2026-10-12).
+// A copied transaction can complete gScanoutHoldMs later instead of at once. The hold was added for the black
+// flashes in mirror mode, whose cause was NVBringup wiring the surface read-only (8960221); without the hold
+// mirror mode and video are fine, so it is 0 by default (2026-10-12).
 // Init is the family's own (not overridden).
 class NVDisplayPipe : public IOAccelDisplayPipe {
     OSDeclareDefaultStructors(NVDisplayPipe)
@@ -325,7 +325,7 @@ static bool have_gpu()
 static NVMetalAccelerator *gAccel = nullptr;     // the one accelerator of this kext (set in start, cleared in stop)
 // How long a copied transaction stays incomplete (NVDisplayPipe::holdCompletion), in ms; 0 completes at once.
 // Set at run time through the accelerator's NVPipeHoldMs property (root), at most 100.
-static volatile uint32_t gScanoutHoldMs = 20;
+static volatile uint32_t gScanoutHoldMs = 0;
 static uint64_t gSubmits, gCompletes, gErrors;
 static uint32_t gLastError;
 
