@@ -1905,7 +1905,12 @@ IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy
         waitedAbs = mach_absolute_time() - w0;
         IOLockLock(gspLock_);
         g = gsp_;
-        if (!g || !g->booted || !g->utilOk || !g->pd3 || !g->dispLit || !g->disp.ready) {
+        // A mode set while unlocked may have changed the geometry or reallocated the buffers: copying with the
+        // checks above would write past them. Refused (the caller copies itself); the next frame is checked anew
+        if (!g || !g->booted || !g->utilOk || !g->pd3 || !g->dispLit || !g->disp.ready ||
+            g->disp.w != a->dstWidth || g->disp.h != a->dstHeight || g->disp.pitch != a->dstPitch ||
+            !g->disp.fb.pa || g->disp.fb.size < need || g->disp.fbB.size < need || g->disp.fbC.size < need ||
+            g->disp.fbD.size < need || pipeFlipOff_) {
             IOLockUnlock(gspLock_);
             return r;
         }
