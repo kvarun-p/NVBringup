@@ -1239,6 +1239,11 @@ void NVBringup::dispHotplugTick()
         mask |= d.candId[i];
     uint8_t cs[NV0073_CONNECT_SIZE] = {};
     put32(cs, NV0073_CONNECT_displayMask, mask);
+    // While lit, the hot-plug pin only (flags: DDC and load detection disabled). The default method probes DDC, and
+    // held gspLock_ 20-67 ms every second, stalling every GPU submission behind it (NVPollHold, 2026-10-12).
+    // Nothing lit, the full detection, as before.
+    if (d.litId)
+        put32(cs, 4, 1u << 4 | 1u << 5);
     if (!gspRmControl(g->hClient, g->hDisp, NV0073_CTRL_CMD_SYSTEM_GET_CONNECT_STATE_, cs, sizeof(cs), &st,
                       true))      // once a second: logged only when it fails
         return;
@@ -1732,6 +1737,18 @@ IOReturn NVBringup::callPlatformFunction(const OSSymbol *functionName, bool wait
     return IOService::callPlatformFunction(functionName, waitForFunction, param1, param2, param3, param4);
 }
 
+IOReturn NVBringup::setProperties(OSObject *properties)
+{
+    OSDictionary *d = OSDynamicCast(OSDictionary, properties);
+    OSBoolean *b = d ? OSDynamicCast(OSBoolean, d->getObject("NVPipeFlip")) : nullptr;
+    if (!b)
+        return kIOReturnUnsupported;
+    pipeFlipOff_ = !b->getValue();
+    setProperty("NVPipeFlip", b->getValue());
+    LOG("GSP: display pipe: flips %s", b->getValue() ? "on" : "off");
+    return kIOReturnSuccess;
+}
+
 void NVBringup::pipeSrcDrop(uint32_t i, bool unmap)
 {
     PipeSrc &s = pipeSrc_[i];
@@ -1852,7 +1869,7 @@ IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy
     // to be shown (at most a frame). Writing into a queued buffer showed frames out of order (2026-10-12).
     const uint64_t need = (uint64_t)d.pitch * (d.h - 1) + (uint64_t)d.w * 4;
     const bool flips = d.fbB.pa && d.fbC.pa && d.fbD.pa && d.fbB.size >= need && d.fbC.size >= need &&
-                       d.fbD.size >= need && d.fb.size >= need &&
+                       d.fbD.size >= need && d.fb.size >= need && !pipeFlipOff_ &&
                        d.vtotal && d.pclkKhz && d.htotal;
     if (!d.fb.pa || a->dstWidth != d.w || a->dstHeight != d.h || a->dstPitch != d.pitch ||
         a->x1 > d.w || a->y1 > d.h || (uint64_t)d.pitch * (a->y1 - 1) + (uint64_t)a->x1 * 4 > d.fb.size) {
@@ -1973,6 +1990,15 @@ IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy
                      (unsigned long long)dd.pipeWaitUs);
             setProperty("NVPipeFlips", m);
         }
+    }
+    if (ok && !flips && dd.pipeArmed != ~0u) {         // flips switched off: window 0 back to fb, which has the frame
+        dispMthd(true, 0x260, (uint32_t)(dd.fb.pa >> 8));
+        dispMthd(true, 0x370, 0);
+        dispMthd(true, 0x374, 0);
+        dispMthd(true, 0x200, 1);
+        dd.pipeArmed = ~0u;
+        dd.pipeShowAt = 0;
+        dd.pipeFreeAt[0] = dd.pipeFreeAt[1] = dd.pipeFreeAt[2] = mach_absolute_time() + dispLinesAbs(2 * dd.vtotal);
     }
     IOLockUnlock(gspLock_);
     return ok ? kIOReturnSuccess : kIOReturnTimeout;

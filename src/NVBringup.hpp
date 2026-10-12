@@ -33,6 +33,9 @@ public:
     // NV_PIPE_COPY_FN (nv_pipe_copy.h): NVMetalAccel's display pipe has the copy engine copy its frames.
     IOReturn callPlatformFunction(const OSSymbol *functionName, bool waitForFunction,
                                   void *param1, void *param2, void *param3, void *param4) override;
+    // NVPipeFlip (boolean): the display pipe presents with flips (default) or copies into the scanned-out
+    // framebuffer as before; a diagnostic switch, set with IORegistryEntrySetCFProperty.
+    IOReturn setProperties(OSObject *properties) override;
 
 private:
     IOPCIDevice          *pci_  = nullptr;
@@ -273,6 +276,7 @@ private:
     static const uint32_t kPipeSrcs = 4;
     static const uint64_t kPipeVa = 0x200000000ull, kPipeVaSlot = 0x4000000ull;   // above GSP-RM's 0x1_0000_0000+512 MiB
     PipeSrc  pipeSrc_[kPipeSrcs];
+    volatile bool pipeFlipOff_ = false;
     uint64_t pipeUse_ = 0;
     IOReturn pipeCopy(OSObject *key, IOMemoryDescriptor *md, struct nv_pipe_copy *a);
     uint32_t dispLinesToVblank();               // raster lines until head 0's next vblank starts (0: unknown)
