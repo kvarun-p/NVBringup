@@ -418,18 +418,44 @@ void NVBringup::startGspPoller()
 
 void NVBringup::gspPoll()
 {
+    // How long each part holds gspLock_ (every GPU submission waits for it): NVPollHold, the maximum and the
+    // count of holds over 20 ms per part, published every 10 s.
+    static uint64_t maxUs[4], slow[4], polls;
+    uint64_t t[5];
+    t[0] = mach_absolute_time();
     IOLockLock(gspLock_);
+    t[1] = t[2] = t[3] = t[4] = t[0];
     bool again = gsp_ && gsp_->booted;
     if (again && serviceStatusQueue() < 0) {
         LOG("GSP: message poller stopped after an error");
         again = false;
     }
+    t[1] = mach_absolute_time();
     if (again) {
         updateStats();
+        t[2] = mach_absolute_time();
         dispHotplugTick();
+        t[3] = mach_absolute_time();
         idleTick();
+        t[4] = mach_absolute_time();
     }
     IOLockUnlock(gspLock_);
+    if (again) {
+        for (int i = 0; i < 4; i++) {
+            uint64_t ns = 0;
+            absolutetime_to_nanoseconds(t[i + 1] > t[i] ? t[i + 1] - t[i] : 0, &ns);
+            if (ns / 1000 > maxUs[i])
+                maxUs[i] = ns / 1000;
+            slow[i] += ns > 20000000;
+        }
+        if (++polls % 100 == 0) {
+            char m[192];
+            snprintf(m, sizeof(m), "max us / holds over 20 ms: lock+messages %llu/%llu, stats %llu/%llu, hotplug %llu/%llu, "
+                     "idle %llu/%llu (%llu polls)", maxUs[0], slow[0], maxUs[1], slow[1], maxUs[2], slow[2], maxUs[3],
+                     slow[3], polls);
+            setProperty("NVPollHold", m);
+        }
+    }
     dispNubSync();      // a display that came or went this poll: its nub, outside gspLock_
     if (again)
         gspTimer_->setTimeoutMS(100);

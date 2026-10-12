@@ -205,6 +205,8 @@ struct NVBringup::GspState {
     // (dispSetMode, from the boot probe or the hot-plug poll). Kernel CPU mappings through BAR1.
     struct DispHw {
         NVDispMem inst, pbCore, pbWndw, sync, ilut, olut, fb, fbB, fbC; // fb, fbB, fbC: the scanout buffers
+        NVDispMem fbD;                  // the display pipe flips among fbB, fbC, fbD; fb (the aperture) gets every
+                                        // frame too: in mirror mode the other display's picture is read from it
         NVDispMem curs;                 // the hardware cursor's image: 256x256 A8R8G8B8, head 0
         bool     cursChan = false;      // the cursor channel (C57A, PIO) is allocated
         bool     cursOn = false;        // head 0's cursor is enabled (core methods since the last modeset)
@@ -214,7 +216,7 @@ struct NVBringup::GspState {
         // queue: each is shown at the first vblank after its UPDATE, but no sooner than a frame after the one
         // before it. pipeArmed is the buffer last flipped to, pipeShowAt when it is (or was) shown; a buffer is in
         // use until the flip after it is shown (pipeFreeAt).
-        uint32_t pipeArmed = 0;
+        uint32_t pipeArmed = ~0u;       // index into fbB, fbC, fbD; ~0u: window 0 shows fb
         uint64_t pipeShowAt = 0;
         uint64_t pipeFreeAt[3] = {};
         uint64_t pipeFlips = 0, pipeWaits = 0, pipeWaitUs = 0;   // NVPipeFlips: flips, frames that waited, total wait

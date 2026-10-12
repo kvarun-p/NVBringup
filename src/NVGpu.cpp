@@ -1032,7 +1032,7 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
     // The surface. A bigger mode gets a new one; the old one's VRAM stays allocated, since a user
     // mapping of it (NVMAC_DISPLAY_MAP) may outlive this.
     const uint64_t need = (uint64_t)pitch * ((vact + 15) & ~15u);
-    NVDispMem *bufs[] = { &d.fb, &d.fbB, &d.fbC };    // three buffers: NVMAC_DISPLAY_FLIP picks one at vblank
+    NVDispMem *bufs[] = { &d.fb, &d.fbB, &d.fbC, &d.fbD };    // NVMAC_DISPLAY_FLIP picks one of the first three
     for (NVDispMem *b : bufs) {
         if (b->size < need) {
             NVDispMem nf;
@@ -1052,7 +1052,7 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
     }
     bar1Flush();
     d.front = 0;
-    d.pipeArmed = 0;
+    d.pipeArmed = ~0u;
     d.pipeShowAt = 0;
     d.pipeFreeAt[0] = d.pipeFreeAt[1] = d.pipeFreeAt[2] = 0;
 
@@ -1851,7 +1851,8 @@ IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy
     // With three buffers one is free unless two flips are already queued, and then this waits for the next one
     // to be shown (at most a frame). Writing into a queued buffer showed frames out of order (2026-10-12).
     const uint64_t need = (uint64_t)d.pitch * (d.h - 1) + (uint64_t)d.w * 4;
-    const bool flips = d.fbB.pa && d.fbC.pa && d.fbB.size >= need && d.fbC.size >= need && d.fb.size >= need &&
+    const bool flips = d.fbB.pa && d.fbC.pa && d.fbD.pa && d.fbB.size >= need && d.fbC.size >= need &&
+                       d.fbD.size >= need && d.fb.size >= need &&
                        d.vtotal && d.pclkKhz && d.htotal;
     if (!d.fb.pa || a->dstWidth != d.w || a->dstHeight != d.h || a->dstPitch != d.pitch ||
         a->x1 > d.w || a->y1 > d.h || (uint64_t)d.pitch * (a->y1 - 1) + (uint64_t)a->x1 * 4 > d.fb.size) {
@@ -1888,11 +1889,11 @@ IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy
             return r;
         }
         if ((target = pickFree(g->disp, ~0ull, &soonest)) < 0)          // the clock was off: take the oldest
-            target = (int)((g->disp.pipeArmed + 1) % 3);
+            target = (int)((g->disp.pipeArmed + 1) % 3);       // pipeArmed < 3 here: two were in use
     }
     GspState::DispHw &dd = g->disp;
-    NVDispMem *const now[3] = { &dd.fb, &dd.fbB, &dd.fbC };     // g may be a new GspState after the wait
-    const NVDispMem &f = *now[target];
+    NVDispMem *const now[3] = { &dd.fbB, &dd.fbC, &dd.fbD };    // g may be a new GspState after the wait
+    const NVDispMem &f = flips ? *now[target] : dd.fb;
     // A flip shows the whole buffer, which holds an older frame: the whole frame is copied, not the dirty rect.
     const uint32_t x0 = flips ? 0 : a->x0, y0 = flips ? 0 : a->y0;
     const int slot = pipeSrcMap(key, md);
@@ -1914,14 +1915,32 @@ IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy
         // physical destination
         pbHeader(subch, 0x300, 1), 2u | 1u << 2 | 1u << 3 | 1u << 7 | 1u << 8 | 1u << 9 | 1u << 13,
     };
+    // Flipping, the aperture (fb) gets the frame too, VRAM to VRAM after the first copy: in mirror mode the other
+    // display's picture is read from it, and holding every third frame it flickered (2026-10-12).
+    const uint64_t vin = f.pa, vout = dd.fb.pa;
+    const uint32_t payload2 = 0x5d000000u | (++g->utilSeq & 0xffffff);
+    const uint32_t push2[] = {
+        pbHeader(subch, 0x000, 1), chip_->arch->cls.copy,
+        pbHeader(subch, 0x260, 1), 0,                                                  // SET_SRC_PHYS_MODE: LOCAL_FB
+        pbHeader(subch, NVC5B5_SET_DST_PHYS_MODE_, 1), 0,
+        pbHeader(subch, 0x400, 4), (uint32_t)(vin >> 32), (uint32_t)vin, (uint32_t)(vout >> 32), (uint32_t)vout,
+        pbHeader(subch, 0x410, 4), dd.pitch, dd.pitch, (a->x1 - x0) * 4, a->y1 - y0,
+        pbHeader(subch, 0x240, 3), (uint32_t)(c.vaSem >> 32), (uint32_t)c.vaSem, payload2,
+        // physical source and destination
+        pbHeader(subch, 0x300, 1), 2u | 1u << 2 | 1u << 3 | 1u << 7 | 1u << 8 | 1u << 9 | 1u << 12 | 1u << 13,
+    };
     const uint64_t t0 = mach_absolute_time();
-    const bool ok = submitAndWait(c, push, sizeof(push) / 4, payload, 100, false);
+    bool ok = submitAndWait(c, push, sizeof(push) / 4, payload, 100, false);
+    if (ok && flips && !submitAndWait(c, push2, sizeof(push2) / 4, payload2, 100, false))
+        LOG("GSP: display pipe: copy into the aperture did not complete");
     uint64_t ns = 0;
     absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
     a->gpuUs = (uint32_t)(ns / 1000);
     if (!ok)                                    // what the slot held is suspect: map it again next time
         pipeSrcDrop((uint32_t)slot, true);
     if (ok && flips && (uint32_t)target != dd.pipeArmed) {
+        if (dd.pipeArmed == ~0u)                    // window 0 still shows fb, which isn't one of the three
+            dd.pipeArmed = 3;
         dispMthd(true, 0x260, (uint32_t)(f.pa >> 8));                     // window 0, offset 0: the buffer
         dispMthd(true, 0x370, 0);                                         // not interlocked with the core
         dispMthd(true, 0x374, 0);
@@ -1935,7 +1954,8 @@ IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy
         const uint64_t frame = dispLinesAbs(dd.vtotal);
         if (dd.pipeShowAt && showAt < dd.pipeShowAt + frame)
             showAt = dd.pipeShowAt + frame;
-        dd.pipeFreeAt[dd.pipeArmed] = showAt;
+        if (dd.pipeArmed < 3)
+            dd.pipeFreeAt[dd.pipeArmed] = showAt;
         dd.pipeShowAt = showAt;
         dd.pipeArmed = (uint32_t)target;
         dd.front = (uint32_t)target;
@@ -1990,12 +2010,12 @@ void NVBringup::dispLost()
         return;
     GspState::DispHw &d = g->disp;
     cursorLive(false);
-    NVDispMem *mems[] = { &d.inst, &d.pbCore, &d.pbWndw, &d.sync, &d.ilut, &d.olut, &d.fb, &d.fbB, &d.fbC, &d.curs };
+    NVDispMem *mems[] = { &d.inst, &d.pbCore, &d.pbWndw, &d.sync, &d.ilut, &d.olut, &d.fb, &d.fbB, &d.fbC, &d.fbD, &d.curs };
     for (NVDispMem *m : mems)
         OSSafeReleaseNULL(m->map);
     // The scanout surfaces are in the VRAM heap, which is rebuilt at the next boot: forgotten here, so that
     // dispInit and dispSetMode allocate them again instead of writing through the released mappings.
-    NVDispMem *surfaces[] = { &d.fb, &d.fbB, &d.fbC, &d.curs };
+    NVDispMem *surfaces[] = { &d.fb, &d.fbB, &d.fbC, &d.fbD, &d.curs };
     for (NVDispMem *m : surfaces)
         *m = NVDispMem();
     d.cursChan = d.cursOn = d.cursHave = false;     // the channel goes with the client
