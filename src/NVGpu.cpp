@@ -1765,7 +1765,7 @@ void NVBringup::pipeSrcDrop(uint32_t i, bool unmap)
     if (s.pages)
         IOFree(s.pages, s.npages * sizeof(uint64_t));
     if (s.md) {
-        s.md->complete(kIODirectionOut);
+        s.md->complete(kIODirectionInOut);
         s.md->release();
     }
     OSSafeReleaseNULL(s.key);
@@ -1798,7 +1798,11 @@ int NVBringup::pipeSrcMap(OSObject *key, IOMemoryDescriptor *md)
     if (!size || size > kPipeVaSlot)
         return -1;
     PipeSrc &s = pipeSrc_[slot];
-    if (md->prepare(kIODirectionOut) != kIOReturnSuccess)
+    // InOut though only read: xnu marks a descriptor wired for kIODirectionOut alone 'prepared read only' and,
+    // while it stays wired, refuses every later prepare that may write (kIOReturnNotWritable). The source is
+    // WindowServer's IOSurface, which the Intel GPU wires InOut to scan it out in mirror mode: held here
+    // read-only, the laptop panel flashed black ('IOAccelSysMemory::wire(): memory failed to prepare', 2026-10-12)
+    if (md->prepare(kIODirectionInOut) != kIOReturnSuccess)
         return -1;
     md->retain();
     s.md = md;
