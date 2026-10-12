@@ -20,6 +20,7 @@
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOLib.h>
+#include <IOKit/IOUserClient.h>
 #include <kern/thread_call.h>
 #include <libkern/OSAtomic.h>
 #include <IOKit/IOLocks.h>
@@ -67,7 +68,7 @@ public:
 };
 
 // The S1 display pipe: a plane-0 copy into NVBringup's scanout (the copy engine, else the CPU), done in submit.
-// A copied transaction completes kScanoutHoldMs later, not at once: in a mirror set CoreDisplay treats the pair
+// A copied transaction completes gScanoutHoldMs later, not at once: in a mirror set CoreDisplay treats the pair
 // as a hardware mirror, and the built-in panel's Intel pipe scans out the same IOSurface; completing at once let
 // WindowServer draw the next frame into a surface the panel was still showing (black flashes, 2026-10-12).
 // Init is the family's own (not overridden).
@@ -86,8 +87,8 @@ private:
     IOReturn copyPlane0(IOAccelDisplayPipeTransaction2 *txn);
     void markDone(uint32_t id);
     bool isDone(uint32_t id);
-    // Copied transactions waiting out kScanoutHoldMs (pendLock_), and the thread call that completes them.
-    static const uint32_t kScanoutHoldMs = 20, kPend = 8;
+    // Copied transactions waiting out gScanoutHoldMs (pendLock_), and the thread call that completes them.
+    static const uint32_t kPend = 8;
     struct Pending { uint32_t id; uint64_t due; bool used; } pend_[kPend] = {};
     IOSimpleLock *pendLock_ = nullptr;
     thread_call_t pendCall_ = nullptr;
@@ -111,6 +112,7 @@ public:
     void stop(IOService *provider) override;
 
     IOMemoryDescriptor *getStampMemory(unsigned int *count) override;
+    IOReturn setProperties(OSObject *props) override;  // NVPipeHoldMs (root: NVMetalAccelerator's IORegistry)
     IOAccelEventMachine2 *newEventMachine() override;
     IOAccelTask *createUserGPUTask() override;
     IOAccelTask *createKernelGPUTask() override;
@@ -321,6 +323,9 @@ static bool have_gpu()
 // ---- counters (registry properties of the accelerator, NVPipe*) ----------------------------------------
 
 static NVMetalAccelerator *gAccel = nullptr;     // the one accelerator of this kext (set in start, cleared in stop)
+// How long a copied transaction stays incomplete (NVDisplayPipe::holdCompletion), in ms; 0 completes at once.
+// Set at run time through the accelerator's NVPipeHoldMs property (root), at most 100.
+static volatile uint32_t gScanoutHoldMs = 20;
 static uint64_t gSubmits, gCompletes, gErrors;
 static uint32_t gLastError;
 
@@ -393,6 +398,7 @@ bool NVMetalAccelerator::start(IOService *provider)
         return false;
     }
     gAccel = this;
+    publishU("NVPipeHoldMs", gScanoutHoldMs);
     if (mode_ == kModeDisplayPipe) {
         pci_ = provider;
         enableAccelerator();                // S0-4 R4: transactionEnd is refused while this bit is clear
@@ -457,6 +463,23 @@ void NVMetalAccelerator::teardownDevice(IOPCIDevice *)
         stamp_->release();
         stamp_ = nullptr;
     }
+}
+
+IOReturn NVMetalAccelerator::setProperties(OSObject *props)
+{
+    OSDictionary *d = OSDynamicCast(OSDictionary, props);
+    OSNumber *n = d ? OSDynamicCast(OSNumber, d->getObject("NVPipeHoldMs")) : nullptr;
+    if (!n)
+        return IOGraphicsAccelerator2::setProperties(props);
+    IOReturn r = IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator);
+    if (r != kIOReturnSuccess)
+        return r;
+    if (n->unsigned32BitValue() > 100)
+        return kIOReturnBadArgument;
+    gScanoutHoldMs = n->unsigned32BitValue();
+    publishU("NVPipeHoldMs", gScanoutHoldMs);
+    IOLog("NVMetalAccel: completion hold %u ms\n", gScanoutHoldMs);
+    return kIOReturnSuccess;
 }
 
 IOMemoryDescriptor *NVMetalAccelerator::getStampMemory(unsigned int *count)
@@ -815,7 +838,7 @@ n_ret NVDisplayPipe::validateTransaction(IOAccelDisplayPipeTransaction2 *txn)
     return (uint32_t)r;
 }
 
-// The copy is done here; the transaction completes kScanoutHoldMs later (holdCompletion), while another display
+// The copy is done here; the transaction completes gScanoutHoldMs later (holdCompletion), while another display
 // may still scan out its surface. An error completes the transaction at once (so WindowServer does not stall on
 // the fifth submit) and is reported through txn+88.
 n_ret NVDisplayPipe::submitTransaction(IOAccelDisplayPipeTransaction2 *txn)
@@ -842,6 +865,9 @@ n_ret NVDisplayPipe::isTransactionComplete(IOAccelDisplayPipeTransaction2 *txn)
 
 bool NVDisplayPipe::holdCompletion(uint32_t id)
 {
+    const uint32_t holdMs = gScanoutHoldMs;
+    if (!holdMs)
+        return false;
     if (!pendLock_) {
         IOSimpleLock *l = IOSimpleLockAlloc();
         if (l && !OSCompareAndSwapPtr(nullptr, l, &pendLock_))
@@ -855,7 +881,7 @@ bool NVDisplayPipe::holdCompletion(uint32_t id)
     if (!pendLock_ || !pendCall_)
         return false;
     uint64_t due = 0;
-    clock_interval_to_deadline(kScanoutHoldMs, kMillisecondScale, &due);
+    clock_interval_to_deadline(holdMs, kMillisecondScale, &due);
     bool held = false, arm = false;
     IOSimpleLockLock(pendLock_);
     for (uint32_t i = 0; i < kPend && !held; i++)
