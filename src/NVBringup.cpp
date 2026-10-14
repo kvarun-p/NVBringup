@@ -3,6 +3,7 @@
 #include "nv_uapi.h"
 #include "nv_vbios.h"
 #include "nv_fwsec.h"
+#include "nv_stack.h"
 
 #include <IOKit/IOLib.h>
 #include <pexpert/pexpert.h>
@@ -23,6 +24,10 @@ IOService *NVBringup::probe(IOService *provider, SInt32 *score)
     IOPCIDevice *p = OSDynamicCast(IOPCIDevice, provider);
     if (!p || (p->configRead32(kIOPCIConfigRevisionID) >> 24) != 0x03)
         return nullptr;
+    if (nv_stack_off()) {       // boot-arg -nvoff: leave the GPU as the firmware left it (nv_stack.h)
+        IOLog("NVBringup: boot-arg -nvoff: not starting\n");
+        return nullptr;
+    }
     return super::probe(provider, score);
 }
 
@@ -67,6 +72,12 @@ bool NVBringup::start(IOService *provider)
         LOG("boot-arg nvboost=%u: P-state boost policy %s", boost, policies[boost]);
     boostPolicy_ = boost <= NVMAC_PERF_POLICY_ADAPTIVE ? boost : NVMAC_PERF_POLICY_ADAPTIVE;
     boostCall_ = thread_call_allocate(&NVBringup::boostThunk, this);
+
+    // The versions the auxiliary kexts and tools check (nv_stack.h).
+    setProperty(NV_STACK_ABI_KEY, NV_STACK_ABI, 32);
+    setProperty(NV_STACK_FEATURES_KEY, NV_STACK_FEATURES, 32);
+    setProperty(NV_UAPI_VERSION_KEY, NVMAC_ABI_VERSION, 32);
+    setProperty(NV_UAPI_FEATURES_KEY, NVMAC_FEATURES, 32);
 
     // Display pipe gate (S1): boot-arg nvdpipe=1, or the NVRAM one-shot nvdpipe-once (deleted here, so it
     // applies to this boot only; read even when the boot-arg is set, so it can't outlive the boot). Decided

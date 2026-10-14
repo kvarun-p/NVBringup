@@ -28,6 +28,7 @@
 #include <pexpert/pexpert.h>
 
 #include "../../src/nv_pipe_copy.h"
+#include "../../src/nv_stack.h"
 
 #define LOG(fmt, ...) IOLog("NVFramebuffer: " fmt "\n", ##__VA_ARGS__)
 
@@ -265,6 +266,19 @@ uint64_t NVFramebuffer::framePeriod() const
 
 IOService *NVFramebuffer::probe(IOService *provider, SInt32 *score)
 {
+    // The stack ABI handshake and -nvoff (nv_stack.h), with the NVBringup beside the nub under the PCI device.
+    IOService *gpu = nullptr;
+    IOService *pci = provider->getProvider();
+    OSIterator *it = pci ? pci->getChildIterator(gIOServicePlane) : nullptr;
+    while (OSObject *o = it ? it->getNextObject() : nullptr)
+        if (o->metaCast("NVBringup")) {
+            gpu = (IOService *)o;
+            break;
+        }
+    const bool admit = nv_stack_admit(gpu, "NVFramebuffer");
+    OSSafeReleaseNULL(it);
+    if (!admit)
+        return nullptr;
     OSObject *o = provider->copyProperty("NVDisplayFB");
     const bool ok = readDisplay(OSDynamicCast(OSDictionary, o));
     OSSafeReleaseNULL(o);
