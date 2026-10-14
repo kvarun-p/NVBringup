@@ -68,9 +68,8 @@ public:
 };
 
 // The S1 display pipe: a plane-0 copy into NVBringup's scanout (the copy engine, else the CPU), done in submit.
-// A copied transaction can complete gScanoutHoldMs later instead of at once. The hold was added for the black
-// flashes in mirror mode, whose cause was NVBringup wiring the surface read-only (8960221); without the hold
-// mirror mode and video are fine, so it is 0 by default (2026-10-12).
+// Every transaction completes at once. (A completion hold, NVPipeHoldMs, was added for the black flashes in
+// mirror mode and removed again: their cause was NVBringup wiring the surface read-only, 8960221.)
 // Init is the family's own (not overridden).
 class NVDisplayPipe : public IOAccelDisplayPipe {
     OSDeclareDefaultStructors(NVDisplayPipe)
@@ -87,18 +86,6 @@ private:
     IOReturn copyPlane0(IOAccelDisplayPipeTransaction2 *txn);
     void markDone(uint32_t id);
     bool isDone(uint32_t id);
-    // Copied transactions waiting out gScanoutHoldMs (pendLock_), and the thread call that completes them.
-    static const uint32_t kPend = 8;
-    struct Pending { uint32_t id; uint64_t due; bool used; } pend_[kPend] = {};
-    IOSimpleLock *pendLock_ = nullptr;
-    thread_call_t pendCall_ = nullptr;
-    uint64_t pendArmed_ = 0;                // the deadline pendCall_ is armed for, 0: not armed (pendLock_)
-    bool pendStop_ = false;                 // free: no more fires (pendLock_)
-    int pendBusy_ = 0;                      // pendFire calls past their entry check (pendLock_)
-    bool holdCompletion(uint32_t id);      // false: couldn't, complete now
-    static void pendFire(thread_call_param_t self, thread_call_param_t);
-public:
-    void free() override;
 };
 
 class NVMetalAccelerator : public IOGraphicsAccelerator2 {
@@ -112,7 +99,6 @@ public:
     void stop(IOService *provider) override;
 
     IOMemoryDescriptor *getStampMemory(unsigned int *count) override;
-    IOReturn setProperties(OSObject *props) override;  // NVPipeHoldMs (root: NVMetalAccelerator's IORegistry)
     IOAccelEventMachine2 *newEventMachine() override;
     IOAccelTask *createUserGPUTask() override;
     IOAccelTask *createKernelGPUTask() override;
@@ -323,9 +309,6 @@ static bool have_gpu()
 // ---- counters (registry properties of the accelerator, NVPipe*) ----------------------------------------
 
 static NVMetalAccelerator *gAccel = nullptr;     // the one accelerator of this kext (set in start, cleared in stop)
-// How long a copied transaction stays incomplete (NVDisplayPipe::holdCompletion), in ms; 0 completes at once.
-// Set at run time through the accelerator's NVPipeHoldMs property (root), at most 100.
-static volatile uint32_t gScanoutHoldMs = 0;
 static uint64_t gSubmits, gCompletes, gErrors;
 static uint32_t gLastError;
 
@@ -398,7 +381,6 @@ bool NVMetalAccelerator::start(IOService *provider)
         return false;
     }
     gAccel = this;
-    publishU("NVPipeHoldMs", gScanoutHoldMs);
     if (mode_ == kModeDisplayPipe) {
         pci_ = provider;
         enableAccelerator();                // S0-4 R4: transactionEnd is refused while this bit is clear
@@ -463,23 +445,6 @@ void NVMetalAccelerator::teardownDevice(IOPCIDevice *)
         stamp_->release();
         stamp_ = nullptr;
     }
-}
-
-IOReturn NVMetalAccelerator::setProperties(OSObject *props)
-{
-    OSDictionary *d = OSDynamicCast(OSDictionary, props);
-    OSNumber *n = d ? OSDynamicCast(OSNumber, d->getObject("NVPipeHoldMs")) : nullptr;
-    if (!n)
-        return IOGraphicsAccelerator2::setProperties(props);
-    IOReturn r = IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator);
-    if (r != kIOReturnSuccess)
-        return r;
-    if (n->unsigned32BitValue() > 100)
-        return kIOReturnBadArgument;
-    gScanoutHoldMs = n->unsigned32BitValue();
-    publishU("NVPipeHoldMs", gScanoutHoldMs);
-    IOLog("NVMetalAccel: completion hold %u ms\n", gScanoutHoldMs);
-    return kIOReturnSuccess;
 }
 
 IOMemoryDescriptor *NVMetalAccelerator::getStampMemory(unsigned int *count)
@@ -838,9 +803,8 @@ n_ret NVDisplayPipe::validateTransaction(IOAccelDisplayPipeTransaction2 *txn)
     return (uint32_t)r;
 }
 
-// The copy is done here; the transaction completes gScanoutHoldMs later (holdCompletion), while another display
-// may still scan out its surface. An error completes the transaction at once (so WindowServer does not stall on
-// the fifth submit) and is reported through txn+88.
+// The copy is done here and the transaction completes at once. An error completes it too (so WindowServer does
+// not stall on the fifth submit) and is reported through txn+88.
 n_ret NVDisplayPipe::submitTransaction(IOAccelDisplayPipeTransaction2 *txn)
 {
     const uint32_t id = txn->getTransactionID();
@@ -850,8 +814,7 @@ n_ret NVDisplayPipe::submitTransaction(IOAccelDisplayPipeTransaction2 *txn)
         gCompletes++;
     else
         noteError(r);
-    if (r != kIOReturnSuccess || !holdCompletion(id))
-        markDone(id);
+    markDone(id);
     publishU("NVPipeSubmits", gSubmits);
     publishU("NVPipeCompletes", gCompletes);
     signalTransactionInterrupt(nullptr);    // kicks completion: the next poll of 278 finds this one done
@@ -861,107 +824,6 @@ n_ret NVDisplayPipe::submitTransaction(IOAccelDisplayPipeTransaction2 *txn)
 n_ret NVDisplayPipe::isTransactionComplete(IOAccelDisplayPipeTransaction2 *txn)
 {
     return isDone(txn->getTransactionID()) ? 1 : 0;
-}
-
-bool NVDisplayPipe::holdCompletion(uint32_t id)
-{
-    const uint32_t holdMs = gScanoutHoldMs;
-    if (!holdMs)
-        return false;
-    if (!pendLock_) {
-        IOSimpleLock *l = IOSimpleLockAlloc();
-        if (l && !OSCompareAndSwapPtr(nullptr, l, &pendLock_))
-            IOSimpleLockFree(l);
-    }
-    if (!pendCall_) {
-        thread_call_t c = thread_call_allocate_with_options(pendFire, this, THREAD_CALL_PRIORITY_HIGH, 0);
-        if (c && !OSCompareAndSwapPtr(nullptr, c, &pendCall_))
-            thread_call_free(c);
-    }
-    if (!pendLock_ || !pendCall_)
-        return false;
-    uint64_t due = 0;
-    clock_interval_to_deadline(holdMs, kMillisecondScale, &due);
-    bool held = false, arm = false;
-    IOSimpleLockLock(pendLock_);
-    for (uint32_t i = 0; i < kPend && !held; i++)
-        if (!pend_[i].used) {
-            pend_[i] = { id, due, true };
-            held = true;
-        }
-    // Armed already for an earlier deadline: that fire reschedules for this one. (Arming again would move the
-    // call later each frame, and at 60 Hz it would never fire.)
-    if (held && !pendArmed_) {
-        pendArmed_ = due;
-        arm = true;
-    }
-    IOSimpleLockUnlock(pendLock_);
-    if (arm)
-        thread_call_enter_delayed(pendCall_, due);
-    return held;
-}
-
-void NVDisplayPipe::pendFire(thread_call_param_t self, thread_call_param_t)
-{
-    NVDisplayPipe *p = (NVDisplayPipe *)self;
-    const uint64_t now = mach_absolute_time();
-    uint64_t next = 0;
-    bool any = false;
-    IOSimpleLockLock(p->pendLock_);
-    if (p->pendStop_) {
-        IOSimpleLockUnlock(p->pendLock_);
-        return;
-    }
-    p->pendBusy_++;
-    for (uint32_t i = 0; i < kPend; i++) {
-        if (!p->pend_[i].used)
-            continue;
-        if (p->pend_[i].due <= now) {
-            p->markDone(p->pend_[i].id);
-            p->pend_[i].used = false;
-            any = true;
-        } else if (!next || p->pend_[i].due < next) {
-            next = p->pend_[i].due;
-        }
-    }
-    p->pendArmed_ = next;
-    IOSimpleLockUnlock(p->pendLock_);
-    if (next)
-        thread_call_enter_delayed(p->pendCall_, next);
-    if (any)
-        p->signalTransactionInterrupt(nullptr);         // the family polls 278 and finds them done
-    IOSimpleLockLock(p->pendLock_);
-    p->pendBusy_--;
-    IOSimpleLockUnlock(p->pendLock_);                   // the last touch: free may go on once this is 0
-}
-
-void NVDisplayPipe::free()
-{
-    // No thread_call_cancel_wait: it is private KPI, and with it the kext didn't link into the auxiliary
-    // collection at all (2026-10-12). Stop new fires, cancel a pending one, wait out one already running.
-    if (pendCall_ && pendLock_) {
-        IOSimpleLockLock(pendLock_);
-        pendStop_ = true;
-        IOSimpleLockUnlock(pendLock_);
-        thread_call_cancel(pendCall_);
-        for (;;) {
-            IOSimpleLockLock(pendLock_);
-            const bool busy = pendBusy_ != 0;
-            IOSimpleLockUnlock(pendLock_);
-            if (!busy)
-                break;
-            IOSleep(1);
-        }
-    }
-    if (pendCall_) {
-        thread_call_free(pendCall_);
-        pendCall_ = nullptr;
-    }
-    if (pendLock_) {
-        IOSimpleLockFree(pendLock_);
-        pendLock_ = nullptr;
-    }
-    IOAccelDisplayPipe::free();
 }
 
 void NVDisplayPipe::markDone(uint32_t id)
