@@ -669,13 +669,16 @@ void NVBringup::probeDisplay()
 }
 
 // Display, step B1 (boot-arg nvdisp=2): lighting the HDMI/DVI output, at boot and on hot-plug. Follows
-// nouveau's r535/r570 path for Turing: c57d core + c57e window channels (HEAD 0, WINDOW 0), no cursor, no
-// window-immediate channel, no HDMI infoframes (the sink gets a DVI-style signal). GSP-RM owns the
+// nouveau's r535/r570 path for Turing: c57d core + c57e window channels (HEAD 0, WINDOW 0), no
+// window-immediate channel; HDMI mode and InfoFrames as NVKMS for an HDMI sink. GSP-RM owns the
 // OR/SOR and the PHY; this writes the channel methods.
-//   dispInit     once per GSP boot: instance memory (RAMHT, context DMAs), LUTs, root, channels, core init
-//   dispSetMode  per connect: SOR, head timing from the EDID, the surface (colour bars), window 0, UPDATEs
+//   dispInit     once per GSP boot: instance memory (RAMHT, context DMAs), LUTs, root, channels, core init,
+//                the hot-plug event
+//   dispSetMode  per connect: the mode from the EDID within the link's limits, SOR, HDMI or DVI, head timing
+//                and range, the surface (colour bars), window 0, UPDATEs, InfoFrames
 //   dispBlank    per disconnect: window 0 and the SOR detached
-//   dispHotplugTick  from the GSP poller: the outputs' connect state once a second (debounced)
+//   dispPower    DPMS (NVFramebuffer)
+//   dispHotplugTick  from the GSP poller: the outputs' connect state after a hot-plug event, or polled (debounced)
 // What nvdisplay 3 requires, found on hardware: the DMA header takes the method's byte offset (bits 13:2);
 // window 0 needs an identity ILUT (else UPDATE INVALID_STATE 0x2d), the head an identity OLUT (0x2e);
 // scanout surfaces take a big-page context DMA. Results: the log, NVDisplayModeset, NVDisplayFB (the lit
