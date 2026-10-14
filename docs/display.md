@@ -19,9 +19,11 @@ X8R8G8B8 buffer. The code is in `src/NVGpu.cpp`:
 - `probeDisplay`: the outputs, their connect state and EDIDs. `nvdisp=1` stops here, read-only.
 - `dispInit`: once per GSP-RM boot. Display instance memory (RAMHT, context DMAs), the LUTs, the root object, the
   channels, and core init.
-- `dispSetMode`: per connect. SOR assignment (`DFP_ASSIGN_SOR`), head timing, both buffers (colour bars until
-  something draws), and window 0.
-- `dispBlank`: per disconnect. Window 0 and the SOR are detached.
+- `dispSetMode`: per connect. The mode (below), SOR assignment (`DFP_ASSIGN_SOR`), HDMI or DVI
+  (`SET_HDMI_ENABLE`), head timing and output range, both buffers (colour bars until something draws), window 0,
+  then the HDMI InfoFrames.
+- `dispBlank`: per disconnect. Window 0 and the SOR are detached, the InfoFrames stopped.
+- `dispPower`: DPMS, from NVFramebuffer when macOS sleeps or wakes the display.
 
 **Found on hardware.** Each item cost a boot or more to find. All are now in the code:
 
@@ -40,9 +42,48 @@ placed 0x2e right after the ILUT check. Turning the head's OLUT off and on confi
 (big pages, as nouveau's), CSC11, the input scaler and the scale-factor bounds made no difference, but
 match nouveau or nvkms and stay.
 
-**Hot-plug:** the GSP poller checks the TMDS outputs' connect state once a second (`dispHotplugTick`). A change
-must hold for two samples, since HPD bounces while a cable goes in. An output that fails to light is skipped
-until it's unplugged. The push buffers wrap with a JUMP to 0 (nouveau's `nv50_dmac_wind`), so modesets can
+**EDID and mode:** the kext keeps the whole EDID, extensions included (up to 8 blocks), and publishes it in
+`NVDisplayFB` (NVFramebuffer serves each block over DDC) and `NVDisplayEDID-<id>`. `src/nv_edid.cpp` parses the
+CTA-861 block: the HDMI VSDB (an HDMI sink, its Max_TMDS_Clock), the HDMI Forum VSDB, the video capability block
+(QS, overscan), the short video descriptors and audio; `NVDisplaySink` shows the result. The mode is the preferred
+detailed timing if the link can carry it: GSP-RM's `GET_PCLK_LIMIT` for the OR, at most 340 MHz (above that HDMI
+2.0 needs scrambling and SCDC, `SET_HDMI_SINK_CAPS`, not set up), 165 MHz for a sink without an HDMI VSDB
+(single-link DVI). Otherwise the biggest timing that fits at 50 Hz or more, also within the sink's own maximum: a
+4K60 TV gets 1080p60 rather than 4K30. If nothing fits, the preferred timing is tried anyway.
+
+**HDMI:** a sink with an HDMI VSDB gets an HDMI signal, following NVKMS (`nvkms-hdmi.c`, the `hdmipacket` library):
+`SET_HDMI_ENABLE` (0x730273) after the SOR assignment, and after the modeset the InfoFrames and an
+AVMUTE-clearing general control packet, preceded by `CTRL_HDMI` (0x730274). On Turing NVKMS writes the packets
+through the display's SF registers, not through RM (the C57x display uses the `C571` packet class with 9171's
+register writers; the 0073 `SET_OD_PACKET` path is for pre-Kepler GPUs), so the kext does too:
+`NV_PDISP_SF_USER_0` is at 0x6f0000 on nvdisplay 3 (`dev_disp.h` v03_00), 0x400 per head, a slot per packet
+(AVI, generic, GCP, vendor-specific) at index × 64, each enabled every frame with the hardware checksum. The kext
+checks that they read sanely first and logs them before and after.
+
+- AVI: RGB 4:4:4, IT content (graphics), "composed for underscan", the timing's CTA video format (VIC), and the
+  quantization range below. HDMI 1.4 sinks get the 4K24-30 formats as an HDMI_VIC in the vendor-specific
+  InfoFrame instead.
+- SPD: "NVIDIA", "GeForce (macOS)", PC. Whether a TV shows it instead of a stale source name is up to the TV;
+  Samsung's name likely comes from CEC, which Turing can't send.
+- RGB range: full, unless the sink can't be told the range (no QS bit in the video capability block) and the
+  timing is a CTA video format other than 640x480, for which such a sink expects limited range. Then the head
+  compresses to 16-235 (OCSC1 and its clamp, procamp CEA range, as NVKMS `EvoSetOCsc1C5`) and the AVI InfoFrame
+  says "default". With QS, full range and the AVI InfoFrame says so. `nvrange=1`/`2` forces full/limited.
+- `nvhdmi=0` keeps the DVI-style signal. `NVDisplaySignal` says what was sent.
+
+**Display sleep (DPMS):** when macOS sleeps the display, NVFramebuffer's `kIOPowerAttribute` or `kConnectionPower`
+goes to 0 and the kext turns the signal off with `SET_MONITOR_POWER` (0x730295, NVKMS's DPMS for TMDS), keeping the
+head, the mode and the surfaces, so the sink goes to standby; waking turns it on. If GSP-RM refuses, the SOR is
+detached and waking relights it. `NVDisplayPower` shows the state; `nvdpms=0` ignores the requests.
+
+**Hot-plug:** GSP-RM handles the HPD interrupts and posts `NV2080_NOTIFIERS_HOTPLUG` to an event object the kext
+allocates on its subdevice (`NV01_EVENT_KERNEL_CALLBACK_EX` with `NV01_EVENT_CLIENT_RM`, then
+`EVENT_SET_NOTIFICATION` REPEAT, as nouveau). The `POST_EVENT` message comes through the status queue, which the
+100 ms GSP poller and every RPC wait drain; there is no interrupt for it. After an event the poller
+(`dispHotplugTick`) checks the TMDS outputs' connect state every 300 ms until a change has held for two checks,
+since HPD bounces while a cable goes in; otherwise every 5 s as a fallback. Without the event object (refused, or
+`nvhpdevent=0`) it checks once a second, as before. `NVDisplayHotplugEvents` counts the events. An output that fails
+to light is skipped until it's unplugged. The push buffers wrap with a JUMP to 0 (nouveau's `nv50_dmac_wind`), so modesets can
 repeat. A bigger mode gets new buffers. The old ones' VRAM stays allocated, because a user mapping may outlive the
 mode. `NVDisplayGen` changes on every connect and disconnect.
 
@@ -159,10 +200,10 @@ binary's ad-hoc signature, so a rebuild needs it granted again.
 
 ## Limitations and next steps
 
-- **DVI-style signal:** no HDMI mode, no InfoFrames, no audio. TVs may overscan the picture; setting the TV input's
-  device type to PC fixes that (verified on the Samsung). They also show a stale source name. An AVI InfoFrame
-  (IT content, underscan) and an SPD InfoFrame would fix both.
-- **One mode,** the EDID's preferred one, and one head. No mode switching from macOS.
+- **HDMI without audio:** HDMI mode and InfoFrames (above) are new and untested on hardware; HDMI audio needs
+  the RM side (ELD, `SET_ELD_AUDIO_CAPS`) and a macOS driver for the GPU's HDA function. No HDMI 2.0 (above
+  340 MHz), no deep colour, no YCbCr output.
+- **One mode,** the preferred one or the best the port carries, and one head. No mode switching from macOS.
 - **Tested on Sonoma only.** The capture runs on Sequoia and Tahoe too. Those systems may ask from time to
   time whether `nvvdisplay` may keep recording the screen, and Sonoma may show a recording indicator in the menu bar.
 - **Not scanned out directly:** every frame is composed on the Intel GPU and copied. Composing on the NVIDIA GPU

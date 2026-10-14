@@ -34,8 +34,10 @@ Sequoia and Tahoe. On Sonoma, `nvvdisplay --cgdisplaystream` captures with the o
 (removed in macOS 15), which is also the fallback if ScreenCaptureKit fails. The permission is tied to the binary's ad-hoc signature, so after a rebuild and reinstall,
 switch it off and on again.
 
-Hot-plug: while GSP-RM runs with `nvdisp=2`, NVBringup checks the TMDS outputs' connect state once a second. A
-change must hold for 2 s before it acts. On plug-in it reads the EDID and lights the output at its preferred mode;
+Hot-plug: while GSP-RM runs with `nvdisp=2`, NVBringup listens for GSP-RM's hot-plug events and then checks the TMDS
+outputs' connect state every 300 ms until a change has held for two checks (otherwise every 5 s; once a second
+without events, or with `nvhpdevent=0`). On plug-in it reads the EDID and lights the output at its preferred mode
+(or the best one the port can carry), in HDMI mode with InfoFrames for an HDMI sink (see docs/display.md);
 on unplug it detaches window 0 and the SOR. Either way it bumps `NVDisplayGen`. nvvdisplay follows that counter: it
 removes the virtual display while nothing is lit, so macOS moves the windows back, and makes it again at the new
 monitor's mode. To be able to see a plug-in, `nvdisp=2` keeps the GPU powered even with no monitor, so the idle
