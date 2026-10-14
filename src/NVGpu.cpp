@@ -1067,6 +1067,20 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
     const uint32_t htotal = mode->htotal, vtotal = mode->vtotal;
     const uint32_t hsyncs = hact + hso, vsyncs = vact + vso;
     const uint32_t pitch = (hact * 4 + 255) & ~255u;
+
+    // HDMI or DVI signal, and the RGB quantization range (nvkms-hdmi.c nvDpyIsHdmiEvo,
+    // CalculateVideoInfoFrameColorFormat). HDMI when the sink has an HDMI VSDB; boot-arg nvhdmi=0 keeps DVI.
+    // The head sends full-range RGB (0-255) unless the sink expects limited range: an HDMI sink, a CTA video
+    // format other than 640x480 (VIC > 1), and no QS bit (it can't be told). Then the head compresses to 16-235
+    // (OCSC1 and the procamp's CEA range, as NVKMS's EvoSetProcAmpC5/EvoSetOCsc1C5) and the AVI InfoFrame says
+    // "default", which for a CTA format is limited. With QS the head stays full and the AVI InfoFrame says so.
+    // Boot-arg nvrange: 0 automatic (default), 1 always full, 2 always limited.
+    uint32_t hdmiArg = 1, rangeArg = 0;
+    PE_parse_boot_argn("nvhdmi", &hdmiArg, sizeof(hdmiArg));
+    PE_parse_boot_argn("nvrange", &rangeArg, sizeof(rangeArg));
+    bool hdmi = sink.hdmi && hdmiArg != 0;
+    uint8_t aspect = 0;
+    const uint8_t vic = nv_cta_vic(mode, &sink, &aspect);
     LOG("GSP: display: lighting 0x%x (protocol %u): %ux%u, pclk %u kHz, h %u/%u/%u/%u v %u/%u/%u/%u, "
         "hsync %c vsync %c", displayId, rmProto, hact, vact, pclkKhz, hact, hso, hsw, htotal, vact, vso, vsw, vtotal,
         nhsync ? '-' : '+', nvsync ? '-' : '+');
@@ -1121,6 +1135,22 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
             FAIL("no SOR assigned");
     }
 
+    // HDMI or DVI for this modeset (NV0073_CTRL_SPECIFIC_SET_HDMI_ENABLE_PARAMS: u8 subDeviceInstance, u32 displayId,
+    // u8 enable): after the SOR assignment, before the modeset, as NVKMS's nvDpyUpdateHdmiPreModesetEvo. Told for
+    // every HDMI sink, and once more to turn it off after one.
+    if (sink.hdmi || d.hdmiOn) {
+        uint8_t he[12] = {};
+        put32(he, 4, displayId);
+        he[8] = hdmi ? 1 : 0;
+        if (!gspRmControl(g->hClient, g->hDisp, 0x730273, he, sizeof(he), &st)) {
+            LOG("GSP: display: SET_HDMI_ENABLE(%u) failed (status 0x%x): DVI signal", he[8], st);
+            hdmi = false;
+        }
+        d.hdmiOn = hdmi;
+    }
+    const bool limited = rangeArg == 2 || (rangeArg == 0 && hdmi && vic > 1 && !sink.qs);
+    const uint8_t aviQ = !sink.qs ? 0 : limited ? 1 : 2;         // AVI Q: default, limited, full
+
     // SOR control, head raster, clock, output resource, OLUT (headc57d_*), window ownership; UPDATE.
     dispMthd(false, 0x300 + sorIdx * 0x20, rmProto << 8 | 1u << head);           // SOR_SET_CONTROL: protocol, owner
     dispMthd(false, 0x2020 + head * 0x400, displayId);                            // HEAD_SET_DISPLAY_ID
@@ -1141,7 +1171,21 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
     dispMthd(false, 0x2028 + head * 0x400, pclkKhz * 1000);                       // pixel clock max
     dispMthd(false, 0x2030 + head * 0x400, 4u | 1u << 4 | 1u << 8 | 1u << 12);    // head usage bounds
     dispMthd(false, 0x2004 + head * 0x400, (nhsync ? 4u : 0) | (nvsync ? 8u : 0) | 4u << 4 | 0x3fu << 26);
-    dispMthd(false, 0x2000 + head * 0x400, 0);                                    // procamp: RGB, VESA range
+    dispMthd(false, 0x2000 + head * 0x400, limited ? 1u << 28 : 0);              // procamp: RGB, VESA or CEA range
+    if (limited || d.rangeLimited) {
+        // Limited range: OCSC1 scales by 219/256 and adds 16/256 (NVKMS RGBToLimitedRangeRGB, S15.16), the clamp
+        // keeps 16-235 (12 bits). Back to full: OCSC1 off, no clamp. Not written at all for full range from the
+        // start, as before.
+        static const uint32_t ocsc1[12] = { 0xdb04, 0, 0, 0x1000, 0, 0xdb04, 0, 0x1000, 0, 0, 0xdb04, 0x1000 };
+        const uint32_t clamp = limited ? 0x100u | 0xeb0u << 16 : 0u | 0xfffu << 16;
+        dispMthd(false, 0x2238 + head * 0x400, clamp);                            // CLAMP_RANGE_GREEN
+        dispMthd(false, 0x223c + head * 0x400, clamp);                            // CLAMP_RANGE_RED_BLUE
+        dispMthd(false, 0x229c + head * 0x400, limited ? 1 : 0);                  // OCSC1CONTROL
+        if (limited)
+            for (uint32_t i = 0; i < 12; i++)
+                dispMthd(false, 0x22a0 + head * 0x400 + i * 4, ocsc1[i]);         // OCSC1COEFFICIENT_C00..C23
+        d.rangeLimited = limited;
+    }
     dispMthd(false, 0x2280 + head * 0x400, (4u + 1025u) << 8 | 2u << 2 | 1u);     // OLUT: size, DIRECT10, interp
     dispMthd(false, 0x2284 + head * 0x400, 0xffffffff);                           // OLUT FP norm scale
     dispMthd(false, 0x2288 + head * 0x400, kDispHandleVram);                      // OLUT context DMA
@@ -1226,6 +1270,25 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
         LOG("GSP: display: sink: %s", si);
         setProperty("NVDisplaySink", si);
     }
+    // InfoFrames once the head and the SOR run (NVKMS nvUpdateInfoFrames after the modeset).
+    d.vic = vic;
+    d.dpmsOff = d.dpmsBySor = false;
+    {
+        char hs[128];
+        if (hdmi && dispHdmiInfoFrames(head, sink, vic, aspect, aviQ))
+            snprintf(hs, sizeof(hs), "HDMI, AVI VIC %u Q %u, range %s, SPD", vic, aviQ, limited ? "limited" : "full");
+        else if (hdmi)
+            snprintf(hs, sizeof(hs), "HDMI without InfoFrames (SF registers unusable), range %s",
+                     limited ? "limited" : "full");
+        else
+            snprintf(hs, sizeof(hs), "DVI (%s), range %s",
+                     !sink.hdmi ? "no HDMI VSDB" : hdmiArg ? "SET_HDMI_ENABLE failed" : "nvhdmi=0",
+                     limited ? "limited" : "full");
+        if (!hdmi)
+            dispHdmiInfoFramesOff(head);
+        LOG("GSP: display: signal: %s", hs);
+        setProperty("NVDisplaySignal", hs);
+    }
     return true;
     }
 fail:
@@ -1234,6 +1297,96 @@ fail:
     setProperty("NVDisplayModeset", what);
     return false;
 #undef FAIL
+}
+
+// ---- HDMI InfoFrames -----------------------------------------------------------------------------------
+//
+// On Turing NVKMS sends InfoFrames through the display's SF registers, not through RM (hdmipacket nvhdmipkt.c: the
+// C57x display uses the NVHDMIPKT_C571_CLASS, which keeps 9171's register writers; nvhdmipkt_0073.c's
+// SET_OD_PACKET path is only for pre-Kepler). NV_PDISP_SF_USER_0 is at 0x6f0000 on nvdisplay 3
+// (swref/published/disp/v03_00/dev_disp.h, kdispGetDisplaySfUserBaseAndSize_v03_00; the cl9171.h offsets are
+// relative to it), 0x400 per head. Per packet slot (index 0 AVI, 1 generic, 3 GCP, 4 vendor-specific) at
+// index * 64: CTRL (bit 0 enable, bit 9 hardware checksum), STATUS, HEADER (HB0-2), then subpacks of PB0-3 / PB4-6.
+// Turing only, like the rest of this display code (C57x classes); Ampere's nvdisplay 4 moves things.
+static const uint32_t kSfUser = 0x6f0000;
+enum { kSfAvi = 0, kSfGeneric = 1, kSfGcp = 3, kSfVsi = 4 };
+
+static bool sfUsable(uint32_t v)
+{
+    return v != 0xffffffff && (v & 0xfff00000) != 0xbad00000;      // a PRI error reads as 0xbadXXXXX
+}
+
+// AVI (with the VIC and quantization range), SPD, the HDMI vendor-specific InfoFrame for an HDMI 1.4 4K format, and
+// the general control packet that clears AVMUTE, which also switches the link's HDMI data islands on
+// (CTRL_HDMI, as nvhdmipkt_9171.c does on the first unmuting GCP). False if the SF registers don't read sanely,
+// so nothing is written.
+bool NVBringup::dispHdmiInfoFrames(uint32_t head, const nv_sink_caps &sink, uint8_t vic, uint8_t aspect, uint8_t q)
+{
+    GspState *g = gsp_;
+    const uint32_t sf = kSfUser + head * 0x400;
+    const uint32_t avi0 = rd32(sf + kSfAvi * 64), gcp0 = rd32(sf + kSfGcp * 64);
+    LOG("GSP: display: SF head %u before: AVI ctrl 0x%08x, generic 0x%08x, GCP 0x%08x subpack 0x%08x, VSI 0x%08x",
+        head, avi0, rd32(sf + kSfGeneric * 64), gcp0, rd32(sf + 0xcc), rd32(sf + kSfVsi * 64));
+    if (!sfUsable(avi0) || !sfUsable(gcp0)) {
+        LOG("GSP: display: SF registers at 0x%x don't read sanely: no InfoFrames", sf);
+        return false;
+    }
+    // hdmiPacketWrite9171: disable the slot, write header and subpacks, enable every frame with HW checksum.
+    auto send = [&](uint32_t idx, const uint8_t *pkt, uint32_t subpacks) {
+        const uint32_t ctrl = sf + idx * 64, hdr = ctrl + 8;
+        wr32(ctrl, rd32(ctrl) & ~1u);
+        wr32(hdr, pkt[0] | (uint32_t)pkt[1] << 8 | (uint32_t)pkt[2] << 16);
+        for (uint32_t i = 0; i < subpacks; i++) {
+            const uint8_t *b = pkt + 3 + i * 7;
+            wr32(hdr + 4 + i * 8, b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24);
+            wr32(hdr + 8 + i * 8, b[4] | (uint32_t)b[5] << 8 | (uint32_t)b[6] << 16);
+        }
+        wr32(ctrl, 1u | 1u << 9);
+    };
+    // HDMI 1.4 sinks know 3840/4096x2160p24-30 only by HDMI_VIC, in the vendor-specific InfoFrame, with AVI VIC 0
+    // (HDMI 1.4b 8.2.3.1); HDMI 2.x sinks (HF-VSDB) take the CTA VIC.
+    const uint8_t hdmiVic = sink.hf ? 0 : nv_hdmi_vic(vic);
+    uint8_t avi[17];
+    nv_avi_infoframe(avi, hdmiVic ? 0 : vic, aspect, q);
+    send(kSfAvi, avi, 2);
+    uint8_t pkt[31];
+    nv_spd_infoframe(pkt, "NVIDIA", "GeForce (macOS)");
+    send(kSfGeneric, pkt, 4);
+    if (hdmiVic) {
+        nv_hdmi_vsi_infoframe(pkt, hdmiVic);
+        send(kSfVsi, pkt, 4);
+    } else {
+        wr32(sf + kSfVsi * 64, rd32(sf + kSfVsi * 64) & ~1u);
+    }
+    // GCP: clear AVMUTE (its reset value is SET_AVMUTE). CTRL_HDMI {u8 sub, u32 displayId, NvBool enable} first.
+    uint32_t st = 0;
+    wr32(sf + kSfGcp * 64, rd32(sf + kSfGcp * 64) & ~1u);
+    uint8_t ch[12] = {};
+    put32(ch, 4, g->disp.litId);
+    ch[8] = 1;
+    if (!gspRmControl(g->hClient, g->hDisp, 0x730274, ch, sizeof(ch), &st))
+        LOG("GSP: display: CTRL_HDMI failed (status 0x%x)", st);
+    wr32(sf + 0xcc, 0x10);                                                        // SB0 CLR_AVMUTE, SB1/SB2 0
+    wr32(sf + kSfGcp * 64, 1u | 1u << 9);
+    LOG("GSP: display: AVI %02x %02x %02x | %02x %02x %02x %02x %02x %02x (VIC %u, HDMI_VIC %u); SF after: AVI ctrl "
+        "0x%08x, generic 0x%08x, GCP 0x%08x, VSI 0x%08x", avi[0], avi[1], avi[2], avi[3], avi[4], avi[5], avi[6],
+        avi[7], avi[8], vic, hdmiVic, rd32(sf), rd32(sf + kSfGeneric * 64), rd32(sf + kSfGcp * 64),
+        rd32(sf + kSfVsi * 64));
+    return true;
+}
+
+// The packets off (DVI, or the display gone): each slot's enable bit cleared, if the registers read sanely.
+void NVBringup::dispHdmiInfoFramesOff(uint32_t head)
+{
+    const uint32_t sf = kSfUser + head * 0x400;
+    if (!sfUsable(rd32(sf)))
+        return;
+    static const uint32_t slots[] = { kSfAvi, kSfGeneric, kSfGcp, kSfVsi };
+    for (uint32_t idx : slots) {
+        const uint32_t v = rd32(sf + idx * 64);
+        if (sfUsable(v) && (v & 1))
+            wr32(sf + idx * 64, v & ~1u);
+    }
 }
 
 // The lit display went away: window 0 and the SOR detached (wndwc37e_image_clr; SOR_SET_CONTROL owner none),
@@ -1259,6 +1412,8 @@ void NVBringup::dispBlank()
     if (d.sorIdx != ~0u)
         dispMthd(false, 0x300 + d.sorIdx * 0x20, 0);                              // SOR_SET_CONTROL: no owner
     dispCoreUpdate(1);
+    dispHdmiInfoFramesOff(0);
+    d.dpmsOff = d.dpmsBySor = false;
     LOG("GSP: display: 0x%x unplugged: window 0 and SOR %u detached", d.litId, d.sorIdx);
     d.litId = 0;
     d.sorIdx = ~0u;
@@ -2121,6 +2276,8 @@ void NVBringup::dispLost()
     for (NVDispMem *m : surfaces)
         *m = NVDispMem();
     d.cursChan = d.cursOn = d.cursHave = false;     // the channel goes with the client
+    d.hdmiOn = d.rangeLimited = d.dpmsOff = d.dpmsBySor = false;   // GSP-RM and the display engine start over
+    d.hpdEvent = d.hpdBurst = 0;                    // the event object goes with the client
     d.ready = false;
     d.litId = 0;
     g->dispLit = false;
