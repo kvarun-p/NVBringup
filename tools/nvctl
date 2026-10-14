@@ -1,0 +1,726 @@
+#!/usr/bin/env python3
+"""nvctl: install, roll back and report NVBringup's pieces as one transaction, with a manifest and one backups tree.
+
+  tools/nvctl status [--json]                       what is built, installed and loaded, and whether they match
+  tools/nvctl report [DIR]                          status plus registry, logs and versions in one folder (bug reports)
+  tools/nvctl install [COMPONENT ...] [--apply]     plan (default) or apply an install; runs tools/nvcheck first
+  tools/nvctl uninstall [COMPONENT ...] [--apply]   plan or apply removing what the manifest lists
+  tools/nvctl rollback [--to STAMP] [--apply]       plan or apply restoring the state before the last (or a given)
+                                                    transaction from its backups
+  tools/nvctl boot-ok [--apply]                     clear the boot-attempt counter (NVRAM nv-boot-try, boot-arg nvguard=1)
+  tools/nvctl prune [--keep N] [--apply]            delete all but the newest N backup sets (default 5)
+
+Components (default: the ones already installed, plus efi when an OpenCore EFI with NVBringup.kext is mounted):
+  efi       build/NVBringup.kext -> <EFI>/OC/Kexts (OpenCore loads it; reboot)
+  accel     accel/build/NVMetalAccel.kext -> /Library/Extensions (auxiliary kext collection via kmutil; reboot)
+  fb        display/build/NVFramebuffer.kext -> /Library/Extensions (auxiliary kext collection via kmutil; reboot)
+  bundle    the Mesa build's NVMetal.bundle -> /System/Library/Extensions (accel/tools/nvmetal_root_install.sh; reboot)
+  vdisplay  display/build/nvvdisplay -> ~/Library/Application Support/NVBringup (LaunchAgent; no sudo)
+  daemon    the GSP-RM boot daemon (tools/install_daemon.sh)
+
+Nothing changes without --apply: every command prints as a plan first. With --apply, nvctl runs the nvcheck gate, then
+for each component backs up what is installed into one timestamped set under
+/Library/Application Support/nvctl/backups/<stamp>/, copies the new one in, checks it, and records it in
+/Library/Application Support/nvctl/installed.json. A failed step undoes the steps before it, newest first. config.plist,
+csr-active-config and the boot-args are never edited: the plan lists what to change by hand.
+"""
+import argparse
+import datetime
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import nvlib  # noqa: E402
+
+COMPONENTS = ["efi", "accel", "fb", "bundle", "vdisplay", "daemon"]
+REBOOT = {"efi", "accel", "fb", "bundle", "daemon"}
+BUNDLE_IDS = {"efi": "io.github.kvarun-p.nvbringup", "accel": "io.github.kvarun-p.nvmetalaccel",
+              "fb": "io.github.kvarun-p.nvframebuffer"}
+STATE = "/Library/Application Support/nvctl"     # not .../NVBringup: tools/uninstall_daemon.sh deletes that folder
+RECOVERY = ("recovery: boot with -nvoff (all NVBringup kexts stay out); from macOS Recovery: "
+            "bless --mount /Volumes/<system> --bootefi --last-sealed-snapshot (drops the NVMetal.bundle); "
+            "from another Mac: replace the USB's EFI with EFI-backup-<date>")
+
+
+# ---- where things live --------------------------------------------------------------------------------------------
+
+class Layout:
+    """Every installed path, under `root` (/ for the real system, a temporary folder in the tests)."""
+    def __init__(self, root="/", home=None, efi=None):
+        self.root = Path(root)
+        self.fake = str(self.root) != "/"
+        self.home = Path(home) if home else (self.root / "Users/test" if self.fake else Path.home())
+        self._efi = Path(efi) if efi else None
+
+    def p(self, path):
+        return self.root / str(path).lstrip("/")
+
+    @property
+    def efi(self):
+        if self._efi is None:
+            self._efi = nvlib.find_efi(self.p("/Volumes")) or False
+        return self._efi or None
+
+    @property
+    def state(self):
+        return self.p(STATE)
+
+    @property
+    def manifest(self):
+        return self.state / "installed.json"
+
+    @property
+    def backups(self):
+        return self.state / "backups"
+
+    def dest(self, comp):
+        if comp == "efi":
+            return self.efi / "OC/Kexts/NVBringup.kext" if self.efi else None
+        return {"accel": self.p("/Library/Extensions/NVMetalAccel.kext"),
+                "fb": self.p("/Library/Extensions/NVFramebuffer.kext"),
+                "bundle": self.p("/System/Library/Extensions/NVMetal.bundle"),
+                "vdisplay": self.home / "Library/Application Support/NVBringup/nvvdisplay",
+                "daemon": self.p("/Library/Application Support/NVBringup/nvgsp")}[comp]
+
+
+def source(comp, repo, cfg):
+    return {"efi": repo / "build/NVBringup.kext", "accel": repo / "accel/build/NVMetalAccel.kext",
+            "fb": repo / "display/build/NVFramebuffer.kext", "bundle": cfg.nvmetal_bundle,
+            "vdisplay": repo / "display/build/nvvdisplay", "daemon": repo / "build/nvgsp"}[comp]
+
+
+# ---- identity of a build or an installed copy ------------------------------------------------------------------------
+
+def executable(path):
+    path = Path(path)
+    if path.is_dir():
+        info = nvlib.plist(path / "Contents/Info.plist") or {}
+        exe = info.get("CFBundleExecutable")
+        return path / "Contents/MacOS" / exe if exe else None
+    return path if path.exists() else None
+
+
+def identity(path):
+    """The executable's Mach-O UUID (kept by re-signing and by nvmetal_root_install.sh's install_name_tool edits), else
+    its SHA-256; None when there is nothing at path."""
+    exe = executable(path)
+    if not exe or not exe.exists():
+        return None
+    u = nvlib.exe_uuid(exe)
+    if u:
+        return u
+    return "sha256:" + hashlib.sha256(exe.read_bytes()).hexdigest()[:32]
+
+
+def comp_identity(comp, path):
+    """identity(), except for the daemon, which is nvgsp and its boot script together."""
+    if comp != "daemon" or path is None:
+        return identity(path) if path is not None else None
+    i, sh = identity(path), Path(path).parent / "gsp_boot.sh"
+    if i is None:
+        return None
+    if not sh.exists():     # a build: the script is in the checkout
+        sh = Path(path).parent.parent / "tools/daemon/gsp_boot.sh"
+    h = hashlib.sha256(sh.read_bytes()).hexdigest()[:12] if sh.exists() else "none"
+    return "%s+gsp_boot.sh:%s" % (i, h)
+
+
+def stack_abi_of(repo):
+    try:
+        m = re.search(r"#define\s+NV_STACK_ABI\s+(\d+)", (repo / "src/nv_stack.h").read_text())
+        return int(m.group(1)) if m else 0
+    except OSError:
+        return 0
+
+
+def git_rev(path):
+    rc, out, _ = nvlib.run(["git", "-C", str(path), "rev-parse", "--short", "HEAD"], timeout=30)
+    if rc != 0:
+        return None
+    rc2, dirty, _ = nvlib.run(["git", "-C", str(path), "status", "--porcelain", "--untracked-files=no"], timeout=30)
+    return out.strip() + ("+dirty" if rc2 == 0 and dirty.strip() else "")
+
+
+# ---- the manifest ------------------------------------------------------------------------------------------------
+
+def load_manifest(lay):
+    try:
+        m = json.loads(lay.manifest.read_text())
+    except (OSError, ValueError):
+        m = {}
+    m.setdefault("version", 1)
+    m.setdefault("components", {})
+    m.setdefault("transactions", [])
+    return m
+
+
+# ---- running commands ------------------------------------------------------------------------------------------
+
+class Runner:
+    """Runs (or, in a plan, only prints) shell commands. Root commands get sudo on the real system. Under a fake root
+    the system-changing tools (kmutil, launchctl, nvram, the install scripts, chown) are recorded instead of run, and
+    file commands run without sudo inside the fake root."""
+    SYSTEM = ("kmutil", "launchctl", "nvram", "chown", "bless", "codesign")
+
+    def __init__(self, lay, apply, out=print):
+        self.lay, self.apply, self.out = lay, apply, out
+        self.recorded = []
+
+    def cmd(self, argv, root=False, check=True):
+        argv = [str(a) for a in argv]
+        shown = (["sudo"] if root and not self.lay.fake and os.geteuid() != 0 else []) + argv
+        self.out("  + " + " ".join(shlex.quote(a) for a in shown))
+        if not self.apply:
+            return True
+        base = os.path.basename(argv[0])
+        if self.lay.fake and (base in self.SYSTEM or base.endswith(".sh") or argv[0] in ("/bin/sh", "/bin/zsh")):
+            self.recorded.append(argv)
+            return True
+        r = subprocess.run(shown)
+        if check and r.returncode != 0:
+            raise StepError("%s failed (exit %d)" % (" ".join(shown), r.returncode))
+        return r.returncode == 0
+
+
+class StepError(Exception):
+    pass
+
+
+class Step:
+    """One change with its undo. do() and undo() take the Runner."""
+    def __init__(self, comp, what, do, undo=None):
+        self.comp, self.what, self.do, self.undo = comp, what, do, undo
+
+
+# ---- planning --------------------------------------------------------------------------------------------------
+
+def default_components(lay, cfg, manifest):
+    want = [c for c in COMPONENTS if c in manifest["components"] or (lay.dest(c) and lay.dest(c).exists())]
+    if lay.efi and "efi" not in want:
+        want.insert(0, "efi")
+    return [c for c in COMPONENTS if c in want]
+
+
+def stack_after(comps, lay, repo, manifest, gpu):
+    """The stack ABI the installed NVBringup will have after installing comps."""
+    if "efi" in comps:
+        return stack_abi_of(repo)
+    rec = manifest["components"].get("efi")
+    dest = lay.dest("efi")
+    if rec and dest and rec.get("identity") == comp_identity("efi", dest):
+        return rec.get("stack_abi", 0)
+    return (gpu or {}).get("NVStackABI", 0) or 0
+
+
+def install_steps(comps, lay, cfg, repo, manifest, stamp, notes):
+    """The steps of an install, and the manifest records they produce."""
+    steps, records = [], {}
+    bset = lay.backups / stamp
+    for c in comps:
+        src, dst = source(c, repo, cfg), lay.dest(c)
+        if dst is None:
+            notes.append("%s: no OpenCore EFI found (mount it, or pass --efi /Volumes/<volume>/EFI)" % c)
+            continue
+        if not src.exists():
+            notes.append("%s: no build at %s (%s)" % (c, src, "make" if c != "bundle" else "build Mesa, or set NVB_NVMETAL_BUNDLE"))
+            continue
+        sid, did = comp_identity(c, src), comp_identity(c, dst)
+        if sid and sid == did:
+            notes.append("%s: %s is current (%s)" % (c, dst, sid))
+            continue
+        rec = {"source": str(src), "dest": str(dst), "identity": sid, "git": git_rev(repo if c != "bundle" else cfg.mesa_src),
+               "installed": stamp, "backup": str(bset / c / dst.name) if dst.exists() else None}
+        if c in ("efi", "accel", "fb"):
+            rec["stack_abi"] = stack_abi_of(repo)
+            rec["bundle_id"] = BUNDLE_IDS[c]
+        records[c] = rec
+        backup = bset / c / dst.name
+        had = dst.exists()
+        root = c != "vdisplay" and not (c == "efi" and os.access(dst.parent, os.W_OK))
+
+        if c == "efi":
+            # the whole EFI next to it on the stick, once a day (what tools/install.sh does): the copy that boots the
+            # Mac from another machine's hands if this one doesn't
+            efi_bak = lay.efi.parent / ("EFI-backup-" + stamp[:4] + "-" + stamp[4:6] + "-" + stamp[6:8])
+            if not efi_bak.exists():
+                steps.append(Step(c, "back up the whole EFI to %s" % efi_bak,
+                                  lambda r, e=lay.efi, b=efi_bak: (r.cmd(["cp", "-RX", e, b]),
+                                                                   r.cmd(["diff", "-rq", e, b]))))
+            else:
+                notes.append("efi: today's %s exists; kept" % efi_bak)
+        if had:
+            extra = [dst.parent / "gsp_boot.sh"] if c == "daemon" and (dst.parent / "gsp_boot.sh").exists() else []
+
+            def do_backup(r, d=dst, b=backup, more=tuple(extra)):
+                r.cmd(["mkdir", "-p", b.parent], root=True)
+                r.cmd(["ditto", d, b], root=True)
+                for f in more:      # the daemon: its boot script too (the firmware is the same r570 set)
+                    r.cmd(["ditto", f, b.parent / f.name], root=True)
+            steps.append(Step(c, "back up %s" % dst, do_backup, None))
+        if c in ("efi", "accel", "fb"):
+            def do_kext(r, s=src, d=dst, ro=root, comp=c):
+                r.cmd(["rm", "-rf", d], root=ro)
+                r.cmd(["ditto", "--norsrc", "--noextattr", s, d], root=ro)
+                if comp == "efi":       # FAT: AppleDouble files break the signature
+                    r.cmd(["find", d, "-name", "._*", "-delete"], root=ro)
+                else:
+                    r.cmd(["chown", "-R", "root:wheel", d], root=True)
+                r.cmd(["codesign", "--verify", "--strict", d])
+                if comp != "efi":       # builds the auxiliary collection; a new kext asks for approval
+                    r.cmd(["kmutil", "load", "-p", d], root=True, check=False)
+
+            def undo_kext(r, d=dst, b=backup, h=had, ro=root):
+                r.cmd(["rm", "-rf", d], root=ro)
+                if h:
+                    r.cmd(["ditto", b, d], root=ro)
+            steps.append(Step(c, "install %s" % dst, do_kext, undo_kext))
+        elif c == "bundle":
+            script = repo / "accel/tools/nvmetal_root_install.sh"
+            steps.append(Step(c, "install NVMetal.bundle (new system snapshot)",
+                              lambda r, s=src: r.cmd(["/bin/zsh", script, "install", s], root=True),
+                              (lambda r, b=backup: r.cmd(["/bin/zsh", script, "restore", b], root=True)) if had else
+                              (lambda r: r.cmd(["/bin/zsh", script, "remove"], root=True))))
+        elif c == "vdisplay":
+            steps.append(Step(c, "install nvvdisplay (LaunchAgent)",
+                              lambda r: r.cmd(["/bin/sh", repo / "display/vdisplay/install.sh"]),
+                              (lambda r, d=dst, b=backup: (r.cmd(["cp", b, d], root=True),
+                                                           r.cmd(["/bin/launchctl", "kickstart", "-k",
+                                                                  "gui/%d/io.github.kvarun-p.nvvdisplay" % os.getuid()])))
+                              if had else (lambda r: r.cmd(["/bin/sh", repo / "display/vdisplay/install.sh", "-u"]))))
+            notes.append("vdisplay: a rebuilt nvvdisplay loses Screen Recording unless it is signed with a stable "
+                         "identity (display/vdisplay/SIGNING.md)")
+        elif c == "daemon":
+            steps.append(Step(c, "install the boot daemon",
+                              lambda r: r.cmd(["/bin/zsh", repo / "tools/install_daemon.sh"], root=True),
+                              (lambda r, d=dst, b=backup: restore_daemon(r, b.parent, d.parent)) if had else None))
+    return steps, records
+
+
+def restore_daemon(r, bdir, ddir):
+    for f in sorted(Path(bdir).iterdir()) if Path(bdir).is_dir() else []:
+        r.cmd(["ditto", f, Path(ddir) / f.name], root=True)
+
+
+def write_manifest_step(lay, manifest, records, stamp, action, removed=()):
+    """The last step of a transaction: the new manifest (and the old one in the backup set)."""
+    new = json.loads(json.dumps(manifest))
+    before = {c: manifest["components"].get(c) for c in list(records) + list(removed)}
+    for c, rec in records.items():
+        new["components"][c] = rec
+    for c in removed:
+        new["components"].pop(c, None)
+    new["transactions"].append({"stamp": stamp, "action": action, "components": sorted(list(records) + list(removed)),
+                                "before": before})
+    text = json.dumps(new, indent=2) + "\n"
+    staged = Path(os.environ.get("TMPDIR", "/private/tmp")) / ("nvctl-manifest-%s-%d.json" % (stamp, os.getpid()))
+
+    def do(r):
+        if r.apply:
+            staged.write_text(text)
+        r.cmd(["mkdir", "-p", lay.backups / stamp], root=True)
+        if lay.manifest.exists():
+            r.cmd(["cp", lay.manifest, lay.backups / stamp / "installed-before.json"], root=True)
+        r.cmd(["cp", staged, lay.manifest], root=True)
+        if r.apply:
+            staged.unlink(missing_ok=True)
+    return Step("manifest", "record %s in %s" % (action, lay.manifest), do, None), new
+
+
+def run_transaction(steps, runner, out=print):
+    """Runs the steps; on a failure undoes the finished ones, newest first. True if all ran."""
+    done = []
+    for s in steps:
+        out("%s: %s" % (s.comp, s.what))
+        try:
+            s.do(runner)
+            done.append(s)
+        except Exception as e:
+            out("FAILED: %s" % e)
+            if runner.apply:
+                # the failed step too: it may have stopped half way (the old copy deleted, the new one not in)
+                for d in reversed(done + [s]):
+                    if d.undo:
+                        out("undo %s: %s" % (d.comp, d.what))
+                        try:
+                            d.undo(runner)
+                        except Exception as e2:
+                            out("  undo failed too: %s (restore it by hand from the backup set)" % e2)
+            return False
+    return True
+
+
+# ---- nvcheck gate ------------------------------------------------------------------------------------------------
+
+def gate(args, repo, out=print):
+    if args.skip_check:
+        if args.apply:
+            out("nvctl: --skip-check only works for a plan")
+            return False
+        out("nvcheck: skipped (plan only)")
+        return True
+    cmd = [args.nvcheck or str(repo / "tools/nvcheck"), "--tier", str(args.check_tier),
+           "--json", str(repo / "build/nvcheck.json")]
+    out("nvcheck gate: " + " ".join(shlex.quote(c) for c in cmd))
+    r = subprocess.run(cmd)
+    try:
+        summary = json.loads((repo / "build/nvcheck.json").read_text())
+    except (OSError, ValueError):
+        summary = {"ok": False}
+    if r.returncode != 0 or not summary.get("ok"):
+        failed = [c["name"] for c in summary.get("checks", []) if c.get("status") == "fail"]
+        out("nvcheck FAILED%s: nothing is installed" % (": " + ", ".join(failed) if failed else ""))
+        return False
+    return True
+
+
+# ---- commands ----------------------------------------------------------------------------------------------------
+
+def boot_arg_notes(comps, bargs, notes):
+    have = set(bargs)
+    for a in ("nvfwsec=1", "nvgsp=1"):
+        if "efi" in comps and a not in have:
+            notes.append("boot-arg %s missing (config.plist NVRAM -> Add -> boot-args)" % a)
+    if "accel" in comps and "nvaccel=1" not in have:
+        notes.append("boot-arg nvaccel=1 missing: NVMetalAccel stays off without it")
+    armed = [a for a in bargs if a.split("=")[0] in ("nvdpipe", "nvfb", "nvguard", "-nvoff", "nvoff", "debug")]
+    if armed:
+        notes.append("boot-args that matter for a failed boot: %s (debug=0x100 makes a panic hang instead of reboot)"
+                     % " ".join(armed))
+
+
+def cmd_install(args, lay, cfg, repo, out=print):
+    manifest = load_manifest(lay)
+    comps = args.components or default_components(lay, cfg, manifest)
+    gpu = nvlib.ioreg_class("NVBringup") if not lay.fake else (args.fake_gpu or {})
+    stamp = args.stamp or datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    notes = []
+    steps, records = install_steps(comps, lay, cfg, repo, manifest, stamp, notes)
+    abi = stack_abi_of(repo)
+    aux = [c for c in records if c in ("accel", "fb")]
+    after = stack_after(list(records), lay, repo, manifest, gpu)
+    problems = []
+    if aux and after != abi:
+        problems.append("the auxiliary kexts (%s) are built for stack ABI %d, but NVBringup on the EFI will have %s: "
+                        "install efi in the same transaction (or the kexts refuse to start)" % (", ".join(aux), abi, after or "none"))
+    boot_arg_notes(comps, nvlib.boot_args() if not lay.fake else [], notes)
+
+    out("nvctl install: %s (%s)" % (", ".join(comps) or "nothing", "APPLY" if args.apply else "plan only; --apply to run"))
+    for n in notes:
+        out("  note: " + n)
+    for p in problems:
+        out("  PROBLEM: " + p)
+    if not records:
+        out("nothing to install")
+        return 0
+    if problems and not args.force:
+        out("refusing: fix the problems above (--force overrides)")
+        return 1
+    if not gate(args, repo, out):
+        return 1
+    mstep, _ = write_manifest_step(lay, manifest, records, stamp, "install")
+    runner = Runner(lay, args.apply, out)
+    ok = run_transaction(steps + [mstep], runner, out)
+    if args.apply and ok:
+        reboot = sorted(set(records) & REBOOT)
+        out("installed: %s; backups in %s" % (", ".join(sorted(records)), lay.backups / stamp))
+        if reboot:
+            out("reboot to load: %s" % ", ".join(reboot))
+        out(RECOVERY)
+    elif not args.apply:
+        out("plan only: nothing changed")
+    return 0 if ok else 1
+
+
+def cmd_uninstall(args, lay, cfg, repo, out=print):
+    manifest = load_manifest(lay)
+    comps = args.components or [c for c in COMPONENTS if c in manifest["components"]]
+    stamp = args.stamp or datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    steps, removed = [], []
+    for c in comps:
+        dst = lay.dest(c)
+        if not dst or not dst.exists():
+            out("  %s: not installed" % c)
+            continue
+        if c in ("bundle", "vdisplay", "daemon"):
+            out("  %s: use tools/uninstall.sh %s (it knows the snapshot, LaunchAgent and daemon steps)" %
+                (c, {"bundle": "bundle", "vdisplay": "vdisplay", "daemon": "daemon"}[c]))
+            continue
+        backup = lay.backups / stamp / c / dst.name
+        root = not (c == "efi" and os.access(dst.parent, os.W_OK))
+        steps.append(Step(c, "back up %s" % dst, lambda r, d=dst, b=backup: (
+            r.cmd(["mkdir", "-p", b.parent], root=True), r.cmd(["ditto", d, b], root=True))))
+        steps.append(Step(c, "remove %s" % dst, lambda r, d=dst, ro=root: r.cmd(["rm", "-rf", d], root=ro),
+                          lambda r, d=dst, b=backup, ro=root: r.cmd(["ditto", b, d], root=ro)))
+        removed.append(c)
+    out("nvctl uninstall: %s (%s)" % (", ".join(removed) or "nothing", "APPLY" if args.apply else "plan only"))
+    if not removed:
+        return 0
+    mstep, _ = write_manifest_step(lay, manifest, {}, stamp, "uninstall", removed)
+    ok = run_transaction(steps + [mstep], Runner(lay, args.apply, out), out)
+    if "efi" in removed:
+        out("  then remove NVBringup.kext's Kernel -> Add entry and the nv* boot-args from config.plist by hand")
+    return 0 if ok else 1
+
+
+def cmd_rollback(args, lay, cfg, repo, out=print):
+    manifest = load_manifest(lay)
+    txs = manifest["transactions"]
+    if not txs:
+        out("nvctl rollback: no transaction recorded in %s" % lay.manifest)
+        return 1
+    tx = next((t for t in reversed(txs) if t["stamp"] == args.to), None) if args.to else txs[-1]
+    if not tx:
+        out("nvctl rollback: no transaction %s (have: %s)" % (args.to, ", ".join(t["stamp"] for t in txs)))
+        return 1
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S") if not args.stamp else args.stamp
+    out("nvctl rollback of %s %s (%s): %s" % (tx["action"], tx["stamp"], "APPLY" if args.apply else "plan only",
+                                              ", ".join(tx["components"])))
+    steps, records, removed = [], {}, []
+    script = repo / "accel/tools/nvmetal_root_install.sh"
+    for c in tx["components"]:
+        before = tx["before"].get(c)
+        dst = lay.dest(c)
+        bset = lay.backups / tx["stamp"] / c
+        backup = next(iter(sorted(bset.iterdir())), None) if bset.is_dir() else None
+        root = c != "vdisplay" and not (c == "efi" and dst and os.access(dst.parent, os.W_OK))
+        if dst is None:
+            out("  %s: no EFI mounted; skipped" % c)
+            continue
+        if backup is None:      # it wasn't there before: take it out
+            if c == "bundle":
+                steps.append(Step(c, "remove NVMetal.bundle", lambda r: r.cmd(["/bin/zsh", script, "remove"], root=True)))
+            elif c == "vdisplay":
+                steps.append(Step(c, "remove nvvdisplay", lambda r: r.cmd(["/bin/sh", repo / "display/vdisplay/install.sh", "-u"])))
+            else:
+                steps.append(Step(c, "remove %s (not installed before)" % dst,
+                                  lambda r, d=dst, ro=root: r.cmd(["rm", "-rf", d], root=ro)))
+            removed.append(c)
+            continue
+        if c == "bundle":
+            steps.append(Step(c, "restore NVMetal.bundle from %s (new system snapshot)" % backup,
+                              lambda r, b=backup: r.cmd(["/bin/zsh", script, "restore", b], root=True)))
+        elif c == "daemon":
+            backup = bset / dst.name
+            steps.append(Step(c, "restore the boot daemon from %s" % bset,
+                              lambda r, b=bset, d=dst: restore_daemon(r, b, d.parent)))
+        else:
+            def do(r, d=dst, b=backup, ro=root, comp=c):
+                r.cmd(["rm", "-rf", d], root=ro)
+                r.cmd(["ditto", b, d], root=ro)
+                if comp in ("accel", "fb"):
+                    r.cmd(["chown", "-R", "root:wheel", d], root=True)
+                    r.cmd(["kmutil", "load", "-p", d], root=True, check=False)
+            steps.append(Step(c, "restore %s from %s" % (dst, backup), do))
+        if before:
+            records[c] = dict(before, installed=stamp, restored_from=tx["stamp"])
+        else:
+            records[c] = {"dest": str(dst), "identity": comp_identity(c, backup), "installed": stamp,
+                          "restored_from": tx["stamp"], "backup": None}
+    mstep, _ = write_manifest_step(lay, manifest, records, stamp, "rollback of " + tx["stamp"], removed)
+    ok = run_transaction(steps + [mstep], Runner(lay, args.apply, out), out)
+    if args.apply and ok:
+        out("rolled back; reboot to load the restored kexts")
+    return 0 if ok else 1
+
+
+def cmd_boot_ok(args, lay, cfg, repo, out=print):
+    out("nvctl boot-ok (%s): the boot-attempt counter goes, so the next boot isn't counted as a failed one" %
+        ("APPLY" if args.apply else "plan only"))
+    Runner(lay, args.apply, out).cmd(["nvram", "-d", "nv-boot-try"], root=True, check=False)
+    return 0
+
+
+def cmd_prune(args, lay, cfg, repo, out=print):
+    sets = sorted(p for p in lay.backups.iterdir() if p.is_dir()) if lay.backups.is_dir() else []
+    old = sets[:-args.keep] if args.keep > 0 else sets
+    out("nvctl prune: %d backup sets, keeping %d (%s)" % (len(sets), min(len(sets), args.keep),
+                                                         "APPLY" if args.apply else "plan only"))
+    r = Runner(lay, args.apply, out)
+    for p in old:
+        r.cmd(["rm", "-rf", p], root=True)
+    return 0
+
+
+# ---- status / report -----------------------------------------------------------------------------------------------
+
+def loaded_kexts():
+    rc, out, _ = nvlib.run(["/usr/bin/kmutil", "showloaded", "--list-only"], timeout=120)
+    loaded = {}
+    for line in out.splitlines():
+        m = re.search(r"(io\.github\.kvarun-p\.\w+) \(([^)]*)\) ([0-9A-F-]{36})", line)
+        if m:
+            loaded[m.group(1)] = m.group(3)
+    return loaded
+
+
+def gather_status(lay, cfg, repo, live=True):
+    manifest = load_manifest(lay)
+    loaded = loaded_kexts() if live else {}
+    gpu = (nvlib.ioreg_class("NVBringup") or {}) if live else {}
+    st = {"repo": str(repo), "git": git_rev(repo), "mesa_git": git_rev(cfg.mesa_src), "stack_abi_build": stack_abi_of(repo),
+          "efi": str(lay.efi) if lay.efi else None, "manifest": str(lay.manifest), "components": {}}
+    for c in COMPONENTS:
+        src, dst = source(c, repo, cfg), lay.dest(c)
+        b, i = comp_identity(c, src), comp_identity(c, dst)
+        e = {"built": str(src) if src.exists() else None, "build_id": b,
+             "installed": str(dst) if dst and dst.exists() else None, "installed_id": i,
+             "current": bool(b and b == i), "manifest": manifest["components"].get(c)}
+        bid = BUNDLE_IDS.get(c)
+        if bid:
+            e["loaded_id"] = loaded.get(bid)
+            e["loaded_is_installed"] = bool(i and e["loaded_id"] == i) if e["loaded_id"] else None
+        if e["manifest"] and i and e["manifest"].get("identity") != i:
+            e["note"] = "changed outside nvctl since it was recorded"
+        st["components"][c] = e
+    keys = ("NVGspResult", "NVGpuName", "NVStackABI", "NVStackFeatures", "NVUapiVersion", "NVUapiFeatures",
+            "NVSafeMode", "NVDisplayModeset", "NVDisplayPipeArmed", "NVFrtsResult", "NVLastTeardown")
+    st["nvbringup"] = {k: gpu[k] for k in keys if k in gpu}
+    if live:
+        st["boot_args"] = nvlib.boot_args()
+        st["os"] = nvlib.run(["/usr/bin/sw_vers", "-productVersion"])[1].strip()
+        st["kernel"] = nvlib.run(["/usr/sbin/sysctl", "-n", "kern.osversion"])[1].strip()
+        # read-only NVRAM queries for the one-shot gates and the boot counter
+        st["nvram"] = {}
+        for v in ("nvdpipe-once", "nvfb-once", "nv-boot-try"):
+            rc, o, _ = nvlib.run(["/usr/sbin/nvram", v], timeout=10)
+            if rc == 0:
+                st["nvram"][v] = o.split("\t", 1)[-1].strip()
+    st["transactions"] = [{"stamp": t["stamp"], "action": t["action"], "components": t["components"]}
+                          for t in manifest["transactions"][-5:]]
+    st["backup_sets"] = sorted(p.name for p in lay.backups.iterdir() if p.is_dir()) if lay.backups.is_dir() else []
+    return st
+
+
+def print_status(st, out=print):
+    out("NVBringup checkout %s (%s), stack ABI %s; Mesa %s" % (st["repo"], st["git"], st["stack_abi_build"], st["mesa_git"]))
+    nb = st.get("nvbringup") or {}
+    if nb:
+        uapi = ("UAPI %s, features %#x" % (nb["NVUapiVersion"], nb.get("NVUapiFeatures", 0))
+                if "NVUapiVersion" in nb else "UAPI not published (older kext)")
+        out("loaded NVBringup: GSP-RM %s, stack ABI %s, %s%s" % (
+            nb.get("NVGspResult", "?"), nb.get("NVStackABI", "none (older kext)"), uapi,
+            ", SAFE MODE" if nb.get("NVSafeMode") else ""))
+    else:
+        out("loaded NVBringup: none")
+    out("%-9s %-9s %-10s %-8s %s" % ("component", "built", "installed", "loaded", "where"))
+    for c, e in st["components"].items():
+        built = "yes" if e["built"] else "-"
+        inst = "-" if not e["installed"] else ("current" if e["current"] else "differs")
+        if "loaded_id" in e:
+            ld = "-" if not e["loaded_id"] else ("same" if e["loaded_is_installed"] else "other")
+        else:
+            ld = ""
+        out("%-9s %-9s %-10s %-8s %s%s" % (c, built, inst, ld, e["installed"] or "",
+                                           "  [%s]" % e["note"] if e.get("note") else ""))
+    if st.get("boot_args") is not None:
+        out("boot-args: " + " ".join(st["boot_args"]))
+    if st.get("nvram"):
+        out("NVRAM: " + ", ".join("%s=%s" % kv for kv in st["nvram"].items()))
+    if st["transactions"]:
+        out("last transactions: " + "; ".join("%s %s (%s)" % (t["stamp"], t["action"], ",".join(t["components"]))
+                                              for t in st["transactions"]))
+    out("backup sets: %d in %s" % (len(st["backup_sets"]), Path(st["manifest"]).parent / "backups"))
+    out(RECOVERY)
+
+
+def cmd_status(args, lay, cfg, repo, out=print):
+    st = gather_status(lay, cfg, repo, live=not lay.fake)
+    if args.json:
+        out(json.dumps(st, indent=2, default=str))
+    else:
+        print_status(st, out)
+    return 0
+
+
+def cmd_report(args, lay, cfg, repo, out=print):
+    d = Path(args.dir or (repo / "build" / ("report-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))))
+    d.mkdir(parents=True, exist_ok=True)
+    st = gather_status(lay, cfg, repo, live=not lay.fake)
+    (d / "status.json").write_text(json.dumps(st, indent=2, default=str) + "\n")
+    lines = []
+    print_status(st, lines.append)
+    (d / "status.txt").write_text("\n".join(lines) + "\n")
+    if not lay.fake:
+        jobs = {"ioreg-nvbringup.txt": ["/usr/sbin/ioreg", "-l", "-r", "-c", "NVBringup", "-d", "1"],
+                "ioreg-accel.txt": ["/usr/sbin/ioreg", "-l", "-r", "-c", "NVMetalAccelerator", "-d", "2"],
+                "ioreg-fb.txt": ["/usr/sbin/ioreg", "-l", "-r", "-c", "NVFramebuffer", "-d", "1"],
+                "kmutil-showloaded.txt": ["/usr/bin/kmutil", "showloaded", "--list-only"],
+                "log.txt": ["/usr/bin/log", "show", "--last", args.logs, "--style", "compact", "--predicate",
+                                      'eventMessage CONTAINS "NVBringup" OR eventMessage CONTAINS "NVMetalAccel" OR '
+                                      'eventMessage CONTAINS "NVFramebuffer" OR eventMessage CONTAINS "NVAGDCControl" '
+                                      'OR eventMessage CONTAINS "nvmetal"']}
+        if args.logs == "none":
+            del jobs["log.txt"]
+        for name, cmd in jobs.items():
+            _, o, _ = nvlib.run(cmd, timeout=300)
+            (d / name).write_text(o)
+        g = nvlib.ioreg_class("NVBringup") or {}
+        if g.get("NVLog"):
+            (d / "nvlog.txt").write_text(str(g["NVLog"]))
+    out("report in %s (local only; it holds boot-args, registry dumps and logs: read it before sharing)" % d)
+    return 0
+
+
+# ---- main --------------------------------------------------------------------------------------------------------
+
+def main(argv=None, out=print):
+    ap = argparse.ArgumentParser(prog="nvctl", description=__doc__.split("\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    ap.add_argument("--root", default="/", help=argparse.SUPPRESS)        # tests: a fake system root
+    ap.add_argument("--home", help=argparse.SUPPRESS)
+    ap.add_argument("--repo", help=argparse.SUPPRESS)
+    ap.add_argument("--efi", help="the OpenCore EFI folder (default: the mounted one with OC/Kexts/NVBringup.kext)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def txn(p):
+        p.add_argument("--apply", action="store_true", help="make the changes (default: print the plan)")
+        p.add_argument("-n", "--dry-run", action="store_false", dest="apply", help="print the plan (the default)")
+        p.add_argument("--stamp", help=argparse.SUPPRESS)
+
+    p = sub.add_parser("status", help="built / installed / loaded, read-only")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("report", help="status plus registry and logs in a folder")
+    p.add_argument("dir", nargs="?")
+    p.add_argument("--logs", default="10m", help="unified log span: 10m (default, ~30 s), 1h, boot (minutes), none")
+    p = sub.add_parser("install", help="plan or apply an install")
+    p.add_argument("components", nargs="*", choices=COMPONENTS + [[]], metavar="COMPONENT")
+    txn(p)
+    p.add_argument("--check-tier", type=int, default=2, choices=(1, 2, 3), help="nvcheck tier for the gate (default 2)")
+    p.add_argument("--skip-check", action="store_true", help="plan without running nvcheck")
+    p.add_argument("--force", action="store_true", help="install although the stack ABI won't match")
+    p.add_argument("--nvcheck", help=argparse.SUPPRESS)
+    p = sub.add_parser("uninstall", help="plan or apply removing the manifest's kexts")
+    p.add_argument("components", nargs="*", choices=COMPONENTS + [[]], metavar="COMPONENT")
+    txn(p)
+    p = sub.add_parser("rollback", help="plan or apply restoring the state before a transaction")
+    p.add_argument("--to", help="the transaction's stamp (default: the last one)")
+    txn(p)
+    p = sub.add_parser("boot-ok", help="clear the boot-attempt counter")
+    txn(p)
+    p = sub.add_parser("prune", help="delete old backup sets")
+    p.add_argument("--keep", type=int, default=5)
+    txn(p)
+    args = ap.parse_args(argv)
+    if not hasattr(args, "fake_gpu"):
+        args.fake_gpu = None
+
+    repo = Path(args.repo) if args.repo else nvlib.REPO
+    cfg = nvlib.Config(repo)
+    lay = Layout(args.root, home=args.home, efi=args.efi or cfg.efi)
+    if not lay.fake and os.geteuid() == 0:
+        out("run nvctl as yourself, not with sudo: it asks for sudo where needed")
+        return 1
+    fn = {"status": cmd_status, "report": cmd_report, "install": cmd_install, "uninstall": cmd_uninstall,
+          "rollback": cmd_rollback, "boot-ok": cmd_boot_ok, "prune": cmd_prune}[args.cmd]
+    return fn(args, lay, cfg, repo, out)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
