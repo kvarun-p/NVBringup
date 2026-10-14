@@ -1011,22 +1011,60 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
     nv_sink_caps sink;
     nv_edid_parse(edid, edidLen, &sink);
 
-    // Mode: the EDID's first detailed timing descriptor (bytes 54..71).
+    // Mode: the first of the sink's timings (nv_edid_timings: the preferred detailed timing, the other detailed
+    // timings, the CTA short video descriptors, 640x480p60) that the link can carry. The port's limit is GSP-RM's
+    // (GET_PCLK_LIMIT, the OR's maximum pixel clock), at most 340 MHz: above that HDMI 2.0 needs scrambling and
+    // SCDC (SET_HDMI_SINK_CAPS), which this doesn't set up. A sink without an HDMI VSDB gets single-link DVI,
+    // 165 MHz. Other timings must also fit the sink's own maximum (HDMI Forum VSDB, HDMI VSDB, range limits);
+    // the preferred one is taken at its word. If nothing fits, the preferred timing, as before.
     {
-    const uint8_t *t = edid + 54;
-    const uint32_t pclkKhz = (uint32_t)(t[0] | t[1] << 8) * 10;
-    const uint32_t hact = t[2] | (uint32_t)(t[4] & 0xf0) << 4, hblank = t[3] | (uint32_t)(t[4] & 0x0f) << 8;
-    const uint32_t vact = t[5] | (uint32_t)(t[7] & 0xf0) << 4, vblank = t[6] | (uint32_t)(t[7] & 0x0f) << 8;
-    const uint32_t hso = t[8] | (uint32_t)(t[11] & 0xc0) << 2, hsw = t[9] | (uint32_t)(t[11] & 0x30) << 4;
-    const uint32_t vso = (t[10] >> 4) | (uint32_t)(t[11] & 0x0c) << 2, vsw = (t[10] & 0x0f) | (uint32_t)(t[11] & 0x03) << 4;
-    const uint32_t flags = t[17];
-    if (!pclkKhz || !hact || !vact || (flags & 0x80)) {        // no timing, or interlaced
-        LOG("GSP: display: EDID has no usable progressive detailed timing (pclk %u kHz %ux%u flags 0x%x)",
-            pclkKhz, hact, vact, flags);
+    nv_edid_timing cand[24];
+    const uint32_t nCand = nv_edid_timings(edid, edidLen, &sink, cand, 24);
+    uint32_t orLimit = 0;
+    {
+        uint8_t pl[20] = {};            // NV0073_CTRL_SPECIFIC_GET_PCLK_LIMIT_PARAMS: sub, displayId, pclk, or, vb
+        put32(pl, 4, displayId);
+        if (gspRmControl(g->hClient, g->hDisp, 0x73028a, pl, sizeof(pl), &st, true))
+            memcpy(&orLimit, pl + 12, 4);
+        else
+            LOG("GSP: display: GET_PCLK_LIMIT failed (status 0x%x); assuming 340 MHz", st);
+    }
+    uint32_t linkMax = 340000;
+    if (orLimit >= 25000 && orLimit < linkMax)      // kHz; anything below VGA's clock is not believed
+        linkMax = orLimit;
+    if (!sink.hdmi && linkMax > 165000)
+        linkMax = 165000;
+    const uint32_t sinkMax = nv_sink_max_tmds_khz(&sink);
+    const nv_edid_timing *mode = nullptr;
+    for (uint32_t i = 0; i < nCand && !mode; i++) {
+        const nv_edid_timing &c = cand[i];
+        const bool preferred = i == 0 && c.source == NV_EDID_SRC_DTD;
+        const uint32_t lim = preferred || sinkMax > linkMax ? linkMax : sinkMax;
+        const char *why = c.interlaced ? "interlaced"
+                        : !c.hact || !c.vact || !c.hsw || !c.vsw || c.hact > 8192 || c.vact > 8192 ? "unusable"
+                        : c.pclkKhz > lim ? "pixel clock above the limit" : nullptr;
+        if (why) {
+            if (i < 6)
+                LOG("GSP: display: timing %u (%ux%u%s, %u kHz, VIC %u) skipped: %s (limit %u kHz)", i, c.hact, c.vact,
+                    c.interlaced ? "i" : "p", c.pclkKhz, c.vic, why, lim);
+            continue;
+        }
+        mode = &c;
+    }
+    if (!mode && nCand && !cand[0].interlaced && cand[0].hact && cand[0].vact && cand[0].hsw && cand[0].vsw) {
+        LOG("GSP: display: no timing within the limits; trying the preferred one anyway");
+        mode = &cand[0];
+    }
+    if (!mode) {
+        LOG("GSP: display: EDID has no usable progressive timing (%u candidates)", nCand);
         FAIL("EDID has no usable timing");
     }
-    const bool nhsync = !(flags & 0x02), nvsync = !(flags & 0x04);
-    const uint32_t htotal = hact + hblank, vtotal = vact + vblank;
+    LOG("GSP: display: timing %u of %u (source %u), port limit %u kHz (OR %u), sink %u kHz",
+        (uint32_t)(mode - cand), nCand, mode->source, linkMax, orLimit, sinkMax);
+    const uint32_t pclkKhz = mode->pclkKhz, hact = mode->hact, vact = mode->vact;
+    const uint32_t hso = mode->hfp, hsw = mode->hsw, vso = mode->vfp, vsw = mode->vsw;
+    const bool nhsync = mode->nhsync, nvsync = mode->nvsync;
+    const uint32_t htotal = mode->htotal, vtotal = mode->vtotal;
     const uint32_t hsyncs = hact + hso, vsyncs = vact + vso;
     const uint32_t pitch = (hact * 4 + 255) & ~255u;
     LOG("GSP: display: lighting 0x%x (protocol %u): %ux%u, pclk %u kHz, h %u/%u/%u/%u v %u/%u/%u/%u, "
@@ -1047,6 +1085,9 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
         }
         // Colour bars show the output is lit before anything draws. On a display-pipe boot, black: WindowServer
         // shows the framebuffer's contents for a moment when it takes the display over (mirrored, on both screens).
+        // A relight (DPMS on) keeps what is there.
+        if (relight && b->size >= need)
+            continue;
         static const uint32_t bars[8] = { 0xffffff, 0xffff00, 0x00ffff, 0x00ff00, 0xff00ff, 0xff0000, 0x0000ff, 0x000000 };
         for (uint32_t y = 0; y < vact; y++)
             for (uint32_t x = 0; x < hact; x++) {
