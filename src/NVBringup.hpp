@@ -18,6 +18,8 @@
 #include "nv_fwsec.h"
 #include "nv_hal.h"
 
+struct nv_sink_caps;    // nv_edid.h
+
 // A VRAM block of the display engine's, CPU-mapped (uncached) through BAR1 (nvdisp=2).
 struct NVDispMem { uint64_t pa = 0, bar1 = 0, size = 0; IOMemoryMap *map = nullptr; volatile uint8_t *cpu = nullptr; };
 
@@ -232,9 +234,16 @@ private:
     void     initNvdec();
     void     probeDisplay();
     bool     dispInit();
-    bool     dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t *edid);
+    bool     dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t *edid, uint32_t edidLen,
+                         bool relight = false);
     void     dispBlank();
-    bool     dispReadEdid(uint32_t displayId, uint8_t edid[128]);
+    bool     dispReadEdid(uint32_t displayId, uint8_t *edid, uint32_t *len);   // edid: kNvEdidMax bytes
+    bool     dispHdmiInfoFrames(uint32_t head, const nv_sink_caps &sink, uint8_t vic, uint8_t aspect,
+                                uint8_t q);
+    void     dispHdmiInfoFramesOff(uint32_t head);
+    IOReturn dispPower(bool on);                // NV_DISPLAY_POWER_FN: DPMS for NVFramebuffer
+    void     dispHpdArm();
+    void     dispHpdEvent(const uint8_t *p, uint32_t len);    // NV_VGPU_MSG_EVENT_POST_EVENT, gspLock_ held
     void     dispHotplugTick();
     void     dispPublish();
     void     dispLost();

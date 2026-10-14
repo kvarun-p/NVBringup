@@ -8,6 +8,7 @@
 #include "nv_gsp_static.h"
 #include "nv_vram.h"
 #include "nv_mmu.h"
+#include "nv_edid.h"
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
@@ -200,7 +201,8 @@ struct NVBringup::GspState {
     uint64_t dispInst = 0;          // display instance memory (64 KiB VRAM), 0 = display not set up
     uint32_t hDisp = 0;             // NV04_DISPLAY_COMMON under our device
     uint32_t dispModeId = 0, dispModeProto = 0;   // nvdisp=2: the output and EDID modesetDisplay uses
-    uint8_t  dispModeEdid[128] = {};
+    uint8_t  dispModeEdid[kNvEdidMax] = {};
+    uint32_t dispModeEdidLen = 0;
     // nvdisp=2: the display engine as set up once per GSP boot (dispInit) and the output it lights
     // (dispSetMode, from the boot probe or the hot-plug poll). Kernel CPU mappings through BAR1.
     struct DispHw {
@@ -238,11 +240,24 @@ struct NVBringup::GspState {
         uint32_t nCand = 0, candId[4] = {}, candProto[4] = {};   // the TMDS outputs (HDMI/DVI)
         uint32_t litId = 0, sorIdx = ~0u;
         uint32_t pendId = 0, pendCount = 0, tick = 0;            // hot-plug debounce
+        // Hot-plug events (dispHpdArm): GSP-RM posts NV2080_NOTIFIERS_HOTPLUG; the poll then samples at 300 ms
+        // until the change settles, and every 5 s otherwise. Without the event object, once a second as before.
+        uint32_t hpdEvent = 0;          // the event object's handle, 0: none (polling)
+        uint32_t hpdEvents = 0;         // events received
+        uint32_t hpdBurst = 0, hpdNext = 0;      // samples still to take at the fast pace, and the tick of the next
         uint32_t failId = 0;            // an output that failed to light: not retried until it's unplugged
         uint32_t nErr = 0;
-        // The lit mode (dispSetMode): the EDID's preferred timing and the surface layout.
-        uint8_t  edid[128] = {};
+        // The lit mode (dispSetMode): the timing chosen from the EDID and the surface layout.
+        uint8_t  edid[kNvEdidMax] = {}; // the base block and its extensions
+        uint32_t edidLen = 0;
         bool     edidValid = false;     // edid is a lit display's (dispSetMode)
+        // HDMI (dispHdmiInfoFrames): the lit display's signal
+        bool     hdmiOn = false;        // SET_HDMI_ENABLE true at the last modeset, InfoFrames sent
+        bool     rangeLimited = false;  // the head compresses RGB to 16-235 (OCSC1, procamp CEA range)
+        uint8_t  vic = 0;               // the CTA-861 video format sent in the AVI InfoFrame
+        // DPMS (dispPower): macOS put the display to sleep
+        bool     dpmsOff = false;
+        bool     dpmsBySor = false;     // by detaching the SOR (SET_MONITOR_POWER refused); waking relights
         uint32_t proto = 0, w = 0, h = 0, pitch = 0, pclkKhz = 0, htotal = 0, vtotal = 0;
         uint32_t hsyncStart = 0, hsyncWidth = 0, vsyncStart = 0, vsyncWidth = 0, syncFlags = 0;
     } disp;

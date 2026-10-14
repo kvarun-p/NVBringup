@@ -545,6 +545,10 @@ int NVBringup::handleGspMessage(const GSP_MSG_QUEUE_ELEMENT *e, const uint8_t *p
         }
         return 0;
 
+    case NV_VGPU_MSG_EVENT_POST_EVENT:
+        dispHpdEvent(p, len);
+        return 0;
+
     case NV_VGPU_MSG_EVENT_RC_TRIGGERED:
         // rpc_rc_triggered_v17_02: engine, chid, gfid, level, exceptType, scope, u16, fault lo/hi/type
         if (len >= 40) {
@@ -1205,7 +1209,7 @@ bool NVBringup::createRmObjects()
             LOG("GSP: BAR1 unavailable: CPU-mappable VRAM disabled");
         else if (g->disp.wanted && dispInit()) {
             if (g->dispModeId)
-                dispSetMode(g->dispModeId, g->dispModeProto, g->dispModeEdid);
+                dispSetMode(g->dispModeId, g->dispModeProto, g->dispModeEdid, g->dispModeEdidLen);
             dispPublish();
         }
     }

@@ -434,6 +434,10 @@ firmware and your Mesa and llama.cpp builds. By hand:
 | `nvaccel=1` | Start NVMetalAccel, so Metal.framework lists the GPU (Metal step) |
 | `nvdisp=1` | Read what GSP-RM knows about the display outputs (connect state, EDIDs) into the log and `NVDisplayProbe`; changes nothing |
 | `nvdisp=2` | Light a connected HDMI/DVI port at boot and on hot-plug, for `nvvdisplay` (step 9). Keeps the GPU powered |
+| `nvhdmi=0` | With `nvdisp=2`: a DVI-style signal even for an HDMI sink (no HDMI mode, no InfoFrames), as before 2026-10-14 |
+| `nvrange=1` / `nvrange=2` | With `nvdisp=2`: RGB always full range / always limited (16-235). Default automatic: limited only for a CTA video format (e.g. 1080p60) on an HDMI sink that can't be told the range |
+| `nvdpms=0` | With `nvdisp=2`: keep the HDMI signal on while macOS sleeps the display |
+| `nvhpdevent=0` | With `nvdisp=2`: poll the connect state once a second instead of using GSP-RM's hot-plug events |
 | `nvfb=1` | Experiment only, don't use: NVBringup publishes `NVDisplayNub` for NVFramebuffer.kext, and WindowServer stops within a minute (see docs/display.md). `sudo nvram nvfb-once=1` does the same for one boot |
 | `nvkmapvram=1` | NVK keeps its push buffers and descriptors in CPU-mapped VRAM: faster generation (+15 % on a 0.5B model, +6 % on 3B), but each program run holds ~2.7 MiB of BAR1 until a restart; after ~42 runs it falls back to system memory (default speed). `desc` / `cmd:<n>` select parts; see [docs/bar1-cpu-mappings.md](docs/bar1-cpu-mappings.md) |
 

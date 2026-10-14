@@ -525,7 +525,6 @@ void NVBringup::probeDisplay()
     if (arm != 1 && arm != 2)
         return;
     uint32_t modeId = 0, modeProto = 0;     // nvdisp=2: the first connected TMDS output and its EDID
-    uint8_t modeEdid[128] = {};
     char sum[512];
     uint32_t pos = 0;
 #define ADD(...) do { if (pos < sizeof(sum)) pos += (uint32_t)snprintf(sum + pos, sizeof(sum) - pos, __VA_ARGS__); } while (0)
@@ -632,7 +631,9 @@ void NVBringup::probeDisplay()
             if (!modeId && (proto == 1 || proto == 2 || proto == 5)) {
                 modeId = id;
                 modeProto = proto;
-                memcpy(modeEdid, e, sizeof(modeEdid));
+                // The whole EDID, extensions included (the CTA block says whether the sink takes HDMI).
+                g->dispModeEdidLen = n < kNvEdidMax ? n : kNvEdidMax;
+                memcpy(g->dispModeEdid, e, g->dispModeEdidLen);
             }
             char key[32];
             snprintf(key, sizeof(key), "NVDisplayEDID-%x", id);
@@ -662,18 +663,22 @@ void NVBringup::probeDisplay()
     if (arm == 2 && modeId) {
         g->dispModeId = modeId;
         g->dispModeProto = modeProto;
-        memcpy(g->dispModeEdid, modeEdid, sizeof(modeEdid));
+    } else {
+        g->dispModeEdidLen = 0;
     }
 }
 
 // Display, step B1 (boot-arg nvdisp=2): lighting the HDMI/DVI output, at boot and on hot-plug. Follows
-// nouveau's r535/r570 path for Turing: c57d core + c57e window channels (HEAD 0, WINDOW 0), no cursor, no
-// window-immediate channel, no HDMI infoframes (the sink gets a DVI-style signal). GSP-RM owns the
+// nouveau's r535/r570 path for Turing: c57d core + c57e window channels (HEAD 0, WINDOW 0), no
+// window-immediate channel; HDMI mode and InfoFrames as NVKMS for an HDMI sink. GSP-RM owns the
 // OR/SOR and the PHY; this writes the channel methods.
-//   dispInit     once per GSP boot: instance memory (RAMHT, context DMAs), LUTs, root, channels, core init
-//   dispSetMode  per connect: SOR, head timing from the EDID, the surface (colour bars), window 0, UPDATEs
+//   dispInit     once per GSP boot: instance memory (RAMHT, context DMAs), LUTs, root, channels, core init,
+//                the hot-plug event
+//   dispSetMode  per connect: the mode from the EDID within the link's limits, SOR, HDMI or DVI, head timing
+//                and range, the surface (colour bars), window 0, UPDATEs, InfoFrames
 //   dispBlank    per disconnect: window 0 and the SOR detached
-//   dispHotplugTick  from the GSP poller: the outputs' connect state once a second (debounced)
+//   dispPower    DPMS (NVFramebuffer)
+//   dispHotplugTick  from the GSP poller: the outputs' connect state after a hot-plug event, or polled (debounced)
 // What nvdisplay 3 requires, found on hardware: the DMA header takes the method's byte offset (bits 13:2);
 // window 0 needs an identity ILUT (else UPDATE INVALID_STATE 0x2d), the head an identity OLUT (0x2e);
 // scanout surfaces take a big-page context DMA. Results: the log, NVDisplayModeset, NVDisplayFB (the lit
@@ -981,6 +986,7 @@ bool NVBringup::dispInit()
         d.fb = nf;
     }
     d.ready = true;
+    dispHpdArm();
     LOG("GSP: display: engine ready (root, core and window channels); watching %u output(s)", d.nCand);
     for (uint32_t i = 0; i < d.nCand; i++)
         LOG("GSP: display:   0x%x (protocol %u)", d.candId[i], d.candProto[i]);
@@ -996,7 +1002,7 @@ fail:
 
 // Lights displayId with the EDID's first detailed timing: SOR, head, the surface (colour bars until
 // something draws there), window 0.
-bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t *edid)
+bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t *edid, uint32_t edidLen, bool relight)
 {
     GspState *g = gsp_;
     GspState::DispHw &d = g->disp;
@@ -1004,27 +1010,90 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
     const uint32_t head = 0;
     const char *what = "";
 #define FAIL(msg) do { what = msg; goto fail; } while (0)
-    if (!d.ready)
+    if (!d.ready || edidLen < 128)
         return false;
+    nv_sink_caps sink;
+    nv_edid_parse(edid, edidLen, &sink);
 
-    // Mode: the EDID's first detailed timing descriptor (bytes 54..71).
+    // Mode: the first of the sink's timings (nv_edid_timings: the preferred detailed timing, the other detailed
+    // timings, the CTA short video descriptors, 640x480p60) that the link can carry. The port's limit is GSP-RM's
+    // (GET_PCLK_LIMIT, the OR's maximum pixel clock), at most 340 MHz: above that HDMI 2.0 needs scrambling and
+    // SCDC (SET_HDMI_SINK_CAPS), which this doesn't set up. A sink without an HDMI VSDB gets single-link DVI,
+    // 165 MHz. Other timings must also fit the sink's own maximum (HDMI Forum VSDB, HDMI VSDB, range limits);
+    // the preferred one is taken at its word. If nothing fits, the preferred timing, as before.
     {
-    const uint8_t *t = edid + 54;
-    const uint32_t pclkKhz = (uint32_t)(t[0] | t[1] << 8) * 10;
-    const uint32_t hact = t[2] | (uint32_t)(t[4] & 0xf0) << 4, hblank = t[3] | (uint32_t)(t[4] & 0x0f) << 8;
-    const uint32_t vact = t[5] | (uint32_t)(t[7] & 0xf0) << 4, vblank = t[6] | (uint32_t)(t[7] & 0x0f) << 8;
-    const uint32_t hso = t[8] | (uint32_t)(t[11] & 0xc0) << 2, hsw = t[9] | (uint32_t)(t[11] & 0x30) << 4;
-    const uint32_t vso = (t[10] >> 4) | (uint32_t)(t[11] & 0x0c) << 2, vsw = (t[10] & 0x0f) | (uint32_t)(t[11] & 0x03) << 4;
-    const uint32_t flags = t[17];
-    if (!pclkKhz || !hact || !vact || (flags & 0x80)) {        // no timing, or interlaced
-        LOG("GSP: display: EDID has no usable progressive detailed timing (pclk %u kHz %ux%u flags 0x%x)",
-            pclkKhz, hact, vact, flags);
+    nv_edid_timing cand[24];
+    const uint32_t nCand = nv_edid_timings(edid, edidLen, &sink, cand, 24);
+    uint32_t orLimit = 0;
+    {
+        uint8_t pl[20] = {};            // NV0073_CTRL_SPECIFIC_GET_PCLK_LIMIT_PARAMS: sub, displayId, pclk, or, vb
+        put32(pl, 4, displayId);
+        if (gspRmControl(g->hClient, g->hDisp, 0x73028a, pl, sizeof(pl), &st, true))
+            memcpy(&orLimit, pl + 12, 4);
+        else
+            LOG("GSP: display: GET_PCLK_LIMIT failed (status 0x%x); assuming 340 MHz", st);
+    }
+    uint32_t linkMax = 340000;
+    if (orLimit >= 25000 && orLimit < linkMax)      // kHz; anything below VGA's clock is not believed
+        linkMax = orLimit;
+    if (!sink.hdmi && linkMax > 165000)
+        linkMax = 165000;
+    const uint32_t sinkMax = nv_sink_max_tmds_khz(&sink);
+    // The preferred timing if it fits; else the biggest that fits at 50 Hz or more (a 4K TV beyond the port: 1080p60
+    // rather than 4K30), then the highest refresh up to 60 Hz, then EDID order.
+    const nv_edid_timing *mode = nullptr;
+    uint64_t best = 0;
+    for (uint32_t i = 0; i < nCand && !(mode && mode == &cand[0]); i++) {
+        const nv_edid_timing &c = cand[i];
+        const bool preferred = i == 0 && c.source == NV_EDID_SRC_DTD;
+        const uint32_t lim = preferred || sinkMax > linkMax ? linkMax : sinkMax;
+        const char *why = c.interlaced ? "interlaced"
+                        : !c.hact || !c.vact || !c.hsw || !c.vsw || c.hact > 8192 || c.vact > 8192 ? "unusable"
+                        : c.pclkKhz > lim ? "pixel clock above the limit" : nullptr;
+        if (why) {
+            if (i < 6)
+                LOG("GSP: display: timing %u (%ux%u%s, %u kHz, VIC %u) skipped: %s (limit %u kHz)", i, c.hact, c.vact,
+                    c.interlaced ? "i" : "p", c.pclkKhz, c.vic, why, lim);
+            continue;
+        }
+        const uint32_t hz = (uint32_t)((uint64_t)c.pclkKhz * 1000 / ((uint64_t)c.htotal * c.vtotal));
+        const uint64_t score = (uint64_t)(hz >= 49) << 63 | (uint64_t)c.hact * c.vact << 16 |
+                               (uint64_t)(hz <= 61 ? hz : 0) << 8 | (255 - (i < 255 ? i : 255));
+        if (!mode || score > best) {
+            mode = &c;
+            best = score;
+        }
+    }
+    if (!mode && nCand && !cand[0].interlaced && cand[0].hact && cand[0].vact && cand[0].hsw && cand[0].vsw) {
+        LOG("GSP: display: no timing within the limits; trying the preferred one anyway");
+        mode = &cand[0];
+    }
+    if (!mode) {
+        LOG("GSP: display: EDID has no usable progressive timing (%u candidates)", nCand);
         FAIL("EDID has no usable timing");
     }
-    const bool nhsync = !(flags & 0x02), nvsync = !(flags & 0x04);
-    const uint32_t htotal = hact + hblank, vtotal = vact + vblank;
+    LOG("GSP: display: timing %u of %u (source %u), port limit %u kHz (OR %u), sink %u kHz",
+        (uint32_t)(mode - cand), nCand, mode->source, linkMax, orLimit, sinkMax);
+    const uint32_t pclkKhz = mode->pclkKhz, hact = mode->hact, vact = mode->vact;
+    const uint32_t hso = mode->hfp, hsw = mode->hsw, vso = mode->vfp, vsw = mode->vsw;
+    const bool nhsync = mode->nhsync, nvsync = mode->nvsync;
+    const uint32_t htotal = mode->htotal, vtotal = mode->vtotal;
     const uint32_t hsyncs = hact + hso, vsyncs = vact + vso;
     const uint32_t pitch = (hact * 4 + 255) & ~255u;
+
+    // HDMI or DVI signal, and the RGB quantization range (nvkms-hdmi.c nvDpyIsHdmiEvo,
+    // CalculateVideoInfoFrameColorFormat). HDMI when the sink has an HDMI VSDB; boot-arg nvhdmi=0 keeps DVI.
+    // The head sends full-range RGB (0-255) unless the sink expects limited range: an HDMI sink, a CTA video
+    // format other than 640x480 (VIC > 1), and no QS bit (it can't be told). Then the head compresses to 16-235
+    // (OCSC1 and the procamp's CEA range, as NVKMS's EvoSetProcAmpC5/EvoSetOCsc1C5) and the AVI InfoFrame says
+    // "default", which for a CTA format is limited. With QS the head stays full and the AVI InfoFrame says so.
+    // Boot-arg nvrange: 0 automatic (default), 1 always full, 2 always limited.
+    uint32_t hdmiArg = 1, rangeArg = 0;
+    PE_parse_boot_argn("nvhdmi", &hdmiArg, sizeof(hdmiArg));
+    PE_parse_boot_argn("nvrange", &rangeArg, sizeof(rangeArg));
+    bool hdmi = sink.hdmi && hdmiArg != 0;
+    uint8_t aspect = 0;
+    const uint8_t vic = nv_cta_vic(mode, &sink, &aspect);
     LOG("GSP: display: lighting 0x%x (protocol %u): %ux%u, pclk %u kHz, h %u/%u/%u/%u v %u/%u/%u/%u, "
         "hsync %c vsync %c", displayId, rmProto, hact, vact, pclkKhz, hact, hso, hsw, htotal, vact, vso, vsw, vtotal,
         nhsync ? '-' : '+', nvsync ? '-' : '+');
@@ -1043,6 +1112,9 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
         }
         // Colour bars show the output is lit before anything draws. On a display-pipe boot, black: WindowServer
         // shows the framebuffer's contents for a moment when it takes the display over (mirrored, on both screens).
+        // A relight (DPMS on) keeps what is there.
+        if (relight && b->size >= need)
+            continue;
         static const uint32_t bars[8] = { 0xffffff, 0xffff00, 0x00ffff, 0x00ff00, 0xff00ff, 0xff0000, 0x0000ff, 0x000000 };
         for (uint32_t y = 0; y < vact; y++)
             for (uint32_t x = 0; x < hact; x++) {
@@ -1076,6 +1148,22 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
             FAIL("no SOR assigned");
     }
 
+    // HDMI or DVI for this modeset (NV0073_CTRL_SPECIFIC_SET_HDMI_ENABLE_PARAMS: u8 subDeviceInstance, u32 displayId,
+    // u8 enable): after the SOR assignment, before the modeset, as NVKMS's nvDpyUpdateHdmiPreModesetEvo. Told for
+    // every HDMI sink, and once more to turn it off after one.
+    if (sink.hdmi || d.hdmiOn) {
+        uint8_t he[12] = {};
+        put32(he, 4, displayId);
+        he[8] = hdmi ? 1 : 0;
+        if (!gspRmControl(g->hClient, g->hDisp, 0x730273, he, sizeof(he), &st)) {
+            LOG("GSP: display: SET_HDMI_ENABLE(%u) failed (status 0x%x): DVI signal", he[8], st);
+            hdmi = false;
+        }
+        d.hdmiOn = hdmi;
+    }
+    const bool limited = rangeArg == 2 || (rangeArg == 0 && hdmi && vic > 1 && !sink.qs);
+    const uint8_t aviQ = !sink.qs ? 0 : limited ? 1 : 2;         // AVI Q: default, limited, full
+
     // SOR control, head raster, clock, output resource, OLUT (headc57d_*), window ownership; UPDATE.
     dispMthd(false, 0x300 + sorIdx * 0x20, rmProto << 8 | 1u << head);           // SOR_SET_CONTROL: protocol, owner
     dispMthd(false, 0x2020 + head * 0x400, displayId);                            // HEAD_SET_DISPLAY_ID
@@ -1096,7 +1184,21 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
     dispMthd(false, 0x2028 + head * 0x400, pclkKhz * 1000);                       // pixel clock max
     dispMthd(false, 0x2030 + head * 0x400, 4u | 1u << 4 | 1u << 8 | 1u << 12);    // head usage bounds
     dispMthd(false, 0x2004 + head * 0x400, (nhsync ? 4u : 0) | (nvsync ? 8u : 0) | 4u << 4 | 0x3fu << 26);
-    dispMthd(false, 0x2000 + head * 0x400, 0);                                    // procamp: RGB, VESA range
+    dispMthd(false, 0x2000 + head * 0x400, limited ? 1u << 28 : 0);              // procamp: RGB, VESA or CEA range
+    if (limited || d.rangeLimited) {
+        // Limited range: OCSC1 scales by 219/256 and adds 16/256 (NVKMS RGBToLimitedRangeRGB, S15.16), the clamp
+        // keeps 16-235 (12 bits). Back to full: OCSC1 off, no clamp. Not written at all for full range from the
+        // start, as before.
+        static const uint32_t ocsc1[12] = { 0xdb04, 0, 0, 0x1000, 0, 0xdb04, 0, 0x1000, 0, 0, 0xdb04, 0x1000 };
+        const uint32_t clamp = limited ? 0x100u | 0xeb0u << 16 : 0u | 0xfffu << 16;
+        dispMthd(false, 0x2238 + head * 0x400, clamp);                            // CLAMP_RANGE_GREEN
+        dispMthd(false, 0x223c + head * 0x400, clamp);                            // CLAMP_RANGE_RED_BLUE
+        dispMthd(false, 0x229c + head * 0x400, limited ? 1 : 0);                  // OCSC1CONTROL
+        if (limited)
+            for (uint32_t i = 0; i < 12; i++)
+                dispMthd(false, 0x22a0 + head * 0x400 + i * 4, ocsc1[i]);         // OCSC1COEFFICIENT_C00..C23
+        d.rangeLimited = limited;
+    }
     dispMthd(false, 0x2280 + head * 0x400, (4u + 1025u) << 8 | 2u << 2 | 1u);     // OLUT: size, DIRECT10, interp
     dispMthd(false, 0x2284 + head * 0x400, 0xffffffff);                           // OLUT FP norm scale
     dispMthd(false, 0x2288 + head * 0x400, kDispHandleVram);                      // OLUT context DMA
@@ -1145,7 +1247,9 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
     d.litId = displayId;
     d.sorIdx = sorIdx;
     d.proto = rmProto;
-    memcpy(d.edid, edid, sizeof(d.edid));
+    if (edid != d.edid)
+        memcpy(d.edid, edid, sink.len);
+    d.edidLen = sink.len;
     d.edidValid = true;
     d.w = hact;
     d.h = vact;
@@ -1167,6 +1271,37 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
     LOG("GSP: display: 0x%x lit: %ux%u on head %u -> SOR %u, surface 0x%llx", displayId, hact, vact, head, sorIdx,
         (unsigned long long)d.fb.pa);
     setProperty("NVDisplayModeset", "ok");
+    {
+        // What the sink's EDID says (nv_edid): for the test plan and the HDMI decisions below.
+        char si[256];
+        snprintf(si, sizeof(si), "%s, %u bytes (%u ext%s); %s; HDMI VSDB %s (max TMDS %u MHz)%s; range limit %u MHz; "
+                 "VCDB %s (QS %u, S_IT %u, S_CE %u); audio %s (%u SADs); native VIC %u, %u VICs",
+                 sink.name[0] ? sink.name : "?", sink.len, sink.nExt, sink.headerOk ? "" : ", BAD HEADER",
+                 sink.cta ? "CTA-861" : "no CTA block", sink.hdmi ? "yes" : "no", sink.hdmiMaxTmdsKhz / 1000,
+                 sink.hf ? ", HF-VSDB" : "", sink.rangeMaxPclkKhz / 1000, sink.vcdb ? "yes" : "no", sink.qs,
+                 sink.sIT, sink.sCE, sink.basicAudio ? "basic" : "none", sink.nSad, sink.nativeVic, sink.nVic);
+        LOG("GSP: display: sink: %s", si);
+        setProperty("NVDisplaySink", si);
+    }
+    // InfoFrames once the head and the SOR run (NVKMS nvUpdateInfoFrames after the modeset).
+    d.vic = vic;
+    d.dpmsOff = d.dpmsBySor = false;
+    {
+        char hs[128];
+        if (hdmi && dispHdmiInfoFrames(head, sink, vic, aspect, aviQ))
+            snprintf(hs, sizeof(hs), "HDMI, AVI VIC %u Q %u, range %s, SPD", vic, aviQ, limited ? "limited" : "full");
+        else if (hdmi)
+            snprintf(hs, sizeof(hs), "HDMI without InfoFrames (SF registers unusable), range %s",
+                     limited ? "limited" : "full");
+        else
+            snprintf(hs, sizeof(hs), "DVI (%s), range %s",
+                     !sink.hdmi ? "no HDMI VSDB" : hdmiArg ? "SET_HDMI_ENABLE failed" : "nvhdmi=0",
+                     limited ? "limited" : "full");
+        if (!hdmi)
+            dispHdmiInfoFramesOff(head);
+        LOG("GSP: display: signal: %s", hs);
+        setProperty("NVDisplaySignal", hs);
+    }
     return true;
     }
 fail:
@@ -1175,6 +1310,96 @@ fail:
     setProperty("NVDisplayModeset", what);
     return false;
 #undef FAIL
+}
+
+// ---- HDMI InfoFrames -----------------------------------------------------------------------------------
+//
+// On Turing NVKMS sends InfoFrames through the display's SF registers, not through RM (hdmipacket nvhdmipkt.c: the
+// C57x display uses the NVHDMIPKT_C571_CLASS, which keeps 9171's register writers; nvhdmipkt_0073.c's
+// SET_OD_PACKET path is only for pre-Kepler). NV_PDISP_SF_USER_0 is at 0x6f0000 on nvdisplay 3
+// (swref/published/disp/v03_00/dev_disp.h, kdispGetDisplaySfUserBaseAndSize_v03_00; the cl9171.h offsets are
+// relative to it), 0x400 per head. Per packet slot (index 0 AVI, 1 generic, 3 GCP, 4 vendor-specific) at
+// index * 64: CTRL (bit 0 enable, bit 9 hardware checksum), STATUS, HEADER (HB0-2), then subpacks of PB0-3 / PB4-6.
+// Turing only, like the rest of this display code (C57x classes); Ampere's nvdisplay 4 moves things.
+static const uint32_t kSfUser = 0x6f0000;
+enum { kSfAvi = 0, kSfGeneric = 1, kSfGcp = 3, kSfVsi = 4 };
+
+static bool sfUsable(uint32_t v)
+{
+    return v != 0xffffffff && (v & 0xfff00000) != 0xbad00000;      // a PRI error reads as 0xbadXXXXX
+}
+
+// AVI (with the VIC and quantization range), SPD, the HDMI vendor-specific InfoFrame for an HDMI 1.4 4K format, and
+// the general control packet that clears AVMUTE, which also switches the link's HDMI data islands on
+// (CTRL_HDMI, as nvhdmipkt_9171.c does on the first unmuting GCP). False if the SF registers don't read sanely,
+// so nothing is written.
+bool NVBringup::dispHdmiInfoFrames(uint32_t head, const nv_sink_caps &sink, uint8_t vic, uint8_t aspect, uint8_t q)
+{
+    GspState *g = gsp_;
+    const uint32_t sf = kSfUser + head * 0x400;
+    const uint32_t avi0 = rd32(sf + kSfAvi * 64), gcp0 = rd32(sf + kSfGcp * 64);
+    LOG("GSP: display: SF head %u before: AVI ctrl 0x%08x, generic 0x%08x, GCP 0x%08x subpack 0x%08x, VSI 0x%08x",
+        head, avi0, rd32(sf + kSfGeneric * 64), gcp0, rd32(sf + 0xcc), rd32(sf + kSfVsi * 64));
+    if (!sfUsable(avi0) || !sfUsable(gcp0)) {
+        LOG("GSP: display: SF registers at 0x%x don't read sanely: no InfoFrames", sf);
+        return false;
+    }
+    // hdmiPacketWrite9171: disable the slot, write header and subpacks, enable every frame with HW checksum.
+    auto send = [&](uint32_t idx, const uint8_t *pkt, uint32_t subpacks) {
+        const uint32_t ctrl = sf + idx * 64, hdr = ctrl + 8;
+        wr32(ctrl, rd32(ctrl) & ~1u);
+        wr32(hdr, pkt[0] | (uint32_t)pkt[1] << 8 | (uint32_t)pkt[2] << 16);
+        for (uint32_t i = 0; i < subpacks; i++) {
+            const uint8_t *b = pkt + 3 + i * 7;
+            wr32(hdr + 4 + i * 8, b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24);
+            wr32(hdr + 8 + i * 8, b[4] | (uint32_t)b[5] << 8 | (uint32_t)b[6] << 16);
+        }
+        wr32(ctrl, 1u | 1u << 9);
+    };
+    // HDMI 1.4 sinks know 3840/4096x2160p24-30 only by HDMI_VIC, in the vendor-specific InfoFrame, with AVI VIC 0
+    // (HDMI 1.4b 8.2.3.1); HDMI 2.x sinks (HF-VSDB) take the CTA VIC.
+    const uint8_t hdmiVic = sink.hf ? 0 : nv_hdmi_vic(vic);
+    uint8_t avi[17];
+    nv_avi_infoframe(avi, hdmiVic ? 0 : vic, aspect, q);
+    send(kSfAvi, avi, 2);
+    uint8_t pkt[31];
+    nv_spd_infoframe(pkt, "NVIDIA", "GeForce (macOS)");
+    send(kSfGeneric, pkt, 4);
+    if (hdmiVic) {
+        nv_hdmi_vsi_infoframe(pkt, hdmiVic);
+        send(kSfVsi, pkt, 4);
+    } else {
+        wr32(sf + kSfVsi * 64, rd32(sf + kSfVsi * 64) & ~1u);
+    }
+    // GCP: clear AVMUTE (its reset value is SET_AVMUTE). CTRL_HDMI {u8 sub, u32 displayId, NvBool enable} first.
+    uint32_t st = 0;
+    wr32(sf + kSfGcp * 64, rd32(sf + kSfGcp * 64) & ~1u);
+    uint8_t ch[12] = {};
+    put32(ch, 4, g->disp.litId);
+    ch[8] = 1;
+    if (!gspRmControl(g->hClient, g->hDisp, 0x730274, ch, sizeof(ch), &st))
+        LOG("GSP: display: CTRL_HDMI failed (status 0x%x)", st);
+    wr32(sf + 0xcc, 0x10);                                                        // SB0 CLR_AVMUTE, SB1/SB2 0
+    wr32(sf + kSfGcp * 64, 1u | 1u << 9);
+    LOG("GSP: display: AVI %02x %02x %02x | %02x %02x %02x %02x %02x %02x (VIC %u, HDMI_VIC %u); SF after: AVI ctrl "
+        "0x%08x, generic 0x%08x, GCP 0x%08x, VSI 0x%08x", avi[0], avi[1], avi[2], avi[3], avi[4], avi[5], avi[6],
+        avi[7], avi[8], vic, hdmiVic, rd32(sf), rd32(sf + kSfGeneric * 64), rd32(sf + kSfGcp * 64),
+        rd32(sf + kSfVsi * 64));
+    return true;
+}
+
+// The packets off (DVI, or the display gone): each slot's enable bit cleared, if the registers read sanely.
+void NVBringup::dispHdmiInfoFramesOff(uint32_t head)
+{
+    const uint32_t sf = kSfUser + head * 0x400;
+    if (!sfUsable(rd32(sf)))
+        return;
+    static const uint32_t slots[] = { kSfAvi, kSfGeneric, kSfGcp, kSfVsi };
+    for (uint32_t idx : slots) {
+        const uint32_t v = rd32(sf + idx * 64);
+        if (sfUsable(v) && (v & 1))
+            wr32(sf + idx * 64, v & ~1u);
+    }
 }
 
 // The lit display went away: window 0 and the SOR detached (wndwc37e_image_clr; SOR_SET_CONTROL owner none),
@@ -1200,6 +1425,8 @@ void NVBringup::dispBlank()
     if (d.sorIdx != ~0u)
         dispMthd(false, 0x300 + d.sorIdx * 0x20, 0);                              // SOR_SET_CONTROL: no owner
     dispCoreUpdate(1);
+    dispHdmiInfoFramesOff(0);
+    d.dpmsOff = d.dpmsBySor = false;
     LOG("GSP: display: 0x%x unplugged: window 0 and SOR %u detached", d.litId, d.sorIdx);
     d.litId = 0;
     d.sorIdx = ~0u;
@@ -1207,8 +1434,75 @@ void NVBringup::dispBlank()
     setProperty("NVDisplayModeset", "unplugged");
 }
 
-// The display's EDID base block (GSP-RM reads it over DDC).
-bool NVBringup::dispReadEdid(uint32_t displayId, uint8_t edid[128])
+// NV_DISPLAY_POWER_FN, DPMS: macOS put the display to sleep (on false) or woke it. Off is NVKMS's for a TMDS output
+// (nvRmSetDpmsEvo): SET_MONITOR_POWER (0x730295; u32 subDeviceInstance, displayId, powerState, headIdx, NvBool
+// bForceMonitorState), which keeps the head, the mode and the surfaces and stops the link, so the sink sees no
+// signal and goes to standby. If GSP-RM refuses it, the SOR is detached as at an unplug, without forgetting the
+// display, and waking relights it (dispSetMode, keeping the surfaces' contents). The hot-plug poll leaves a
+// sleeping display alone: it stays connected and lit as far as macOS is concerned. Boot-arg nvdpms=0: ignored.
+IOReturn NVBringup::dispPower(bool on)
+{
+    uint32_t arg = 1;
+    if (PE_parse_boot_argn("nvdpms", &arg, sizeof(arg)) && !arg)
+        return kIOReturnUnsupported;
+    if (!gspLock_)
+        return kIOReturnNotReady;
+    IOLockLock(gspLock_);
+    GspState *g = gsp_;
+    if (!g || !g->booted || !g->disp.ready || !g->disp.litId) {
+        IOLockUnlock(gspLock_);
+        return kIOReturnNotReady;
+    }
+    GspState::DispHw &d = g->disp;
+    IOReturn r = kIOReturnSuccess;
+    uint32_t st = 0;
+    if (on != d.dpmsOff) {                          // already in that state
+        IOLockUnlock(gspLock_);
+        return kIOReturnSuccess;
+    }
+    uint8_t mp[20] = {};
+    put32(mp, 4, d.litId);
+    put32(mp, 8, on ? 1 : 0);                       // NV0073_CTRL_SPECIFIC_SET_MONITOR_POWER_ON / _OFF
+    put32(mp, 12, 0);                               // head 0
+    if (!on) {
+        if (gspRmControl(g->hClient, g->hDisp, 0x730295, mp, sizeof(mp), &st)) {
+            d.dpmsBySor = false;
+        } else {
+            LOG("GSP: display: SET_MONITOR_POWER off failed (status 0x%x): detaching the SOR instead", st);
+            cursorLive(false);
+            if (d.sorIdx != ~0u)
+                dispMthd(false, 0x300 + d.sorIdx * 0x20, 0);                      // SOR_SET_CONTROL: no owner
+            dispCoreUpdate(0);
+            d.dpmsBySor = true;
+            d.cursOn = false;                       // re-enabled after the relight
+        }
+        d.dpmsOff = true;
+    } else {
+        bool lit = false;
+        if (!d.dpmsBySor) {
+            lit = gspRmControl(g->hClient, g->hDisp, 0x730295, mp, sizeof(mp), &st);
+            if (!lit)
+                LOG("GSP: display: SET_MONITOR_POWER on failed (status 0x%x): relighting", st);
+        }
+        if (!lit) {
+            lit = dispSetMode(d.litId, d.proto, d.edid, d.edidLen, true);
+            if (lit)
+                cursorEnableLocked();
+        }
+        if (lit)
+            d.dpmsOff = d.dpmsBySor = false;
+        else
+            r = kIOReturnError;
+    }
+    LOG("GSP: display: power %s (%s)%s", on ? "on" : "off", d.dpmsBySor ? "SOR" : "SET_MONITOR_POWER",
+        r ? ": FAILED" : "");
+    setProperty("NVDisplayPower", d.dpmsOff ? (d.dpmsBySor ? "off (SOR detached)" : "off") : "on");
+    IOLockUnlock(gspLock_);
+    return r;
+}
+
+// The display's EDID, the base block and its extensions (GSP-RM reads it over DDC), up to kNvEdidMax bytes.
+bool NVBringup::dispReadEdid(uint32_t displayId, uint8_t *edid, uint32_t *len)
 {
     GspState *g = gsp_;
     uint32_t st = 0, n = 0;
@@ -1219,21 +1513,120 @@ bool NVBringup::dispReadEdid(uint32_t displayId, uint8_t edid[128])
     if (gspRmControl(g->hClient, g->hDisp, NV0073_CTRL_CMD_SPECIFIC_GET_EDID_V2_, ed, NV0073_EDID_SIZE, &st))
         memcpy(&n, ed + NV0073_EDID_bufferSize, 4);
     const bool ok = n >= 128 && n <= NV0073_EDID_MAX;
-    if (ok)
-        memcpy(edid, ed + NV0073_EDID_buffer, 128);
+    *len = 0;
+    if (ok) {
+        *len = n < kNvEdidMax ? n : kNvEdidMax;
+        memcpy(edid, ed + NV0073_EDID_buffer, *len);
+    }
     IOFree(ed, NV0073_EDID_SIZE);
     return ok;
 }
 
-// From the GSP poller (gspLock_ held), every 100 ms; acts once a second. A change must hold for two
-// samples (HPD bounces while a cable goes in). Keeps the lit display while it stays connected, else
-// lights the first connected TMDS output.
+// ---- Hot-plug events ------------------------------------------------------------------------------------
+//
+// GSP-RM handles the HPD interrupts and tells its clients through NV2080_NOTIFIERS_HOTPLUG (cl2080_notification.h)
+// on the subdevice: an event object of class NV01_EVENT_KERNEL_CALLBACK_EX (NV0005_ALLOC_PARAMETERS: hParentClient,
+// hSrcResource = the subdevice, the notifier, hClass, notifyIndex with NV01_EVENT_CLIENT_RM so GSP-RM posts it
+// back to us, data), enabled with NV2080_CTRL_CMD_EVENT_SET_NOTIFICATION (event, action REPEAT), as nouveau's
+// r535 disp does. GSP-RM then sends NV_VGPU_MSG_EVENT_POST_EVENT (rpc_post_event_v17_00), which the status queue
+// delivers within 100 ms (the poller; any RPC wait drains it too). Without it the poll runs once a second as
+// before. Boot-arg nvhpdevent=0: no event object.
+void NVBringup::dispHpdArm()
+{
+    GspState *g = gsp_;
+    GspState::DispHw &d = g->disp;
+    uint32_t arg = 1, st = 0;
+    if (d.hpdEvent || (PE_parse_boot_argn("nvhpdevent", &arg, sizeof(arg)) && !arg))
+        return;
+    const uint32_t h = g->nextHandle;
+    g->nextHandle += 8;
+    uint8_t ev[24] = {};                            // NV0005_ALLOC_PARAMETERS (data, an NvP64, at 16)
+    put32(ev, 0, g->hClient);                       // hParentClient
+    put32(ev, 4, g->hSubdevice);                    // hSrcResource: the notifier
+    put32(ev, 8, 0x7e);                             // hClass: NV01_EVENT_KERNEL_CALLBACK_EX
+    put32(ev, 12, 0x04000000u | 1);                 // NV01_EVENT_CLIENT_RM | NV2080_NOTIFIERS_HOTPLUG
+    if (!gspRmAlloc(g->hClient, g->hSubdevice, h, 0x7e, ev, sizeof(ev), &st)) {
+        LOG("GSP: display: hot-plug event object refused (status 0x%x): polling once a second", st);
+        return;
+    }
+    uint8_t sn[20] = {};                            // NV2080_CTRL_EVENT_SET_NOTIFICATION_PARAMS
+    put32(sn, 0, 1);                                // event: NV2080_NOTIFIERS_HOTPLUG
+    put32(sn, 4, 2);                                // action: REPEAT
+    if (!gspRmControl(g->hClient, g->hSubdevice, 0x20800301, sn, sizeof(sn), &st)) {
+        LOG("GSP: display: hot-plug SET_NOTIFICATION failed (status 0x%x): polling once a second", st);
+        gspRmFree(g->hClient, g->hSubdevice, h, &st);
+        return;
+    }
+    d.hpdEvent = h;
+    d.hpdBurst = 0;
+    LOG("GSP: display: hot-plug events on (event 0x%x); polling every 5 s as a fallback", h);
+    setProperty("NVDisplayHotplug", "events");
+}
+
+// NV_VGPU_MSG_EVENT_POST_EVENT, from handleGspMessage (gspLock_ held). rpc_post_event_v17_00: hClient, hEvent,
+// notifyIndex, data, info16 (u16), status, eventDataSize, bNotifyList (u8), eventData[] at 29; for HOTPLUG,
+// Nv2080HotplugNotification { plugDisplayMask, unplugDisplayMask }. Only logged: the poll reads the state itself,
+// sampling every 300 ms from the next tick until the change has settled.
+void NVBringup::dispHpdEvent(const uint8_t *p, uint32_t len)
+{
+    GspState *g = gsp_;
+    uint32_t hClient = 0, hEvent = 0, index = 0, size = 0, plug = 0, unplug = 0;
+    if (len >= 28) {
+        memcpy(&hClient, p, 4);
+        memcpy(&hEvent, p + 4, 4);
+        memcpy(&index, p + 8, 4);
+        memcpy(&size, p + 24, 4);
+    }
+    if (!g || !g->disp.hpdEvent || hEvent != g->disp.hpdEvent) {
+        static uint32_t logged;
+        if (logged++ < 8)
+            LOG("GSP: event: client 0x%x event 0x%x index 0x%x (%u bytes of data) ignored", hClient, hEvent, index,
+                size);
+        return;
+    }
+    if (size >= 8 && len >= 29 + 8) {
+        memcpy(&plug, p + 29, 4);
+        memcpy(&unplug, p + 33, 4);
+    }
+    GspState::DispHw &d = g->disp;
+    d.hpdEvents++;
+    d.hpdBurst = 6;
+    d.hpdNext = d.tick + 1;
+    LOG("GSP: display: hot-plug event %u: plug 0x%x unplug 0x%x", d.hpdEvents, plug, unplug);
+    setProperty("NVDisplayHotplugEvents", d.hpdEvents, 32);
+}
+
+// From the GSP poller (gspLock_ held), every 100 ms. Samples the outputs' connect state once a second; with hot-plug
+// events (dispHpdArm) every 300 ms for a while after an event and every 5 s otherwise. A change must hold for two
+// samples (HPD bounces while a cable goes in). Keeps the lit display while it stays connected, else lights the first
+// connected TMDS output.
 void NVBringup::dispHotplugTick()
 {
     GspState *g = gsp_;
     GspState::DispHw &d = g->disp;
-    if (!d.ready || !d.nCand || ++d.tick % 10)
+    if (!d.ready || !d.nCand)
         return;
+    d.tick++;
+    if (d.dpmsOff)          // asleep (dispPower): GSP-RM's state may say anything; checked again once woken
+        return;
+    if (!d.hpdEvent) {
+        if (d.tick % 10)
+            return;
+    } else if (d.hpdBurst) {
+        if ((int32_t)(d.tick - d.hpdNext) < 0)
+            return;
+        d.hpdBurst--;
+        d.hpdNext = d.tick + 3;
+    } else if (d.tick % 50) {
+        return;
+    }
+    // Another sample soon (a change waiting for its second sample, an EDID not readable yet), events or not.
+    auto again = [&](uint32_t ticks) {
+        if (d.hpdEvent && !d.hpdBurst) {
+            d.hpdBurst = 1;
+            d.hpdNext = d.tick + ticks;
+        }
+    };
     uint32_t mask = 0, st = 0, conn = 0;
     for (uint32_t i = 0; i < d.nCand; i++)
         mask |= d.candId[i];
@@ -1267,6 +1660,7 @@ void NVBringup::dispHotplugTick()
     if (want != d.pendId || !d.pendCount) {
         d.pendId = want;
         d.pendCount = 1;
+        again(3);
         return;
     }
     d.pendCount = 0;
@@ -1274,15 +1668,21 @@ void NVBringup::dispHotplugTick()
     if (wasLit)
         dispBlank();
     if (want) {
-        uint8_t edid[128];
-        if (!dispReadEdid(want, edid)) {
+        uint8_t *edid = (uint8_t *)IOMallocZero(kNvEdidMax);
+        uint32_t edidLen = 0;
+        if (!edid || !dispReadEdid(want, edid, &edidLen)) {
+            if (edid)
+                IOFree(edid, kNvEdidMax);
             LOG("GSP: display: 0x%x connected, but its EDID can't be read yet", want);     // tried again in 2 s
+            again(20);
             if (wasLit)
                 dispPublish();
             return;
         }
         LOG("GSP: display: 0x%x connected", want);
-        if (!dispSetMode(want, wantProto, edid)) {
+        const bool lit = dispSetMode(want, wantProto, edid, edidLen);
+        IOFree(edid, kNvEdidMax);
+        if (!lit) {
             d.failId = want;
             if (wasLit)
                 dispPublish();
@@ -1337,7 +1737,7 @@ void NVBringup::dispPublish()
     if (d.cursChan && d.curs.cpu)
         num("CursorSize", 256, 32);         // NVFramebuffer offers a hardware cursor (NV_CURSOR_*_FN)
     if (d.edidValid) {              // the last lit display's: it stays while unlit (Online false)
-        if (OSData *e = OSData::withBytes(d.edid, sizeof(d.edid))) {
+        if (OSData *e = OSData::withBytes(d.edid, d.edidLen)) {
             dict->setObject("EDID", e);
             e->release();
         }
@@ -1734,6 +2134,8 @@ IOReturn NVBringup::callPlatformFunction(const OSSymbol *functionName, bool wait
         return cursorImage((const uint32_t *)param1, (uint32_t)(uintptr_t)param2, (uint32_t)(uintptr_t)param3);
     if (functionName && functionName->isEqualTo(NV_CURSOR_MOVE_FN))
         return cursorMove((int32_t)(intptr_t)param1, (int32_t)(intptr_t)param2, param3 != nullptr);
+    if (functionName && functionName->isEqualTo(NV_DISPLAY_POWER_FN))
+        return dispPower(param1 != nullptr);
     return IOService::callPlatformFunction(functionName, waitForFunction, param1, param2, param3, param4);
 }
 
@@ -2114,6 +2516,8 @@ void NVBringup::dispLost()
     for (NVDispMem *m : surfaces)
         *m = NVDispMem();
     d.cursChan = d.cursOn = d.cursHave = false;     // the channel goes with the client
+    d.hdmiOn = d.rangeLimited = d.dpmsOff = d.dpmsBySor = false;   // GSP-RM and the display engine start over
+    d.hpdEvent = d.hpdBurst = 0;                    // the event object goes with the client
     d.ready = false;
     d.litId = 0;
     g->dispLit = false;

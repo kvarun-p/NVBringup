@@ -48,7 +48,9 @@ class NVFramebuffer : public IOFramebuffer {
     uint32_t width_ = 0, height_ = 0, pitch_ = 0, pclkKhz_ = 0;
     uint32_t htotal_ = 0, vtotal_ = 0, hsyncStart_ = 0, hsyncWidth_ = 0, vsyncStart_ = 0, vsyncWidth_ = 0;
     uint32_t syncFlags_ = 0;            // bit 0: hsync negative, bit 1: vsync negative
-    uint8_t edid_[128] = {};
+    static constexpr uint32_t kEdidMax = 1024;   // NVBringup's kNvEdidMax: the base block and 7 extensions
+    uint8_t edid_[kEdidMax] = {};
+    uint32_t edidLen_ = 0;              // whole 128-byte blocks in edid_
     bool haveEdid_ = false;
     Interrupt vbl_, connect_;           // guarded by vblLock_
     thread_call_t vblCall_ = nullptr;   // allocated in start, freed in free; armed while vblActive_
@@ -73,6 +75,7 @@ class NVFramebuffer : public IOFramebuffer {
     static constexpr UInt32 kMsgState = 0x4e564442;     // NVBringup's kNVDisplayMsgState ('NVDB'), the nub's change
 
     bool readDisplay(OSDictionary *d);
+    void displayPower(bool on, const char *why, uintptr_t value);
     bool applyNub();
     void raiseConnect();
     IOFixed1616 refresh() const;
@@ -154,8 +157,14 @@ bool NVFramebuffer::readDisplay(OSDictionary *d)
     syncFlags_ = (uint32_t)num("Flags");
     cursorSize_ = (uint32_t)num("CursorSize") <= 256 ? (uint32_t)num("CursorSize") : 0;
     haveEdid_ = false;
-    if (OSData *e = OSDynamicCast(OSData, d->getObject("EDID")); e && e->getLength() >= sizeof(edid_)) {
-        memcpy(edid_, e->getBytesNoCopy(), sizeof(edid_));
+    edidLen_ = 0;
+    if (OSData *e = OSDynamicCast(OSData, d->getObject("EDID")); e && e->getLength() >= 128) {
+        // The base block and the extensions it counts (byte 126), as far as NVBringup read them.
+        uint32_t n = e->getLength() < kEdidMax ? e->getLength() : kEdidMax;
+        n -= n % 128;
+        memcpy(edid_, e->getBytesNoCopy(), n);
+        const uint32_t want = 128u * (1u + edid_[126]);
+        edidLen_ = want < n ? want : n;
         haveEdid_ = true;
     }
     return true;
@@ -655,12 +664,31 @@ IOReturn NVFramebuffer::setCursorState(SInt32 x, SInt32 y, bool visible)
     return kIOReturnSuccess;
 }
 
-// IOFramebuffer runs power management and asks for each change through kIOPowerAttribute. The display's
-// power follows NVBringup's GPU, so only IOGraphics' notifications are sent, as IOFramebuffer.h asks.
+// DPMS: the monitor's signal off while macOS sleeps the display, on again when it wakes (NVBringup's
+// NV_DISPLAY_POWER_FN; the mode and the surfaces stay). IOGraphics asks through kIOPowerAttribute (the
+// framebuffer's power state) and kConnectionPower (the display's); either one going to 0 turns the signal off,
+// any other value on. The first changes are logged with the value seen.
+void NVFramebuffer::displayPower(bool on, const char *why, uintptr_t value)
+{
+    static const OSSymbol *fn;
+    static uint32_t logged;
+    IOReturn r = kIOReturnUnsupported;
+    if (gpu_ && nvSym(fn, NV_DISPLAY_POWER_FN))
+        r = gpu_->callPlatformFunction(fn, false, (void *)(uintptr_t)on, nullptr, nullptr, nullptr);
+    if (logged++ < 16)
+        LOG("display power %s (%s %lu): %#x", on ? "on" : "off", why, (unsigned long)value, r);
+}
+
+// IOFramebuffer runs power management and asks for each change through kIOPowerAttribute. IOGraphics' notifications
+// are sent, as IOFramebuffer.h asks, and the signal follows (displayPower).
 IOReturn NVFramebuffer::setAttribute(IOSelect attribute, uintptr_t value)
 {
     if (attribute == kIOPowerAttribute) {
+        if (!value)
+            displayPower(false, "framebuffer power", value);
         handleEvent(value ? kIOFBNotifyDidPowerOn : kIOFBNotifyWillPowerOff);
+        if (value)
+            displayPower(true, "framebuffer power", value);
         return kIOReturnSuccess;
     }
     IOReturn r = IOFramebuffer::setAttribute(attribute, value);
@@ -727,9 +755,11 @@ IOReturn NVFramebuffer::setAttributeForConnection(IOIndex connect, IOSelect attr
     if (connect != 0)
         return kIOReturnBadArgument;
     switch (attribute) {
+    case kConnectionPower:
+        displayPower(value != 0, "connection power", value);
+        return kIOReturnSuccess;
     case kConnectionPostWake:
     case kConnectionEnable:
-    case kConnectionPower:
     case kConnectionColorMode:
     case kConnectionControllerColorDepth:
     case kConnectionFlags:
@@ -759,10 +789,11 @@ IOReturn NVFramebuffer::getDDCBlock(IOIndex connect, UInt32 blockNumber, IOSelec
 {
     if (connect != 0 || !haveEdid_ || blockType != kIODDCBlockTypeEDID || !data || !length)
         return kIOReturnBadArgument;
-    if (blockNumber != 1)           // only the base block: NVBringup reads 128 bytes
+    // blockNumber counts from 1: the base block, then the extensions (the CTA-861 block of an HDMI sink).
+    if (!blockNumber || (uint64_t)blockNumber * 128 > edidLen_)
         return kIOReturnUnsupported;
-    const IOByteCount n = *length < sizeof(edid_) ? *length : sizeof(edid_);
-    memcpy(data, edid_, n);
+    const IOByteCount n = *length < 128 ? *length : 128;
+    memcpy(data, edid_ + (blockNumber - 1) * 128, n);
     *length = n;
     return kIOReturnSuccess;
 }
