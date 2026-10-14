@@ -1421,6 +1421,73 @@ void NVBringup::dispBlank()
     setProperty("NVDisplayModeset", "unplugged");
 }
 
+// NV_DISPLAY_POWER_FN, DPMS: macOS put the display to sleep (on false) or woke it. Off is NVKMS's for a TMDS output
+// (nvRmSetDpmsEvo): SET_MONITOR_POWER (0x730295; u32 subDeviceInstance, displayId, powerState, headIdx, NvBool
+// bForceMonitorState), which keeps the head, the mode and the surfaces and stops the link, so the sink sees no
+// signal and goes to standby. If GSP-RM refuses it, the SOR is detached as at an unplug, without forgetting the
+// display, and waking relights it (dispSetMode, keeping the surfaces' contents). The hot-plug poll leaves a
+// sleeping display alone: it stays connected and lit as far as macOS is concerned. Boot-arg nvdpms=0: ignored.
+IOReturn NVBringup::dispPower(bool on)
+{
+    uint32_t arg = 1;
+    if (PE_parse_boot_argn("nvdpms", &arg, sizeof(arg)) && !arg)
+        return kIOReturnUnsupported;
+    if (!gspLock_)
+        return kIOReturnNotReady;
+    IOLockLock(gspLock_);
+    GspState *g = gsp_;
+    if (!g || !g->booted || !g->disp.ready || !g->disp.litId) {
+        IOLockUnlock(gspLock_);
+        return kIOReturnNotReady;
+    }
+    GspState::DispHw &d = g->disp;
+    IOReturn r = kIOReturnSuccess;
+    uint32_t st = 0;
+    if (on != d.dpmsOff) {                          // already in that state
+        IOLockUnlock(gspLock_);
+        return kIOReturnSuccess;
+    }
+    uint8_t mp[20] = {};
+    put32(mp, 4, d.litId);
+    put32(mp, 8, on ? 1 : 0);                       // NV0073_CTRL_SPECIFIC_SET_MONITOR_POWER_ON / _OFF
+    put32(mp, 12, 0);                               // head 0
+    if (!on) {
+        if (gspRmControl(g->hClient, g->hDisp, 0x730295, mp, sizeof(mp), &st)) {
+            d.dpmsBySor = false;
+        } else {
+            LOG("GSP: display: SET_MONITOR_POWER off failed (status 0x%x): detaching the SOR instead", st);
+            cursorLive(false);
+            if (d.sorIdx != ~0u)
+                dispMthd(false, 0x300 + d.sorIdx * 0x20, 0);                      // SOR_SET_CONTROL: no owner
+            dispCoreUpdate(0);
+            d.dpmsBySor = true;
+            d.cursOn = false;                       // re-enabled after the relight
+        }
+        d.dpmsOff = true;
+    } else {
+        bool lit = false;
+        if (!d.dpmsBySor) {
+            lit = gspRmControl(g->hClient, g->hDisp, 0x730295, mp, sizeof(mp), &st);
+            if (!lit)
+                LOG("GSP: display: SET_MONITOR_POWER on failed (status 0x%x): relighting", st);
+        }
+        if (!lit) {
+            lit = dispSetMode(d.litId, d.proto, d.edid, d.edidLen, true);
+            if (lit)
+                cursorEnableLocked();
+        }
+        if (lit)
+            d.dpmsOff = d.dpmsBySor = false;
+        else
+            r = kIOReturnError;
+    }
+    LOG("GSP: display: power %s (%s)%s", on ? "on" : "off", d.dpmsBySor ? "SOR" : "SET_MONITOR_POWER",
+        r ? ": FAILED" : "");
+    setProperty("NVDisplayPower", d.dpmsOff ? (d.dpmsBySor ? "off (SOR detached)" : "off") : "on");
+    IOLockUnlock(gspLock_);
+    return r;
+}
+
 // The display's EDID, the base block and its extensions (GSP-RM reads it over DDC), up to kNvEdidMax bytes.
 bool NVBringup::dispReadEdid(uint32_t displayId, uint8_t *edid, uint32_t *len)
 {
@@ -1450,6 +1517,8 @@ void NVBringup::dispHotplugTick()
     GspState *g = gsp_;
     GspState::DispHw &d = g->disp;
     if (!d.ready || !d.nCand || ++d.tick % 10)
+        return;
+    if (d.dpmsOff)          // asleep (dispPower): GSP-RM's state may say anything; checked again once woken
         return;
     uint32_t mask = 0, st = 0, conn = 0;
     for (uint32_t i = 0; i < d.nCand; i++)
@@ -1956,6 +2025,8 @@ IOReturn NVBringup::callPlatformFunction(const OSSymbol *functionName, bool wait
         return cursorImage((const uint32_t *)param1, (uint32_t)(uintptr_t)param2, (uint32_t)(uintptr_t)param3);
     if (functionName && functionName->isEqualTo(NV_CURSOR_MOVE_FN))
         return cursorMove((int32_t)(intptr_t)param1, (int32_t)(intptr_t)param2, param3 != nullptr);
+    if (functionName && functionName->isEqualTo(NV_DISPLAY_POWER_FN))
+        return dispPower(param1 != nullptr);
     return IOService::callPlatformFunction(functionName, waitForFunction, param1, param2, param3, param4);
 }
 

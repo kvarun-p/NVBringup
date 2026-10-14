@@ -24,7 +24,11 @@
 // Head 0's vblank, for NVFramebuffer's vertical blank timer:
 //   gpu->callPlatformFunction(sym(NV_VBLANK_LINES_FN), false, &lines, nullptr, nullptr, nullptr)
 //       lines (uint32_t): raster lines until the next vblank starts, 0 when unknown
+// Display power (DPMS), from NVFramebuffer when macOS sleeps or wakes the display:
+//   gpu->callPlatformFunction(sym(NV_DISPLAY_POWER_FN), false, (void *)(uintptr_t)on, nullptr, nullptr, nullptr)
+//       on 0: the monitor's signal off (it may go to standby), 1: back on; the mode and surfaces stay
 #define NV_VBLANK_LINES_FN    "NVVblankLines"
+#define NV_DISPLAY_POWER_FN   "NVDisplayPower"
 #define NV_CURSOR_IMAGE_FN    "NVCursorImage"
 #define NV_CURSOR_MOVE_FN     "NVCursorMove"
 

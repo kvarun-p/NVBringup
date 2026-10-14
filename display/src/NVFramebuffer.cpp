@@ -75,6 +75,7 @@ class NVFramebuffer : public IOFramebuffer {
     static constexpr UInt32 kMsgState = 0x4e564442;     // NVBringup's kNVDisplayMsgState ('NVDB'), the nub's change
 
     bool readDisplay(OSDictionary *d);
+    void displayPower(bool on, const char *why, uintptr_t value);
     bool applyNub();
     void raiseConnect();
     IOFixed1616 refresh() const;
@@ -663,12 +664,31 @@ IOReturn NVFramebuffer::setCursorState(SInt32 x, SInt32 y, bool visible)
     return kIOReturnSuccess;
 }
 
-// IOFramebuffer runs power management and asks for each change through kIOPowerAttribute. The display's
-// power follows NVBringup's GPU, so only IOGraphics' notifications are sent, as IOFramebuffer.h asks.
+// DPMS: the monitor's signal off while macOS sleeps the display, on again when it wakes (NVBringup's
+// NV_DISPLAY_POWER_FN; the mode and the surfaces stay). IOGraphics asks through kIOPowerAttribute (the
+// framebuffer's power state) and kConnectionPower (the display's); either one going to 0 turns the signal off,
+// any other value on. The first changes are logged with the value seen.
+void NVFramebuffer::displayPower(bool on, const char *why, uintptr_t value)
+{
+    static const OSSymbol *fn;
+    static uint32_t logged;
+    IOReturn r = kIOReturnUnsupported;
+    if (gpu_ && nvSym(fn, NV_DISPLAY_POWER_FN))
+        r = gpu_->callPlatformFunction(fn, false, (void *)(uintptr_t)on, nullptr, nullptr, nullptr);
+    if (logged++ < 16)
+        LOG("display power %s (%s %lu): %#x", on ? "on" : "off", why, (unsigned long)value, r);
+}
+
+// IOFramebuffer runs power management and asks for each change through kIOPowerAttribute. IOGraphics' notifications
+// are sent, as IOFramebuffer.h asks, and the signal follows (displayPower).
 IOReturn NVFramebuffer::setAttribute(IOSelect attribute, uintptr_t value)
 {
     if (attribute == kIOPowerAttribute) {
+        if (!value)
+            displayPower(false, "framebuffer power", value);
         handleEvent(value ? kIOFBNotifyDidPowerOn : kIOFBNotifyWillPowerOff);
+        if (value)
+            displayPower(true, "framebuffer power", value);
         return kIOReturnSuccess;
     }
     IOReturn r = IOFramebuffer::setAttribute(attribute, value);
@@ -735,9 +755,11 @@ IOReturn NVFramebuffer::setAttributeForConnection(IOIndex connect, IOSelect attr
     if (connect != 0)
         return kIOReturnBadArgument;
     switch (attribute) {
+    case kConnectionPower:
+        displayPower(value != 0, "connection power", value);
+        return kIOReturnSuccess;
     case kConnectionPostWake:
     case kConnectionEnable:
-    case kConnectionPower:
     case kConnectionColorMode:
     case kConnectionControllerColorDepth:
     case kConnectionFlags:
