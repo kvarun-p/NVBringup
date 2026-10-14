@@ -264,6 +264,9 @@ private:
     int      fbWanted_ = -1;        // -1: not decided yet (see fbWanted)
     bool     fbWanted();
     bool     nvramOneShot(const char *name);    // reads and deletes an NVRAM one-shot; true if it was set
+    IORegistryEntry *nvramOptions();            // /options once AppleEFINVRAM is up (retained), nullptr: none
+    bool     safeMode_ = false;                 // the boot-attempt guard tripped (bootGuard): experimental gates off
+    void     bootGuard();                       // boot-arg nvguard=1: counts unfinished boots in NVRAM nv-boot-try
     void     dispNubWant(OSDictionary *fb, bool online);   // gspLock_ held
     // The display pipe's sources (nv_pipe_copy.h), mapped read-only into the kernel VA space, one 64 MiB slot each
     // from kPipeVa. All under gspLock_.
