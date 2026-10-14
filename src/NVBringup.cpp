@@ -3,6 +3,7 @@
 #include "nv_uapi.h"
 #include "nv_vbios.h"
 #include "nv_fwsec.h"
+#include "nv_stack.h"
 
 #include <IOKit/IOLib.h>
 #include <pexpert/pexpert.h>
@@ -23,6 +24,10 @@ IOService *NVBringup::probe(IOService *provider, SInt32 *score)
     IOPCIDevice *p = OSDynamicCast(IOPCIDevice, provider);
     if (!p || (p->configRead32(kIOPCIConfigRevisionID) >> 24) != 0x03)
         return nullptr;
+    if (nv_stack_off()) {       // boot-arg -nvoff: leave the GPU as the firmware left it (nv_stack.h)
+        IOLog("NVBringup: boot-arg -nvoff: not starting\n");
+        return nullptr;
+    }
     return super::probe(provider, score);
 }
 
@@ -68,6 +73,13 @@ bool NVBringup::start(IOService *provider)
     boostPolicy_ = boost <= NVMAC_PERF_POLICY_ADAPTIVE ? boost : NVMAC_PERF_POLICY_ADAPTIVE;
     boostCall_ = thread_call_allocate(&NVBringup::boostThunk, this);
 
+    // The versions the auxiliary kexts and tools check (nv_stack.h).
+    setProperty(NV_STACK_ABI_KEY, NV_STACK_ABI, 32);
+    setProperty(NV_STACK_FEATURES_KEY, NV_STACK_FEATURES, 32);
+    setProperty(NV_UAPI_VERSION_KEY, NVMAC_ABI_VERSION, 32);
+    setProperty(NV_UAPI_FEATURES_KEY, NVMAC_FEATURES, 32);
+    bootGuard();
+
     // Display pipe gate (S1): boot-arg nvdpipe=1, or the NVRAM one-shot nvdpipe-once (deleted here, so it
     // applies to this boot only; read even when the boot-arg is set, so it can't outlive the boot). Decided
     // here, not when a display lights: the accelerator, a client of this PCI device, reads the property at
@@ -75,6 +87,10 @@ bool NVBringup::start(IOService *provider)
     const bool pipeOnce = nvramOneShot("nvdpipe-once");
     uint32_t pipe = 0;
     dispPipeArmed_ = (PE_parse_boot_argn("nvdpipe", &pipe, sizeof(pipe)) && pipe) || pipeOnce;
+    if (dispPipeArmed_ && safeMode_) {
+        LOG("safe mode (boot-attempt guard): display pipe gate ignored this boot");
+        dispPipeArmed_ = false;
+    }
     if (dispPipeArmed_) {
         // WindowServer adopts only the framebuffers present when it lists the GPUs, and NVFramebuffer comes after
         // the GSP boot: about a second too late on some boots (2026-10-10 13:40, 2026-10-11 21:04). WSInitialize

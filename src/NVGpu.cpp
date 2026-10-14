@@ -22,6 +22,7 @@
 #include "nv_regs.h"
 #include "nv_uapi.h"
 #include "nv_pipe_copy.h"
+#include "nv_stack.h"
 #include "NVGpuUserClient.hpp"
 
 #include <IOKit/IODeviceTreeSupport.h>
@@ -1772,13 +1773,17 @@ bool NVBringup::fbWanted()
     fbWanted_ = ((PE_parse_boot_argn("nvfb", &arg, sizeof(arg)) && arg) || dispPipeArmed_) ? 1 : 0;
     if (!fbWanted_ && nvramOneShot("nvfb-once"))
         fbWanted_ = 1;
+    if (fbWanted_ && safeMode_) {
+        LOG("safe mode (boot-attempt guard): NVFramebuffer not wanted this boot");
+        fbWanted_ = 0;
+    }
     return fbWanted_ == 1;
 }
 
 // An NVRAM one-shot: read once, and if it is set, deleted here and checked. The delete is the one `nvram -d`
 // does: setProperty(kIONVRAMDeletePropertyKey) doesn't delete, setProperties() with it and
 // kIONVRAMSyncNowPropertyKey does. True if the variable was set, which makes it apply to this boot only.
-bool NVBringup::nvramOneShot(const char *name)
+IORegistryEntry *NVBringup::nvramOptions()
 {
     // OpenCore injects this kext, so start() can run before AppleEFINVRAM has loaded the OS's variables into /options:
     // then a variable set with `nvram` is missing here and the one-shot is silently ignored (2026-10-10 13:06 and 13:14,
@@ -1795,7 +1800,12 @@ bool NVBringup::nvramOneShot(const char *name)
         }
         nvramReady = true;
     }
-    IORegistryEntry *opts = IORegistryEntry::fromPath("/options", gIODTPlane);
+    return IORegistryEntry::fromPath("/options", gIODTPlane);
+}
+
+bool NVBringup::nvramOneShot(const char *name)
+{
+    IORegistryEntry *opts = nvramOptions();
     OSObject *v = opts ? opts->copyProperty(name) : nullptr;
     if (!v) {
         OSSafeReleaseNULL(opts);
@@ -1822,6 +1832,75 @@ bool NVBringup::nvramOneShot(const char *name)
     OSSafeReleaseNULL(left);
     OSSafeReleaseNULL(opts);
     return true;
+}
+
+// The boot-attempt guard (boot-arg nvguard=1, off by default). NVRAM nv-boot-try counts the boots that started this kext
+// and never reached a healthy desktop: it goes up here at every start, and the boot daemon (tools/daemon/gsp_boot.sh)
+// deletes it once WindowServer has run for a minute. A panic, a hang or a login loop leaves it set. At kNVGuardTries
+// unfinished boots this boot is a safe one: the experimental gates (nvdpipe, nvdpipe-once, nvfb, nvfb-once) are ignored,
+// NVSafeMode is published, and the auxiliary kexts stay out (nv_stack_admit). The normal kext still starts, since it is
+// what the desktop has run on for weeks; boot-arg -nvoff leaves the GPU alone entirely.
+// It fails open: a missing or unreadable NVRAM means no safe mode, and a write that fails is logged and changes nothing.
+// The variable is in Apple's NVRAM namespace, like nvdpipe-once (OpenCore's NVRAM Delete lists only boot-args there).
+void NVBringup::bootGuard()
+{
+    static const uint32_t kNVGuardTries = 2;
+    static const char kVar[] = "nv-boot-try";
+    uint32_t arm = 0;
+    if (!PE_parse_boot_argn("nvguard", &arm, sizeof(arm)) || arm != 1)
+        return;
+    IORegistryEntry *opts = nvramOptions();
+    if (!opts) {
+        LOG("boot guard: no /options; off this boot");
+        return;
+    }
+    // `sudo nvram nv-boot-try=3` stores the text as data; this kext writes one decimal digit.
+    uint32_t tries = 0;
+    OSObject *v = opts->copyProperty(kVar);
+    const char *p = nullptr;
+    unsigned len = 0;
+    if (OSData *d = OSDynamicCast(OSData, v)) {
+        p = (const char *)d->getBytesNoCopy();
+        len = d->getLength();
+    } else if (OSString *str = OSDynamicCast(OSString, v)) {
+        p = str->getCStringNoCopy();
+        len = str->getLength();
+    }
+    for (unsigned i = 0; p && i < len && p[i] >= '0' && p[i] <= '9' && tries < 100; i++)
+        tries = tries * 10 + (uint32_t)(p[i] - '0');
+    OSSafeReleaseNULL(v);
+
+    const uint32_t next = tries < 9 ? tries + 1 : 9;
+    const char digit = (char)('0' + next);
+    OSData *val = OSData::withBytes(&digit, 1);
+    OSString *key = OSString::withCString(kVar);
+    bool wrote = false;
+    if (val && key) {
+        OSDictionary *req = OSDictionary::withCapacity(1);
+        if (req) {
+            req->setObject(key, val);
+            wrote = opts->setProperties(req) == kIOReturnSuccess;
+            req->release();
+        }
+        if ((req = OSDictionary::withCapacity(1))) {
+            req->setObject(kIONVRAMSyncNowPropertyKey, key);
+            opts->setProperties(req);
+            req->release();
+        }
+    }
+    OSSafeReleaseNULL(val);
+    OSSafeReleaseNULL(key);
+    OSSafeReleaseNULL(opts);
+
+    if (tries >= kNVGuardTries) {
+        safeMode_ = true;
+        setProperty(NV_SAFE_MODE_KEY, kOSBooleanTrue);
+        LOG("boot guard: %u boots in a row didn't reach a healthy desktop: SAFE MODE, the experimental gates and the "
+            "auxiliary kexts are off this boot (sudo nvram -d %s, or tools/nvctl boot-ok, to clear)", tries, kVar);
+    } else {
+        LOG("boot guard: boot attempt %u of %u before safe mode%s", next, kNVGuardTries + 1,
+            wrote ? "" : " (the counter could NOT be written: the guard can't trip)");
+    }
 }
 
 // Records the nub's state for dispNubSync: fb is NVDisplayFB, nullptr none; online says a display is lit. Caller
@@ -4547,7 +4626,7 @@ void NVBringup::fillInfo(nvmac_info *i)
     GspState *g = gsp_;
     *i = {};
     i->version = NVMAC_ABI_VERSION;
-    i->features = NVMAC_FEATURE_IMPORT;
+    i->features = NVMAC_FEATURES;
     i->device_id = pci_->configRead16(kIOPCIConfigDeviceID);
     i->chipset = (uint16_t)chipset_;
     i->pci_bus = pci_->getBusNumber();

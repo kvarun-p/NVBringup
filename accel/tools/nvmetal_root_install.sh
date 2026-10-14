@@ -4,6 +4,8 @@
 # volume read-write, change it, and bless a new (unsealed) snapshot to boot. Run with sudo.
 #
 #   sudo nvmetal_root_install.sh install [path/to/NVMetal.bundle]   copy it in, bless; then reboot
+#   sudo nvmetal_root_install.sh restore path/to/NVMetal.bundle      put back a copy of an installed bundle (from tools/nvctl's
+#                                                                     backups) as it is, without embedding again; bless
 #   sudo nvmetal_root_install.sh remove                              take it out again, bless; then reboot
 #   sudo nvmetal_root_install.sh revert                              boot Apple's last sealed snapshot
 #                                                                     (drops every root change); then reboot
@@ -24,7 +26,7 @@ if [[ $cmd == revert ]]; then
     print "Blessed the last sealed snapshot. Reboot to finish."
     exit 0
 fi
-[[ $cmd == install || $cmd == remove ]] || die "usage: $0 install [bundle] | remove | revert"
+[[ $cmd == install || $cmd == restore || $cmd == remove ]] || die "usage: $0 install [bundle] | restore bundle | remove | revert"
 
 # ---- checks ---------------------------------------------------------------------------------------
 csrutil status | grep -q "Filesystem Protections: disabled" ||
@@ -39,6 +41,14 @@ if [[ $cmd == install ]]; then
     [[ $(plutil -extract NSPrincipalClass raw "$BUNDLE/Contents/Info.plist") == NVMetalDevice ]] ||
         die "$BUNDLE isn't NVMetal.bundle"
     ICD=${NVMETAL_ICD_SRC:-${BUNDLE:h:h}/vulkan/libvulkan_nouveau.dylib}   # build tree: src/nouveau/{air,vulkan}
+fi
+if [[ $cmd == restore ]]; then
+    BUNDLE=${2:-}
+    [[ -n $BUNDLE && -x $BUNDLE/Contents/MacOS/NVMetal ]] || die "no bundle at ${BUNDLE:-(none given)}"
+    # Only a copy of an installed bundle: its libraries are embedded and NVMetalICD points into the system volume.
+    [[ -d $BUNDLE/Contents/Frameworks && $(plutil -extract NVMetalICD raw "$BUNDLE/Contents/Info.plist" 2>/dev/null) == /$DEST/* ]] ||
+        die "$BUNDLE isn't a copy of an installed NVMetal.bundle (use install for a build)"
+    codesign --verify --deep --strict "$BUNDLE" || die "$BUNDLE doesn't verify"
 fi
 
 # The booted system is a snapshot of the System volume: /dev/diskNsMsK -> /dev/diskNsM.
@@ -132,6 +142,12 @@ if [[ $cmd == install ]]; then
     chown -R root:wheel "$MNT/$DEST"
     chmod -R 755 "$MNT/$DEST"
     print "copied $BUNDLE"
+elif [[ $cmd == restore ]]; then
+    rm -rf "$MNT/$DEST"
+    ditto --norsrc --noextattr "$BUNDLE" "$MNT/$DEST"
+    chown -R root:wheel "$MNT/$DEST"
+    chmod -R 755 "$MNT/$DEST"
+    print "restored $BUNDLE"
 else
     [[ -e $MNT/$DEST ]] || die "NVMetal.bundle isn't installed"
     rm -rf "$MNT/$DEST"

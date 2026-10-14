@@ -122,7 +122,15 @@ enum {
 // nvmac_info.features
 enum {
     NVMAC_FEATURE_IMPORT = 1u << 0,     // NVMAC_MEM_IMPORT
+    // Selectors added after NVMAC_ABI_VERSION 1 shipped, each with a bit so that a client can test for it instead of
+    // trying the call (all 0 on older kexts). The kext also publishes these as NVUapiVersion / NVUapiFeatures (nv_stack.h).
+    NVMAC_FEATURE_DISPLAY_MAP  = 1u << 1,   // NVMAC_DISPLAY_MAP
+    NVMAC_FEATURE_DISPLAY_MEM  = 1u << 2,   // NVMAC_DISPLAY_MEM, buffers 0-2
+    NVMAC_FEATURE_DISPLAY_FLIP = 1u << 3,   // NVMAC_DISPLAY_FLIP
+    NVMAC_FEATURE_PERF         = 1u << 4,   // control client NVMAC_PERF, NVMAC_PERF_POLICY
 };
+#define NVMAC_FEATURES (NVMAC_FEATURE_IMPORT | NVMAC_FEATURE_DISPLAY_MAP | NVMAC_FEATURE_DISPLAY_MEM | \
+                        NVMAC_FEATURE_DISPLAY_FLIP | NVMAC_FEATURE_PERF)
 #define NVMAC_IMPORT_MAX    (1ull << 30)    // bytes per import
 
 struct nvmac_info {

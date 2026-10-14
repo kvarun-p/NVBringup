@@ -29,6 +29,29 @@ build/nvtest                     # just the kernel interface: "nvtest: 55 checks
 build/nvtest -v                  # with details: bind timings, copy bandwidth, latencies
 ```
 
+## Check a build before installing it
+
+```bash
+tools/nvcheck                    # tier 1 (static) and 2 (GPU smoke tests, user space only); exit 1 on a failure
+tools/nvcheck --tier 1           # no GPU: builds, make verify/check, signatures, plists, stack ABI, UAPI vs Mesa
+tools/nvcheck --only metal       # just the Metal regression tests, with the build tree's libnvmetal.dylib injected
+tools/nvcheck --tier 3 --update-baselines   # pins the clocks, measures, restores them; records baselines
+tools/nvcheck --list             # every check and what it guards
+```
+
+The summary is `build/nvcheck.json` (`--json -` prints it). The Mesa paths come from `NVB_MESA_SRC` and
+`NVB_MESA_BUILD` (or `NVB_NVMETAL_BUNDLE`) in `local.env`, the scratch tests from `NVB_SCRATCH`.
+`tools/nvctl install --apply` runs it first and installs nothing if a check fails. The unit tests of
+the tools run without a GPU or sudo: `python3 -m unittest discover -s tools/tests`.
+
+## Recover from a boot that fails
+
+- Boot-arg `-nvoff`: NVBringup, NVMetalAccel and NVFramebuffer stay out (README, Boot-args).
+- Boot-arg `nvguard=1` makes this automatic for the experimental gates: two boots in a row that
+  don't reach a desktop make the next one a safe boot (`NVSafeMode` in the registry).
+- `tools/nvctl rollback --apply` restores the kexts (and NVMetal.bundle) the last install replaced;
+  `tools/nvctl status` shows what is loaded, installed and built.
+
 ## Benchmark llama.cpp on the GPU
 
 ```bash

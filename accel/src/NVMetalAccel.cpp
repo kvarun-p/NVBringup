@@ -16,6 +16,7 @@
 // by tools/gen_decl.py: rebuild it after a macOS update.
 #include "IOAccelFamily2_decl.h"
 #include "../../src/nv_pipe_copy.h"
+#include "../../src/nv_stack.h"
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IODeviceMemory.h>
@@ -306,6 +307,24 @@ static bool have_gpu()
     return s != nullptr;
 }
 
+// The stack ABI handshake and -nvoff (nv_stack.h): the NVBringup this accelerator would work with (the one on `on`, else
+// any) must have been built with the same cross-kext contract, and not be in safe mode.
+static bool stackAdmit(IOService *on)
+{
+    OSDictionary *m = IOService::serviceMatching("NVBringup");
+    OSIterator *it = m ? IOService::getMatchingServices(m) : nullptr;
+    OSSafeReleaseNULL(m);
+    IOService *gpu = nullptr;
+    while (IOService *s = it ? (IOService *)it->getNextObject() : nullptr)
+        if (!on || s->getProvider() == on) {
+            gpu = s;
+            break;
+        }
+    const bool ok = nv_stack_admit(gpu, "NVMetalAccel");     // before the iterator goes: it holds gpu
+    OSSafeReleaseNULL(it);
+    return ok;
+}
+
 // ---- counters (registry properties of the accelerator, NVPipe*) ----------------------------------------
 
 static NVMetalAccelerator *gAccel = nullptr;     // the one accelerator of this kext (set in start, cleared in stop)
@@ -352,6 +371,8 @@ static uint32_t pipeCount(IOAccelDisplayMachine *m)
 IOService *NVMetalAccelerator::probe(IOService *provider, SInt32 *score)
 {
     if (!layout_ok())
+        return nullptr;
+    if (!stackAdmit(OSDynamicCast(IOPCIDevice, provider) ? provider : nullptr))
         return nullptr;
     if (OSDynamicCast(IOPCIDevice, provider)) {
         // The display-pipe personality: only while NVBringup on this same device has its gate armed.

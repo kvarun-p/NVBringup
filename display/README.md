@@ -31,8 +31,11 @@ It needs the Screen Recording permission, and the first run asks for it. Grant i
 Privacy & Security. The LaunchAgent retries every 10 s, so it starts once the permission is granted. It logs to
 `~/Library/Logs/nvvdisplay.log`. ScreenCaptureKit exists from macOS 12.3, so the same capture serves Sonoma,
 Sequoia and Tahoe. On Sonoma, `nvvdisplay --cgdisplaystream` captures with the older CGDisplayStream instead
-(removed in macOS 15), which is also the fallback if ScreenCaptureKit fails. The permission is tied to the binary's ad-hoc signature, so after a rebuild and reinstall,
-switch it off and on again.
+(removed in macOS 15), which is also the fallback if ScreenCaptureKit fails. With the default ad-hoc signature the
+permission is tied to the binary's cdhash, so after a rebuild and reinstall, switch it off and on again. To keep it
+across rebuilds, sign with a local self-signed certificate: `tools/devsign.sh howto` shows how to make one (once, by
+hand), then set `NVB_SIGN_IDENTITY` in `local.env`; `make -C display vdisplay` signs with it, and
+`tools/devsign.sh check <binary>` says whether a signature keeps its grants.
 
 Hot-plug: while GSP-RM runs with `nvdisp=2`, NVBringup listens for GSP-RM's hot-plug events and then checks the TMDS
 outputs' connect state every 300 ms until a change has held for two checks (otherwise every 5 s; once a second

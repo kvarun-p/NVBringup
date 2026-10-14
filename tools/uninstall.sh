@@ -9,6 +9,8 @@
 # Components (default: all of them, in this order):
 #   bundle    NVMetal.bundle out of /System/Library/Extensions (nvmetal_root_install.sh remove; a new snapshot)
 #   accel     NVMetalAccel.kext out of /Library/Extensions
+#   fb        NVFramebuffer.kext out of /Library/Extensions (the display pipe's framebuffer and AGDC provider)
+#   vdisplay  nvvdisplay, the HDMI virtual display helper (display/vdisplay/install.sh -u; no sudo)
 #   prefs     the Metal allow list and kill switch in /Library/Preferences
 #   daemon    the GSP-RM boot daemon (tools/uninstall_daemon.sh)
 #   icd       your NVK Vulkan manifest (~/.config/vulkan/icd.d, the ones that point at nouveau)
@@ -22,14 +24,14 @@ typeset -a want
 while (( $# )); do
     case $1 in
         -n|--dry-run) DRY=1 ;;
-        -h|--help)    sed -n 2,15p "$0"; exit 0 ;;
-        bundle|accel|prefs|daemon|icd|monitor) want+=$1 ;;
+        -h|--help)    sed -n 2,17p "$0"; exit 0 ;;
+        bundle|accel|fb|vdisplay|prefs|daemon|icd|monitor) want+=$1 ;;
         *)            print -u2 "unknown argument $1 (see --help)"; exit 2 ;;
     esac
     shift
 done
 [[ $EUID -eq 0 ]] && { print -u2 "run as yourself, not with sudo: it asks for sudo where needed"; exit 1; }
-(( ${#want} )) || want=(bundle accel prefs daemon icd monitor)
+(( ${#want} )) || want=(bundle accel fb vdisplay prefs daemon icd monitor)
 has() { (( ${want[(Ie)$1]} )); }
 
 if [[ -t 1 ]]; then G=$'\e[32m' Y=$'\e[33m' R=$'\e[31m' B=$'\e[1m' N=$'\e[0m'; else G= Y= R= B= N=; fi
@@ -44,13 +46,16 @@ run()  { print "  + ${(j: :)${(q-)@}}"; (( DRY )) || "$@"; }
 SYS_BUNDLE=/System/Library/Extensions/NVMetal.bundle
 ACCEL=/Library/Extensions/NVMetalAccel.kext
 ACCEL_ID=io.github.kvarun-p.nvmetalaccel
+FB=/Library/Extensions/NVFramebuffer.kext
+FB_ID=io.github.kvarun-p.nvframebuffer
+VDISPLAY_PLIST=~/Library/LaunchAgents/io.github.kvarun-p.nvvdisplay.plist
 PREFS=(/Library/Preferences/io.github.kvarun-p.nvmetal.{allow,disabled})
 BA=" $(sysctl -n kern.bootargs 2>/dev/null) "
 
 print "components: ${(j:, :)want}"
 if (( DRY )); then
     print "dry run: nothing is changed"
-elif has bundle || has accel || has prefs || has daemon; then
+elif has bundle || has accel || has fb || has prefs || has daemon; then
     sudo -v || exit 1
 fi
 
@@ -81,6 +86,33 @@ if has accel; then
         else
             err "couldn't delete $ACCEL"
         fi
+    fi
+fi
+
+if has fb; then
+    step "NVFramebuffer"
+    if [[ ! -e $FB ]]; then
+        ok "not installed"
+    else
+        # WindowServer holds the framebuffer open while it is used; it is then gone after the reboot
+        if kmutil showloaded --bundle-identifier $FB_ID 2>/dev/null | grep -q $FB_ID; then
+            run sudo kmutil unload -b $FB_ID 2>/dev/null || note "still in use; it stops at the reboot"
+        fi
+        if run sudo rm -rf $FB; then
+            REBOOT+="NVFramebuffer removal (macOS rebuilds the auxiliary kext collection)"
+        else
+            err "couldn't delete $FB"
+        fi
+    fi
+fi
+
+if has vdisplay; then
+    step "nvvdisplay (HDMI virtual display)"
+    if [[ ! -e $VDISPLAY_PLIST && ! -e ~/Library/"Application Support"/NVBringup/nvvdisplay ]]; then
+        ok "not installed"
+    else
+        run /bin/sh display/vdisplay/install.sh -u || err "display/vdisplay/install.sh -u failed"
+        note "its Screen Recording permission stays listed in System Settings → Privacy & Security; remove it there"
     fi
 fi
 

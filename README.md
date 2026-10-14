@@ -384,9 +384,24 @@ control).
 
 ## Update after changes
 
-The kext, `nvgsp` and NVK share one interface (`src/nv_uapi.h`, `NVMAC_ABI_VERSION`). After
-pulling changes, run `tools/install.sh`: it rebuilds and reinstalls whatever differs from the
-build. By hand:
+The kext, `nvgsp` and NVK share one interface (`src/nv_uapi.h`, `NVMAC_ABI_VERSION` plus the
+`NVMAC_FEATURE_*` bits for selectors added later). NVBringup and the auxiliary kexts share another
+(`src/nv_stack.h`, `NV_STACK_ABI`): NVMetalAccel and NVFramebuffer refuse to start, with a log line
+saying why, next to an NVBringup built with a different one, so install the three from the same
+checkout. After pulling changes:
+
+```bash
+tools/nvcheck                    # the pre-install gate: builds, make verify/check, ABI, GPU smoke tests
+tools/nvctl status               # what is built, installed and loaded, and whether they match
+tools/nvctl install              # the plan: every command, nothing changed
+tools/nvctl install --apply      # nvcheck, then backup, copy and record as one transaction
+tools/nvctl rollback             # the plan to undo the last transaction (--apply to run it)
+```
+
+`tools/nvctl` keeps a manifest (`/Library/Application Support/nvctl/installed.json`) and one
+backup set per transaction under `/Library/Application Support/nvctl/backups/`; it never edits
+`config.plist`. `tools/install.sh` still rebuilds and reinstalls whatever differs from the
+build, without the manifest. By hand:
 
 | Changed | Do |
 |---|---|
@@ -403,7 +418,7 @@ that differs from the build.
 
 ## Uninstall
 
-`tools/uninstall.sh` (`-n` for a dry run) removes NVMetal.bundle, NVMetalAccel, the Metal allow
+`tools/uninstall.sh` (`-n` for a dry run) removes NVMetal.bundle, NVMetalAccel, NVFramebuffer, nvvdisplay, the Metal allow
 list and kill switch, the boot daemon, your NVK Vulkan manifest and GPU Monitor, then lists the
 EFI changes to undo by hand (step 1 below, and `csr-active-config`). It keeps the logs, the
 firmware and your Mesa and llama.cpp builds. By hand:
@@ -417,7 +432,7 @@ firmware and your Mesa and llama.cpp builds. By hand:
    `/Library/Extensions/NVMetalAccel.kext` and the files in `/Library/Preferences/` named
    `io.github.kvarun-p.nvmetal.*`; remove `nvaccel=1` and restore `csr-active-config`.
 6. HDMI display: `display/vdisplay/install.sh -u`, remove `nvdisp=2`, and delete
-   `/Library/Extensions/NVFramebuffer.kext` if an earlier test installed it (`tools/uninstall.sh` doesn't).
+   `/Library/Extensions/NVFramebuffer.kext` (`tools/uninstall.sh fb vdisplay` does both).
 
 ## Boot-args
 
@@ -439,6 +454,8 @@ firmware and your Mesa and llama.cpp builds. By hand:
 | `nvdpms=0` | With `nvdisp=2`: keep the HDMI signal on while macOS sleeps the display |
 | `nvhpdevent=0` | With `nvdisp=2`: poll the connect state once a second instead of using GSP-RM's hot-plug events |
 | `nvfb=1` | Experiment only, don't use: NVBringup publishes `NVDisplayNub` for NVFramebuffer.kext, and WindowServer stops within a minute (see docs/display.md). `sudo nvram nvfb-once=1` does the same for one boot |
+| `-nvoff` | Recovery: NVBringup, NVMetalAccel and NVFramebuffer all decline to start, and the GPU is left as the firmware left it. OpenCore rewrites the boot-args every boot, so add it to config.plist (from another computer if this one hangs) or keep a spare EFI with it |
+| `nvguard=1` | Boot-attempt guard: NVBringup counts boots in NVRAM `nv-boot-try`, and the boot daemon deletes it once WindowServer has run for a minute. After 2 boots in a row that never got there, the next boot is a safe one: `nvdpipe`, `nvdpipe-once`, `nvfb` and `nvfb-once` are ignored, `NVSafeMode` is published, and the auxiliary kexts stay out. `tools/nvctl boot-ok` clears the counter by hand. Needs the boot daemon from this version (`tools/install_daemon.sh`), or every third boot is a safe one |
 | `nvkmapvram=1` | NVK keeps its push buffers and descriptors in CPU-mapped VRAM: faster generation (+15 % on a 0.5B model, +6 % on 3B), but each program run holds ~2.7 MiB of BAR1 until a restart; after ~42 runs it falls back to system memory (default speed). `desc` / `cmd:<n>` select parts; see [docs/bar1-cpu-mappings.md](docs/bar1-cpu-mappings.md) |
 
 ## Troubleshooting

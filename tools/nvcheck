@@ -1,0 +1,517 @@
+#!/usr/bin/env python3
+"""nvcheck: the pre-install gate. Run it before installing anything (tools/nvctl install runs it first).
+
+  tools/nvcheck [--tier N] [--only PAT,...] [--skip PAT,...] [--no-build] [--json FILE] [--list] [-v]
+
+Tiers (each includes the ones below it; default 2):
+  1  static, no GPU: builds NVBringup.kext and both auxiliary kexts, make verify (vtable slots and class sizes against
+     this Mac's kernel), make check (every KPI import listed, or kmutil silently drops the kext), code signatures,
+     Info.plists, the stack ABI the kexts are built with against the loaded NVBringup, and the UAPI (src/nv_uapi.h)
+     against Mesa's copy.
+  2  GPU smoke, user space only: nvtest, airrun and the Metal regression tests with the build tree's libnvmetal.dylib
+     injected (NVMETAL_DISABLE=1, so the installed bundle stays out). Skipped when NVBringup isn't running GSP-RM.
+  3  performance: pins the clocks (nvgsp power on, perf policy off, perf max inf), measures, restores them (also on
+     Ctrl-C), and compares with the baselines (--update-baselines records them).
+
+Every check is pass, fail, warn or skip. The exit status is 1 if any check failed, else 0 (2: bad arguments). The JSON
+summary (default build/nvcheck.json) has one record per check: name, tier, status, detail, seconds, and the tail of
+the output of failed checks. Nothing here needs sudo or changes the installed system.
+"""
+import argparse
+import fnmatch
+import json
+import os
+import re
+import signal
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import nvlib  # noqa: E402
+
+PASS, FAIL, WARN, SKIP = "pass", "fail", "warn", "skip"
+
+
+class Check:
+    def __init__(self, name, tier, fn, doc):
+        self.name, self.tier, self.fn, self.doc = name, tier, fn, doc
+
+
+CHECKS = []
+
+
+def check(name, tier, doc):
+    def deco(fn):
+        CHECKS.append(Check(name, tier, fn, doc))
+        return fn
+    return deco
+
+
+class Ctx:
+    def __init__(self, cfg, args):
+        self.cfg, self.args = cfg, args
+        self.repo = cfg.repo
+        self.gpu = None          # NVBringup's registry properties, read once
+        self.built = {}          # make target -> (rc, out)
+        self.metrics = {}
+
+    def nvbringup(self):
+        if self.gpu is None:
+            self.gpu = nvlib.ioreg_class("NVBringup") or {}
+        return self.gpu
+
+    def make(self, *targets, cwd=None):
+        """make in cwd (default the repository); returns (rc, out). Cached per (dir, targets) within one run."""
+        cwd = Path(cwd or self.repo)
+        key = (str(cwd), targets)
+        if key not in self.built:
+            cmd = ["make"]
+            # firmware/ is gitignored: in a fresh worktree reuse an existing generated header (AGENT-RULES, Building)
+            if cwd == self.repo and not (self.repo / "firmware/nvidia/tu102/gsp/gen_bootloader-570.144.bin").exists() \
+                    and (self.repo / "build/gen_bootloader.h").exists():
+                cmd += ["-o", "build/gen_bootloader.h"]
+            if self.args.no_build and not targets:
+                cmd += ["-q"]       # only asks whether it is up to date
+            rc, out, _ = nvlib.run(cmd + list(targets), cwd=cwd, timeout=1800)
+            self.built[key] = (rc, out)
+        return self.built[key]
+
+
+def tail(out, n=15):
+    return "\n".join(out.rstrip().splitlines()[-n:])
+
+
+# ---- tier 1: static ----------------------------------------------------------------------------------------------
+
+def _build(ctx, cwd, product):
+    rc, out = ctx.make(cwd=cwd)
+    if ctx.args.no_build:
+        if not (ctx.repo / product).exists():
+            return FAIL, "%s missing (--no-build)" % product, out
+        return (PASS, "%s up to date" % product, out) if rc == 0 else (WARN, "%s is older than its sources" % product, out)
+    return (PASS, product, out) if rc == 0 else (FAIL, "make failed", out)
+
+
+@check("build.nvbringup", 1, "make: NVBringup.kext, nvgsp, nvtest, vbios_tool")
+def _(ctx):
+    return _build(ctx, ctx.repo, "build/NVBringup.kext")
+
+
+@check("build.accel", 1, "make -C accel: NVMetalAccel.kext")
+def _(ctx):
+    return _build(ctx, ctx.repo / "accel", "accel/build/NVMetalAccel.kext")
+
+
+@check("build.display", 1, "make -C display: NVFramebuffer.kext and nvvdisplay")
+def _(ctx):
+    return _build(ctx, ctx.repo / "display", "display/build/NVFramebuffer.kext")
+
+
+def _make_target(ctx, sub, target, what):
+    rc, out = ctx.make(target, cwd=ctx.repo / sub)
+    last = [l for l in out.splitlines() if l.strip() and not l.startswith(("clang", "python3", "ld: warning"))]
+    return (PASS if rc == 0 else FAIL), (last[-1] if last else what), out
+
+
+@check("verify.accel", 1, "make -C accel verify: decl header current, vtable slots match the kernel's")
+def _(ctx):
+    return _make_target(ctx, "accel", "verify", "vtables")
+
+
+@check("verify.display", 1, "make -C display verify: vtables, class sizes, C++ imports")
+def _(ctx):
+    return _make_target(ctx, "display", "verify", "vtables")
+
+
+@check("kpi.accel", 1, "make -C accel check: every KPI import listed in OSBundleLibraries (kmutil drops it otherwise)")
+def _(ctx):
+    return _make_target(ctx, "accel", "check", "KPI imports")
+
+
+@check("kpi.display", 1, "make -C display check: every KPI import listed in OSBundleLibraries")
+def _(ctx):
+    return _make_target(ctx, "display", "check", "KPI imports")
+
+
+@check("kpi.nvbringup", 1, "NVBringup.kext KPI imports (OpenCore links it into the boot collection: warn only)")
+def _(ctx):
+    rc, out, _ = nvlib.run([str(ctx.repo / "tools/check_kext_libs.sh"), "build/NVBringup.kext"], cwd=ctx.repo)
+    if rc == 0:
+        return PASS, tail(out, 1), out
+    libs = sorted(set(re.findall(r"imports from (\S+),", out)))
+    return WARN, "unlisted %s (fine for an OpenCore-injected kext, not for kmutil)" % ", ".join(libs), out
+
+
+KEXTS = [("NVBringup", "build/NVBringup.kext"), ("NVMetalAccel", "accel/build/NVMetalAccel.kext"),
+         ("NVFramebuffer", "display/build/NVFramebuffer.kext")]
+
+
+@check("codesign", 1, "kexts and nvvdisplay: signatures verify, no AppleDouble (._*) files")
+def _(ctx):
+    bad, out = [], ""
+    items = [p for _, p in KEXTS] + ["display/build/nvvdisplay"]
+    for p in items:
+        path = ctx.repo / p
+        if not path.exists():
+            bad.append("%s missing" % p)
+            continue
+        rc, o, _ = nvlib.run(["/usr/bin/codesign", "--verify", "--strict", str(path)])
+        out += o
+        if rc != 0:
+            bad.append("%s doesn't verify" % p)
+        if path.is_dir() and any(f.name.startswith("._") for f in path.rglob("._*")):
+            bad.append("%s has ._* files" % p)
+    return (FAIL, "; ".join(bad), out) if bad else (PASS, "%d signatures verify" % len(items), out)
+
+
+@check("plist", 1, "Info.plists lint and name the expected bundle IDs and executables")
+def _(ctx):
+    want = {"NVBringup": "io.github.kvarun-p.nvbringup", "NVMetalAccel": "io.github.kvarun-p.nvmetalaccel",
+            "NVFramebuffer": "io.github.kvarun-p.nvframebuffer"}
+    bad = []
+    for name, p in KEXTS:
+        f = ctx.repo / p / "Contents/Info.plist"
+        rc, o, _ = nvlib.run(["/usr/bin/plutil", "-lint", str(f)])
+        info = nvlib.plist(f)
+        if rc != 0 or info is None:
+            bad.append("%s: %s" % (p, o.strip()))
+            continue
+        if info.get("CFBundleIdentifier") != want[name]:
+            bad.append("%s: CFBundleIdentifier %s" % (name, info.get("CFBundleIdentifier")))
+        if info.get("CFBundleExecutable") != name:
+            bad.append("%s: CFBundleExecutable %s" % (name, info.get("CFBundleExecutable")))
+        if name != "NVBringup" and "com.apple.kpi.iokit" not in info.get("OSBundleLibraries", {}):
+            bad.append("%s: no com.apple.kpi.iokit in OSBundleLibraries" % name)
+    return (FAIL, "; ".join(bad), "") if bad else (PASS, "3 Info.plists", "")
+
+
+def stack_abi(repo):
+    m = re.search(r"#define\s+NV_STACK_ABI\s+(\d+)", (repo / "src/nv_stack.h").read_text())
+    return int(m.group(1)) if m else None
+
+
+@check("abi.stack", 1, "the kexts carry the handshake; the loaded NVBringup speaks the same stack ABI")
+def _(ctx):
+    abi = stack_abi(ctx.repo)
+    missing = [p for _, p in KEXTS
+               if b"NVStackABI" not in (ctx.repo / p / "Contents/MacOS" / Path(p).stem).read_bytes()] \
+        if all((ctx.repo / p).exists() for _, p in KEXTS) else ["(not built)"]
+    if missing:
+        return FAIL, "built without the stack handshake: %s" % ", ".join(missing), ""
+    g = ctx.nvbringup()
+    if not g:
+        return WARN, "this build: stack ABI %d; NVBringup isn't loaded, nothing to compare" % abi, ""
+    have = g.get("NVStackABI")
+    if have == abi:
+        return PASS, "stack ABI %d, the same as the loaded NVBringup" % abi, ""
+    return WARN, ("the loaded NVBringup has stack ABI %s, this build %d: install the EFI kext from this build together "
+                  "with the auxiliary kexts, or they refuse to start" % (have if have is not None else "none (older)", abi)), ""
+
+
+@check("abi.uapi", 1, "src/nv_uapi.h against Mesa's nvkmd/macos copy: shared constants, struct sizes and offsets")
+def _(ctx):
+    mesa = ctx.cfg.mesa_uapi
+    if not mesa.exists():
+        return SKIP, "no %s (set NVB_MESA_SRC)" % mesa, ""
+    try:
+        ok, summary, problems = nvlib.uapi_compare(ctx.repo / "src/nv_uapi.h", mesa)
+    except RuntimeError as e:
+        return FAIL, "couldn't compile the headers", str(e)
+    if not ok:
+        return FAIL, "; ".join(problems[:4]), "\n".join(problems)
+    return PASS, summary, ""
+
+
+@check("vbios.selftest", 1, "build/vbios_tool --selftest (VBIOS/FWSEC/GSP parsers, host build with sanitizers)")
+def _(ctx):
+    t = ctx.repo / "build/vbios_tool"
+    if not t.exists():
+        return FAIL, "build/vbios_tool missing", ""
+    rc, out, _ = nvlib.run([str(t), "--selftest"], cwd=ctx.repo, timeout=120)
+    return (PASS if rc == 0 else FAIL), tail(out, 1), out
+
+
+# ---- tier 2: GPU smoke (user space) -----------------------------------------------------------------------------
+
+def gpu_up(ctx):
+    g = ctx.nvbringup()
+    if not g:
+        return "NVBringup isn't loaded"
+    r = g.get("NVGspResult", "")
+    if r not in ("running", "powered off (idle)"):
+        return "GSP-RM isn't running (%s)" % (r or "no NVGspResult")
+    return None
+
+
+def gpu_test(ctx, cmd, expect, need=None, env_extra=None, cwd=None, timeout=300, inject=False):
+    """Runs a GPU test; pass when it exits 0 and its output matches expect (and need, when given)."""
+    why = gpu_up(ctx)
+    if why:
+        return SKIP, why, ""
+    exe = Path(cmd[0])
+    if not exe.exists():
+        return SKIP, "%s not built" % exe, ""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("DYLD_")}
+    if inject:
+        lib = ctx.cfg.nvmetal_dylib
+        if not lib.exists():
+            return SKIP, "no %s (set NVB_MESA_BUILD)" % lib, ""
+        # the build tree's library, injected; the installed bundle stays out. SIP binaries would strip DYLD_*:
+        # `need` checks the NVIDIA device was used.
+        env.update(NVMETAL_DISABLE="1", DYLD_INSERT_LIBRARIES=str(lib), NVMETAL_DEFAULT="1")
+    env.update(env_extra or {})
+    if cwd is None:         # tests leave files behind (rendertest: out/*.ppm)
+        cwd = ctx.repo / "build/nvcheck-work"
+        cwd.mkdir(parents=True, exist_ok=True)
+    rc, out, _ = nvlib.run([str(c) for c in cmd], cwd=cwd, env=env, timeout=timeout)
+    m = re.search(expect, out)
+    if rc == 0 and m and (not need or re.search(need, out)):
+        return PASS, m.group(0).strip(), out
+    if rc == -9:
+        return FAIL, "timed out", out
+    if need and not re.search(need, out):
+        return FAIL, "the NVIDIA device wasn't used", out
+    last = [l for l in out.splitlines() if l.strip()]
+    return FAIL, (last[-1].strip() if last else "exit %d" % rc), out
+
+
+@check("gpu.nvtest", 2, "build/nvtest: the kernel interface")
+def _(ctx):
+    return gpu_test(ctx, [ctx.repo / "build/nvtest"], r"nvtest: \d+ checks passed, 0 failed")
+
+
+def air_files(ctx):
+    return sorted((ctx.cfg.scratch / "acceleration-research/air/out").glob("*.air"))
+
+
+@check("gpu.airrun", 2, "airrun: AIR kernels through NVK with self-checks")
+def _(ctx):
+    files = air_files(ctx)
+    if not files:
+        return SKIP, "no AIR files in %s" % (ctx.cfg.scratch / "acceleration-research/air/out"), ""
+    return gpu_test(ctx, [ctx.cfg.mesa_build / "src/nouveau/air/airrun", ctx.cfg.nvk_lib] + files,
+                    r"airrun: \d+ kernels, all checks passed")
+
+
+NVMETAL_NEED = r"NVIDIA|nvmetal"
+GFX = "acceleration-research/nvmetal/gfx"
+S6 = "accel-displaypipe/s6/tests"
+METAL_TESTS = [
+    # name, path under NVB_SCRATCH, args, extra environment, expected output (regex), what it guards
+    ("metal.textest", GFX + "/textest", ["nvmetal"], {}, r"PASS: \d+/\d+ checks passed", "textures, samplers, blits"),
+    ("metal.rendertest", GFX + "/rendertest", [], {}, r"(?m)^PASS$", "render pipelines against the Intel GPU"),
+    ("metal.submitted", S6 + "/submitted", [], {}, r"0 of 60 frames not in the surface; scheduled handler 0 of 60",
+     "commitAndWaitUntilSubmitted/scheduled handlers after the write-back (mirror flicker, mesa 0e4cc1d)"),
+    ("metal.twotex", S6 + "/twotex", [], {}, r"0 of 60 frames lost to a stale write-back",
+     "per-surface write-back across textures (mesa 37351e1)"),
+    ("metal.dontcare", S6 + "/dontcare", [], {}, r"0 of 10 surfaces lost their contents",
+     "DontCare loads on IOSurface attachments (black flashes)"),
+    # WindowServer's configuration: the commit-sync wait is on by default only there (nvmetal.m env_flags_init)
+    ("metal.crossgpu", S6 + "/crossgpu", [], {"NVMETAL_COMMIT_SYNC": "1"}, r"Intel read 0 of 60 frames stale",
+     "Intel reads NVMetal's IOSurface right after commit, with WindowServer's commit sync (mirroring)"),
+]
+
+for _name, _path, _args, _env, _expect, _doc in METAL_TESTS:
+    def _mk(path=_path, args=_args, env=_env, expect=_expect):
+        def fn(ctx):
+            return gpu_test(ctx, [ctx.cfg.scratch / path] + args, expect, need=NVMETAL_NEED, env_extra=env,
+                            inject=True, timeout=180)
+        return fn
+    CHECKS.append(Check(_name, 2, _mk(), _doc + " (injected libnvmetal.dylib)"))
+
+
+# ---- tier 3: performance ----------------------------------------------------------------------------------------
+
+METRICS = {   # name: (higher is better, unit)
+    "vram_copy_gbs": (True, "GB/s"), "sysmem_copy_gbs": (True, "GB/s"), "fma_tflops": (True, "TFLOPS"),
+    "dispatch_roundtrip_ms": (False, "ms"), "dispatch_gpu_us": (False, "us"),
+    "ce_vram_gbs": (True, "GB/s"), "ce_to_vram_gbs": (True, "GB/s"), "ce_from_vram_gbs": (True, "GB/s"),
+    "exec_roundtrip_us": (False, "us"),
+}
+
+
+def parse_perf(airrun_out, nvtest_out):
+    m = {}
+    pats = [(airrun_out, "vram_copy_gbs", r"VRAM:\s+[\d.]+ ms\s+([\d.]+) GB/s"),
+            (airrun_out, "sysmem_copy_gbs", r"system memory:\s+[\d.]+ ms\s+([\d.]+) GB/s"),
+            (airrun_out, "fma_tflops", r"ms\s+([\d.]+) TFLOPS"),
+            (airrun_out, "dispatch_roundtrip_ms", r"median ([\d.]+) ms"),
+            (airrun_out, "dispatch_gpu_us", r"GPU ([\d.]+) us/dispatch"),
+            (nvtest_out, "ce_vram_gbs", r"VRAM -> VRAM [\d]+ MiB: ([\d.]+) GB/s"),
+            (nvtest_out, "ce_to_vram_gbs", r"system memory -> VRAM [\d]+ MiB: ([\d.]+) GB/s"),
+            (nvtest_out, "ce_from_vram_gbs", r"VRAM -> system memory [\d]+ MiB: ([\d.]+) GB/s"),
+            (nvtest_out, "exec_roundtrip_us", r"round trip \(exec \+ wait\): avg ([\d.]+) us")]
+    for out, k, p in pats:
+        r = re.search(p, out)
+        if r:
+            m[k] = float(r.group(1))
+    return m
+
+
+class PinnedClocks:
+    """nvgsp power on; perf policy off; perf max inf, undone on exit (also on Ctrl-C and SIGTERM)."""
+    def __init__(self, nvgsp):
+        self.nvgsp, self.pinned = str(nvgsp), False
+
+    def _run(self, *a):
+        return nvlib.run([self.nvgsp] + list(a), timeout=120)
+
+    def __enter__(self):
+        self._old = {s: signal.signal(s, self._raise) for s in (signal.SIGINT, signal.SIGTERM)}
+        self.pinned = True
+        for a in (("power", "on"), ("perf", "policy", "off"), ("perf", "max", "inf")):
+            rc, out, _ = self._run(*a)
+            if rc != 0:
+                raise RuntimeError("nvgsp %s failed: %s" % (" ".join(a), out.strip()))
+        return self
+
+    @staticmethod
+    def _raise(signum, frame):
+        raise KeyboardInterrupt
+
+    def __exit__(self, *exc):
+        if self.pinned:      # the restore the benchmarking notes give
+            for a in (("perf", "policy", "adaptive", "burst=max"), ("perf", "clear"), ("power", "auto")):
+                self._run(*a)
+            self.pinned = False
+        for s, h in self._old.items():
+            signal.signal(s, h)
+        return False
+
+
+def baselines_path(ctx):
+    return Path(ctx.args.baselines or ctx.cfg.env.get("NVB_BASELINES") or
+                os.path.expanduser("~/.config/nvbringup/nvcheck-baselines.json"))
+
+
+@check("perf", 3, "clocks pinned: VRAM/sysmem copy, FMA throughput, dispatch latency, copy engine (best of 3)")
+def _(ctx):
+    why = gpu_up(ctx)
+    if why:
+        return SKIP, why, ""
+    airrun, nvtest, nvgsp = ctx.cfg.mesa_build / "src/nouveau/air/airrun", ctx.repo / "build/nvtest", \
+        ctx.repo / "build/nvgsp"
+    bench = ctx.cfg.scratch / "acceleration-research/air/out/bench.air"
+    for p in (airrun, nvtest, nvgsp, bench):
+        if not p.exists():
+            return SKIP, "%s missing" % p, ""
+    runs, log = [], ""
+    env = dict(os.environ, MESA_SHADER_CACHE_DISABLE="true")
+    with PinnedClocks(nvgsp):
+        for _ in range(3):
+            _, a, _ = nvlib.run([str(airrun), "-b", str(ctx.cfg.nvk_lib), str(bench)], env=env, timeout=300)
+            _, n, _ = nvlib.run([str(nvtest), "-v"], timeout=300)
+            runs.append(parse_perf(a, n))
+            log += a + n
+    best = {}
+    for k, (higher, _) in METRICS.items():
+        vals = [r[k] for r in runs if k in r]
+        if vals:
+            best[k] = max(vals) if higher else min(vals)
+    ctx.metrics = best
+    if len(best) < len(METRICS):
+        return FAIL, "couldn't read %s from the output" % ", ".join(sorted(set(METRICS) - set(best))), log
+    bp = baselines_path(ctx)
+    if ctx.args.update_baselines:
+        bp.parent.mkdir(parents=True, exist_ok=True)
+        bp.write_text(json.dumps({"recorded": time.strftime("%Y-%m-%d %H:%M"), "metrics": best}, indent=2) + "\n")
+        return PASS, "baselines recorded in %s" % bp, log
+    base = (json.loads(bp.read_text()) if bp.exists() else {}).get("metrics")
+    if not base:
+        return WARN, "no baselines (%s): run with --update-baselines" % bp, log
+    tol = ctx.args.tolerance / 100.0
+    worse = []
+    for k, v in best.items():
+        b = base.get(k)
+        if not b:
+            continue
+        higher, unit = METRICS[k]
+        if (v < b * (1 - tol)) if higher else (v > b * (1 + tol)):
+            worse.append("%s %.3g %s (baseline %.3g)" % (k, v, unit, b))
+    if worse:
+        return FAIL, "slower than baseline by more than %d%%: %s" % (ctx.args.tolerance, "; ".join(worse)), log
+    return PASS, "within %d%% of the baselines (%s)" % (ctx.args.tolerance, ", ".join(
+        "%s %.3g" % (k, v) for k, v in sorted(best.items()))), log
+
+
+# ---- driver -----------------------------------------------------------------------------------------------------
+
+def select(args):
+    def match(name, pats):
+        return any(fnmatch.fnmatch(name, p) or name.startswith(p + ".") or name == p for p in pats)
+    only = [p for p in (args.only or "").split(",") if p]
+    skip = [p for p in (args.skip or "").split(",") if p]
+    return [c for c in CHECKS if c.tier <= args.tier and (not only or match(c.name, only)) and not match(c.name, skip)]
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="nvcheck", description=__doc__.split("\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--tier", type=int, default=2, choices=(1, 2, 3), help="highest tier to run (default 2)")
+    ap.add_argument("--only", help="comma-separated check names or globs (e.g. metal.*,abi)")
+    ap.add_argument("--skip", help="comma-separated check names or globs to leave out")
+    ap.add_argument("--no-build", action="store_true", help="don't build: check the existing build products")
+    ap.add_argument("--json", help="summary file (default build/nvcheck.json; - for stdout)")
+    ap.add_argument("--list", action="store_true", help="list the checks and exit")
+    ap.add_argument("--baselines", help="tier 3 baselines file (default ~/.config/nvbringup/nvcheck-baselines.json)")
+    ap.add_argument("--update-baselines", action="store_true", help="tier 3: record the measurements as baselines")
+    ap.add_argument("--tolerance", type=int, default=15, help="tier 3: allowed regression in percent (default 15)")
+    ap.add_argument("--repo", help=argparse.SUPPRESS)
+    ap.add_argument("-v", "--verbose", action="store_true", help="print the output of every check, not just failures")
+    args = ap.parse_args(argv)
+
+    cfg = nvlib.Config(Path(args.repo) if args.repo else nvlib.REPO)
+    if args.list:
+        for c in CHECKS:
+            print("%d  %-18s %s" % (c.tier, c.name, c.doc))
+        return 0
+    checks = select(args)
+    if not checks:
+        print("nvcheck: no check selected", file=sys.stderr)
+        return 2
+    ctx = Ctx(cfg, args)
+    say = (lambda *a: print(*a, file=sys.stderr)) if args.json == "-" else print    # stdout carries the JSON
+    tty = (sys.stderr if args.json == "-" else sys.stdout).isatty()
+    col = {PASS: "\033[32m", FAIL: "\033[31m", WARN: "\033[33m", SKIP: "\033[2m"} if tty else {}
+    results = []
+    interrupted = False
+    for c in checks:
+        t = time.monotonic()
+        try:
+            status, detail, out = c.fn(ctx)
+        except KeyboardInterrupt:
+            status, detail, out, interrupted = FAIL, "interrupted", "", True
+        except Exception as e:     # a broken check is a failed check, not a crashed gate
+            status, detail, out = FAIL, "check raised %s: %s" % (type(e).__name__, e), ""
+        dt = time.monotonic() - t
+        rec = {"name": c.name, "tier": c.tier, "status": status, "detail": detail, "seconds": round(dt, 2)}
+        if status == FAIL and out:
+            rec["output"] = tail(out, 40)
+        results.append(rec)
+        say("%s%-4s%s  %-18s %s  (%.1f s)" % (col.get(status, ""), status.upper(), "\033[0m" if tty else "",
+                                                 c.name, detail.splitlines()[0] if detail else "", dt))
+        if out and (args.verbose or status == FAIL):
+            say("      " + tail(out).replace("\n", "\n      "))
+        if interrupted:
+            break
+    counts = {s: sum(r["status"] == s for r in results) for s in (PASS, FAIL, WARN, SKIP)}
+    summary = {"tool": "nvcheck", "version": 1, "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+               "repo": str(cfg.repo), "git": nvlib.run(["git", "-C", str(cfg.repo), "rev-parse", "--short", "HEAD"])[1].strip(),
+               "tier": args.tier, "ok": counts[FAIL] == 0 and not interrupted, "counts": counts,
+               "metrics": ctx.metrics, "checks": results}
+    text = json.dumps(summary, indent=2) + "\n"
+    if args.json == "-":
+        sys.stdout.write(text)
+    else:
+        jp = Path(args.json) if args.json else cfg.repo / "build/nvcheck.json"
+        jp.parent.mkdir(parents=True, exist_ok=True)
+        jp.write_text(text)
+    say("nvcheck: %d passed, %d failed, %d warnings, %d skipped%s" % (
+        counts[PASS], counts[FAIL], counts[WARN], counts[SKIP], "" if args.json == "-" else
+        " (summary: %s)" % (args.json or os.path.relpath(cfg.repo / "build/nvcheck.json"))))
+    return 0 if summary["ok"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
