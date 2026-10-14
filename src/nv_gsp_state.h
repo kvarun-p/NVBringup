@@ -235,7 +235,7 @@ struct NVBringup::GspState {
         uint32_t litId = 0, sorIdx = ~0u;
         uint32_t pendId = 0, pendCount = 0, tick = 0;            // hot-plug debounce
         // Hot-plug events (dispHpdArm): GSP-RM posts NV2080_NOTIFIERS_HOTPLUG; the poll then samples at 300 ms
-        // until the change settles, and every 10 s otherwise. Without the event object, once a second as before.
+        // until the change settles, and every 5 s otherwise. Without the event object, once a second as before.
         uint32_t hpdEvent = 0;          // the event object's handle, 0: none (polling)
         uint32_t hpdEvents = 0;         // events received
         uint32_t hpdBurst = 0, hpdNext = 0;      // samples still to take at the fast pace, and the tick of the next

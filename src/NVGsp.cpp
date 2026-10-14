@@ -544,6 +544,10 @@ int NVBringup::handleGspMessage(const GSP_MSG_QUEUE_ELEMENT *e, const uint8_t *p
         }
         return 0;
 
+    case NV_VGPU_MSG_EVENT_POST_EVENT:
+        dispHpdEvent(p, len);
+        return 0;
+
     case NV_VGPU_MSG_EVENT_RC_TRIGGERED:
         // rpc_rc_triggered_v17_02: engine, chid, gfid, level, exceptType, scope, u16, fault lo/hi/type
         if (len >= 40) {

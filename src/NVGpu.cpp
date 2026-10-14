@@ -983,6 +983,7 @@ bool NVBringup::dispInit()
         d.fb = nf;
     }
     d.ready = true;
+    dispHpdArm();
     LOG("GSP: display: engine ready (root, core and window channels); watching %u output(s)", d.nCand);
     for (uint32_t i = 0; i < d.nCand; i++)
         LOG("GSP: display:   0x%x (protocol %u)", d.candId[i], d.candProto[i]);
@@ -1509,17 +1510,111 @@ bool NVBringup::dispReadEdid(uint32_t displayId, uint8_t *edid, uint32_t *len)
     return ok;
 }
 
-// From the GSP poller (gspLock_ held), every 100 ms; acts once a second. A change must hold for two
-// samples (HPD bounces while a cable goes in). Keeps the lit display while it stays connected, else
-// lights the first connected TMDS output.
+// ---- Hot-plug events ------------------------------------------------------------------------------------
+//
+// GSP-RM handles the HPD interrupts and tells its clients through NV2080_NOTIFIERS_HOTPLUG (cl2080_notification.h)
+// on the subdevice: an event object of class NV01_EVENT_KERNEL_CALLBACK_EX (NV0005_ALLOC_PARAMETERS: hParentClient,
+// hSrcResource = the subdevice, the notifier, hClass, notifyIndex with NV01_EVENT_CLIENT_RM so GSP-RM posts it
+// back to us, data), enabled with NV2080_CTRL_CMD_EVENT_SET_NOTIFICATION (event, action REPEAT), as nouveau's
+// r535 disp does. GSP-RM then sends NV_VGPU_MSG_EVENT_POST_EVENT (rpc_post_event_v17_00), which the status queue
+// delivers within 100 ms (the poller; any RPC wait drains it too). Without it the poll runs once a second as
+// before. Boot-arg nvhpdevent=0: no event object.
+void NVBringup::dispHpdArm()
+{
+    GspState *g = gsp_;
+    GspState::DispHw &d = g->disp;
+    uint32_t arg = 1, st = 0;
+    if (d.hpdEvent || (PE_parse_boot_argn("nvhpdevent", &arg, sizeof(arg)) && !arg))
+        return;
+    const uint32_t h = g->nextHandle;
+    g->nextHandle += 8;
+    uint8_t ev[24] = {};                            // NV0005_ALLOC_PARAMETERS (data, an NvP64, at 16)
+    put32(ev, 0, g->hClient);                       // hParentClient
+    put32(ev, 4, g->hSubdevice);                    // hSrcResource: the notifier
+    put32(ev, 8, 0x7e);                             // hClass: NV01_EVENT_KERNEL_CALLBACK_EX
+    put32(ev, 12, 0x04000000u | 1);                 // NV01_EVENT_CLIENT_RM | NV2080_NOTIFIERS_HOTPLUG
+    if (!gspRmAlloc(g->hClient, g->hSubdevice, h, 0x7e, ev, sizeof(ev), &st)) {
+        LOG("GSP: display: hot-plug event object refused (status 0x%x): polling once a second", st);
+        return;
+    }
+    uint8_t sn[20] = {};                            // NV2080_CTRL_EVENT_SET_NOTIFICATION_PARAMS
+    put32(sn, 0, 1);                                // event: NV2080_NOTIFIERS_HOTPLUG
+    put32(sn, 4, 2);                                // action: REPEAT
+    if (!gspRmControl(g->hClient, g->hSubdevice, 0x20800301, sn, sizeof(sn), &st)) {
+        LOG("GSP: display: hot-plug SET_NOTIFICATION failed (status 0x%x): polling once a second", st);
+        gspRmFree(g->hClient, g->hSubdevice, h, &st);
+        return;
+    }
+    d.hpdEvent = h;
+    d.hpdBurst = 0;
+    LOG("GSP: display: hot-plug events on (event 0x%x); polling every 5 s as a fallback", h);
+    setProperty("NVDisplayHotplug", "events");
+}
+
+// NV_VGPU_MSG_EVENT_POST_EVENT, from handleGspMessage (gspLock_ held). rpc_post_event_v17_00: hClient, hEvent,
+// notifyIndex, data, info16 (u16), status, eventDataSize, bNotifyList (u8), eventData[] at 29; for HOTPLUG,
+// Nv2080HotplugNotification { plugDisplayMask, unplugDisplayMask }. Only logged: the poll reads the state itself,
+// sampling every 300 ms from the next tick until the change has settled.
+void NVBringup::dispHpdEvent(const uint8_t *p, uint32_t len)
+{
+    GspState *g = gsp_;
+    uint32_t hClient = 0, hEvent = 0, index = 0, size = 0, plug = 0, unplug = 0;
+    if (len >= 28) {
+        memcpy(&hClient, p, 4);
+        memcpy(&hEvent, p + 4, 4);
+        memcpy(&index, p + 8, 4);
+        memcpy(&size, p + 24, 4);
+    }
+    if (!g || !g->disp.hpdEvent || hEvent != g->disp.hpdEvent) {
+        static uint32_t logged;
+        if (logged++ < 8)
+            LOG("GSP: event: client 0x%x event 0x%x index 0x%x (%u bytes of data) ignored", hClient, hEvent, index,
+                size);
+        return;
+    }
+    if (size >= 8 && len >= 29 + 8) {
+        memcpy(&plug, p + 29, 4);
+        memcpy(&unplug, p + 33, 4);
+    }
+    GspState::DispHw &d = g->disp;
+    d.hpdEvents++;
+    d.hpdBurst = 6;
+    d.hpdNext = d.tick + 1;
+    LOG("GSP: display: hot-plug event %u: plug 0x%x unplug 0x%x", d.hpdEvents, plug, unplug);
+    setProperty("NVDisplayHotplugEvents", d.hpdEvents, 32);
+}
+
+// From the GSP poller (gspLock_ held), every 100 ms. Samples the outputs' connect state once a second; with hot-plug
+// events (dispHpdArm) every 300 ms for a while after an event and every 5 s otherwise. A change must hold for two
+// samples (HPD bounces while a cable goes in). Keeps the lit display while it stays connected, else lights the first
+// connected TMDS output.
 void NVBringup::dispHotplugTick()
 {
     GspState *g = gsp_;
     GspState::DispHw &d = g->disp;
-    if (!d.ready || !d.nCand || ++d.tick % 10)
+    if (!d.ready || !d.nCand)
         return;
+    d.tick++;
     if (d.dpmsOff)          // asleep (dispPower): GSP-RM's state may say anything; checked again once woken
         return;
+    if (!d.hpdEvent) {
+        if (d.tick % 10)
+            return;
+    } else if (d.hpdBurst) {
+        if ((int32_t)(d.tick - d.hpdNext) < 0)
+            return;
+        d.hpdBurst--;
+        d.hpdNext = d.tick + 3;
+    } else if (d.tick % 50) {
+        return;
+    }
+    // Another sample soon (a change waiting for its second sample, an EDID not readable yet), events or not.
+    auto again = [&](uint32_t ticks) {
+        if (d.hpdEvent && !d.hpdBurst) {
+            d.hpdBurst = 1;
+            d.hpdNext = d.tick + ticks;
+        }
+    };
     uint32_t mask = 0, st = 0, conn = 0;
     for (uint32_t i = 0; i < d.nCand; i++)
         mask |= d.candId[i];
@@ -1553,6 +1648,7 @@ void NVBringup::dispHotplugTick()
     if (want != d.pendId || !d.pendCount) {
         d.pendId = want;
         d.pendCount = 1;
+        again(3);
         return;
     }
     d.pendCount = 0;
@@ -1566,6 +1662,7 @@ void NVBringup::dispHotplugTick()
             if (edid)
                 IOFree(edid, kNvEdidMax);
             LOG("GSP: display: 0x%x connected, but its EDID can't be read yet", want);     // tried again in 2 s
+            again(20);
             if (wasLit)
                 dispPublish();
             return;
