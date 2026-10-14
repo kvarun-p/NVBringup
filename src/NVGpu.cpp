@@ -525,7 +525,6 @@ void NVBringup::probeDisplay()
     if (arm != 1 && arm != 2)
         return;
     uint32_t modeId = 0, modeProto = 0;     // nvdisp=2: the first connected TMDS output and its EDID
-    uint8_t modeEdid[128] = {};
     char sum[512];
     uint32_t pos = 0;
 #define ADD(...) do { if (pos < sizeof(sum)) pos += (uint32_t)snprintf(sum + pos, sizeof(sum) - pos, __VA_ARGS__); } while (0)
@@ -632,7 +631,9 @@ void NVBringup::probeDisplay()
             if (!modeId && (proto == 1 || proto == 2 || proto == 5)) {
                 modeId = id;
                 modeProto = proto;
-                memcpy(modeEdid, e, sizeof(modeEdid));
+                // The whole EDID, extensions included (the CTA block says whether the sink takes HDMI).
+                g->dispModeEdidLen = n < kNvEdidMax ? n : kNvEdidMax;
+                memcpy(g->dispModeEdid, e, g->dispModeEdidLen);
             }
             char key[32];
             snprintf(key, sizeof(key), "NVDisplayEDID-%x", id);
@@ -662,7 +663,8 @@ void NVBringup::probeDisplay()
     if (arm == 2 && modeId) {
         g->dispModeId = modeId;
         g->dispModeProto = modeProto;
-        memcpy(g->dispModeEdid, modeEdid, sizeof(modeEdid));
+    } else {
+        g->dispModeEdidLen = 0;
     }
 }
 
@@ -996,7 +998,7 @@ fail:
 
 // Lights displayId with the EDID's first detailed timing: SOR, head, the surface (colour bars until
 // something draws there), window 0.
-bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t *edid)
+bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t *edid, uint32_t edidLen, bool relight)
 {
     GspState *g = gsp_;
     GspState::DispHw &d = g->disp;
@@ -1004,8 +1006,10 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
     const uint32_t head = 0;
     const char *what = "";
 #define FAIL(msg) do { what = msg; goto fail; } while (0)
-    if (!d.ready)
+    if (!d.ready || edidLen < 128)
         return false;
+    nv_sink_caps sink;
+    nv_edid_parse(edid, edidLen, &sink);
 
     // Mode: the EDID's first detailed timing descriptor (bytes 54..71).
     {
@@ -1145,7 +1149,9 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
     d.litId = displayId;
     d.sorIdx = sorIdx;
     d.proto = rmProto;
-    memcpy(d.edid, edid, sizeof(d.edid));
+    if (edid != d.edid)
+        memcpy(d.edid, edid, sink.len);
+    d.edidLen = sink.len;
     d.edidValid = true;
     d.w = hact;
     d.h = vact;
@@ -1167,6 +1173,18 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
     LOG("GSP: display: 0x%x lit: %ux%u on head %u -> SOR %u, surface 0x%llx", displayId, hact, vact, head, sorIdx,
         (unsigned long long)d.fb.pa);
     setProperty("NVDisplayModeset", "ok");
+    {
+        // What the sink's EDID says (nv_edid): for the test plan and the HDMI decisions below.
+        char si[256];
+        snprintf(si, sizeof(si), "%s, %u bytes (%u ext%s); %s; HDMI VSDB %s (max TMDS %u MHz)%s; range limit %u MHz; "
+                 "VCDB %s (QS %u, S_IT %u, S_CE %u); audio %s (%u SADs); native VIC %u, %u VICs",
+                 sink.name[0] ? sink.name : "?", sink.len, sink.nExt, sink.headerOk ? "" : ", BAD HEADER",
+                 sink.cta ? "CTA-861" : "no CTA block", sink.hdmi ? "yes" : "no", sink.hdmiMaxTmdsKhz / 1000,
+                 sink.hf ? ", HF-VSDB" : "", sink.rangeMaxPclkKhz / 1000, sink.vcdb ? "yes" : "no", sink.qs,
+                 sink.sIT, sink.sCE, sink.basicAudio ? "basic" : "none", sink.nSad, sink.nativeVic, sink.nVic);
+        LOG("GSP: display: sink: %s", si);
+        setProperty("NVDisplaySink", si);
+    }
     return true;
     }
 fail:
@@ -1207,8 +1225,8 @@ void NVBringup::dispBlank()
     setProperty("NVDisplayModeset", "unplugged");
 }
 
-// The display's EDID base block (GSP-RM reads it over DDC).
-bool NVBringup::dispReadEdid(uint32_t displayId, uint8_t edid[128])
+// The display's EDID, the base block and its extensions (GSP-RM reads it over DDC), up to kNvEdidMax bytes.
+bool NVBringup::dispReadEdid(uint32_t displayId, uint8_t *edid, uint32_t *len)
 {
     GspState *g = gsp_;
     uint32_t st = 0, n = 0;
@@ -1219,8 +1237,11 @@ bool NVBringup::dispReadEdid(uint32_t displayId, uint8_t edid[128])
     if (gspRmControl(g->hClient, g->hDisp, NV0073_CTRL_CMD_SPECIFIC_GET_EDID_V2_, ed, NV0073_EDID_SIZE, &st))
         memcpy(&n, ed + NV0073_EDID_bufferSize, 4);
     const bool ok = n >= 128 && n <= NV0073_EDID_MAX;
-    if (ok)
-        memcpy(edid, ed + NV0073_EDID_buffer, 128);
+    *len = 0;
+    if (ok) {
+        *len = n < kNvEdidMax ? n : kNvEdidMax;
+        memcpy(edid, ed + NV0073_EDID_buffer, *len);
+    }
     IOFree(ed, NV0073_EDID_SIZE);
     return ok;
 }
@@ -1274,15 +1295,20 @@ void NVBringup::dispHotplugTick()
     if (wasLit)
         dispBlank();
     if (want) {
-        uint8_t edid[128];
-        if (!dispReadEdid(want, edid)) {
+        uint8_t *edid = (uint8_t *)IOMallocZero(kNvEdidMax);
+        uint32_t edidLen = 0;
+        if (!edid || !dispReadEdid(want, edid, &edidLen)) {
+            if (edid)
+                IOFree(edid, kNvEdidMax);
             LOG("GSP: display: 0x%x connected, but its EDID can't be read yet", want);     // tried again in 2 s
             if (wasLit)
                 dispPublish();
             return;
         }
         LOG("GSP: display: 0x%x connected", want);
-        if (!dispSetMode(want, wantProto, edid)) {
+        const bool lit = dispSetMode(want, wantProto, edid, edidLen);
+        IOFree(edid, kNvEdidMax);
+        if (!lit) {
             d.failId = want;
             if (wasLit)
                 dispPublish();
@@ -1337,7 +1363,7 @@ void NVBringup::dispPublish()
     if (d.cursChan && d.curs.cpu)
         num("CursorSize", 256, 32);         // NVFramebuffer offers a hardware cursor (NV_CURSOR_*_FN)
     if (d.edidValid) {              // the last lit display's: it stays while unlit (Online false)
-        if (OSData *e = OSData::withBytes(d.edid, sizeof(d.edid))) {
+        if (OSData *e = OSData::withBytes(d.edid, d.edidLen)) {
             dict->setObject("EDID", e);
             e->release();
         }

@@ -30,7 +30,8 @@ enum nv_edid_src : uint8_t {
 };
 
 struct nv_sink_caps {
-    bool     valid;                                 // a base block with a good header
+    bool     valid;                                 // at least a base block
+    bool     headerOk;                              // with the EDID header
     uint32_t len;                                   // bytes that belong to the EDID: 128 * (1 + extensions), capped
     uint8_t  nExt;
     char     name[14];                              // the monitor name descriptor

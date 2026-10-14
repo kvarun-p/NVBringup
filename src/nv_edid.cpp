@@ -86,9 +86,10 @@ bool nv_edid_parse(const uint8_t *e, uint32_t len, nv_sink_caps *c)
 {
     memset(c, 0, sizeof(*c));
     static const uint8_t hdr[8] = { 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00 };
-    if (!e || len < 128 || memcmp(e, hdr, 8))
+    if (!e || len < 128)
         return false;
-    c->valid = true;
+    c->valid = true;                                // a bad header is reported, not refused: GSP-RM read it as an EDID
+    c->headerOk = !memcmp(e, hdr, 8);
     c->nExt = e[126];
     uint32_t want = 128u * (1u + c->nExt);
     if (want > kNvEdidMax)

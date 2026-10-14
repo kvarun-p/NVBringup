@@ -48,7 +48,9 @@ class NVFramebuffer : public IOFramebuffer {
     uint32_t width_ = 0, height_ = 0, pitch_ = 0, pclkKhz_ = 0;
     uint32_t htotal_ = 0, vtotal_ = 0, hsyncStart_ = 0, hsyncWidth_ = 0, vsyncStart_ = 0, vsyncWidth_ = 0;
     uint32_t syncFlags_ = 0;            // bit 0: hsync negative, bit 1: vsync negative
-    uint8_t edid_[128] = {};
+    static constexpr uint32_t kEdidMax = 1024;   // NVBringup's kNvEdidMax: the base block and 7 extensions
+    uint8_t edid_[kEdidMax] = {};
+    uint32_t edidLen_ = 0;              // whole 128-byte blocks in edid_
     bool haveEdid_ = false;
     Interrupt vbl_, connect_;           // guarded by vblLock_
     thread_call_t vblCall_ = nullptr;   // allocated in start, freed in free; armed while vblActive_
@@ -154,8 +156,14 @@ bool NVFramebuffer::readDisplay(OSDictionary *d)
     syncFlags_ = (uint32_t)num("Flags");
     cursorSize_ = (uint32_t)num("CursorSize") <= 256 ? (uint32_t)num("CursorSize") : 0;
     haveEdid_ = false;
-    if (OSData *e = OSDynamicCast(OSData, d->getObject("EDID")); e && e->getLength() >= sizeof(edid_)) {
-        memcpy(edid_, e->getBytesNoCopy(), sizeof(edid_));
+    edidLen_ = 0;
+    if (OSData *e = OSDynamicCast(OSData, d->getObject("EDID")); e && e->getLength() >= 128) {
+        // The base block and the extensions it counts (byte 126), as far as NVBringup read them.
+        uint32_t n = e->getLength() < kEdidMax ? e->getLength() : kEdidMax;
+        n -= n % 128;
+        memcpy(edid_, e->getBytesNoCopy(), n);
+        const uint32_t want = 128u * (1u + edid_[126]);
+        edidLen_ = want < n ? want : n;
         haveEdid_ = true;
     }
     return true;
@@ -759,10 +767,11 @@ IOReturn NVFramebuffer::getDDCBlock(IOIndex connect, UInt32 blockNumber, IOSelec
 {
     if (connect != 0 || !haveEdid_ || blockType != kIODDCBlockTypeEDID || !data || !length)
         return kIOReturnBadArgument;
-    if (blockNumber != 1)           // only the base block: NVBringup reads 128 bytes
+    // blockNumber counts from 1: the base block, then the extensions (the CTA-861 block of an HDMI sink).
+    if (!blockNumber || (uint64_t)blockNumber * 128 > edidLen_)
         return kIOReturnUnsupported;
-    const IOByteCount n = *length < sizeof(edid_) ? *length : sizeof(edid_);
-    memcpy(data, edid_, n);
+    const IOByteCount n = *length < 128 ? *length : 128;
+    memcpy(data, edid_ + (blockNumber - 1) * 128, n);
     *length = n;
     return kIOReturnSuccess;
 }
