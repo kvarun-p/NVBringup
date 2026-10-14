@@ -714,7 +714,23 @@ bool NVBringup::waitGspReply(uint32_t function, uint32_t ms, uint32_t *result,
     g->waitLen = 0;
     g->waitFunction = function;
     g->waitDone = false;
-    for (uint32_t t = 0; t < ms && !g->waitDone; t++) {
+    // Replies mostly arrive within a few hundred microseconds; a 1 ms sleep per poll made every RPC cost at least
+    // one tick. Poll the (host memory) queue for up to kReplySpinUs first, then fall back to sleeping. gspLock_ is
+    // held by the callers throughout, so the spin costs a core for at most that long and blocks nobody extra.
+    static const uint32_t kReplySpinUs = 400, kReplyPollUs = 10;
+    uint64_t spinAbs = 0;
+    nanoseconds_to_absolutetime((uint64_t)kReplySpinUs * 1000, &spinAbs);
+    const uint64_t spinEnd = mach_absolute_time() + spinAbs;
+    bool failed = false;
+    while (!g->waitDone && mach_absolute_time() < spinEnd) {
+        if (serviceStatusQueue() < 0) {
+            failed = true;
+            break;
+        }
+        if (!g->waitDone)
+            IODelay(kReplyPollUs);
+    }
+    for (uint32_t t = 0; !failed && t < ms && !g->waitDone; t++) {
         if (serviceStatusQueue() < 0)
             break;
         if (!g->waitDone)
@@ -1442,7 +1458,7 @@ bool NVBringup::scheduleChannel(TestChan &c)
 // Writes the pushbuffer, the next GPFIFO entry and GPPut, rings the doorbell, then waits up
 // to `ms` for the semaphore word (servicing GSP messages meanwhile). One submission at a time.
 bool NVBringup::submitAndWait(TestChan &c, const uint32_t *push, uint32_t words, uint32_t semPayload, uint32_t ms,
-                              bool verbose)
+                              bool verbose, uint32_t spinUs)
 {
     const uint32_t ringEntries = 512;
     for (uint32_t i = 0; i < words; i++)
@@ -1458,14 +1474,18 @@ bool NVBringup::submitAndWait(TestChan &c, const uint32_t *push, uint32_t words,
     if (verbose)
         LOG("GSP: channel 0x%x: submitted %u pushbuffer words; doorbell rung", c.handle, words);
 
-    // Spin briefly (small jobs finish in microseconds), then poll every millisecond.
+    // Spin for spinUs (small jobs finish in microseconds; the display pipe's copy takes 1-2 ms and a sleep tick
+    // would add one or two more), then poll every millisecond. The caller holds gspLock_ either way.
     uint32_t semVal = 0, waited = 0;
-    for (uint32_t i = 0; i < 200; i++) {
+    uint64_t spinAbs = 0;
+    nanoseconds_to_absolutetime((uint64_t)spinUs * 1000, &spinAbs);
+    const uint64_t spinEnd = mach_absolute_time() + spinAbs;
+    do {
         semVal = praminRd32(c.sem);
         if (semVal == semPayload)
             break;
         IODelay(5);
-    }
+    } while (mach_absolute_time() < spinEnd);
     for (; semVal != semPayload && waited < ms; waited++) {
         praminRestore();
         IOSleep(1);

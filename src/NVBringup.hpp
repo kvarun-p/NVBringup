@@ -219,7 +219,7 @@ private:
                            uint64_t vaBase, uint32_t mthdSize);
     bool     scheduleChannel(TestChan &c);
     bool     submitAndWait(TestChan &c, const uint32_t *push, uint32_t words, uint32_t semPayload, uint32_t ms,
-                           bool verbose = true);
+                           bool verbose = true, uint32_t spinUs = 1000);
     // Graphics context buffers plus TURING_COMPUTE_A (Phase 4 step 7)
     bool     testCompute();
     // BAR1 through GSP-RM's BAR1 root (Phase 4 step 6)

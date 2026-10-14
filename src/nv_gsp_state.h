@@ -220,6 +220,12 @@ struct NVBringup::GspState {
         uint64_t pipeShowAt = 0;
         uint64_t pipeFreeAt[3] = {};
         uint64_t pipeFlips = 0, pipeWaits = 0, pipeWaitUs = 0;   // NVPipeFlips: flips, frames that waited, total wait
+        // Per-frame pipe timeline (NVPipeTiming, published with NVPipeFlips): copy = submit to copy engines done,
+        // queue = done to UPDATE written, lead = UPDATE to the estimated latch, gap = flip to flip. Sum and max in
+        // us over the flips since the last publish, plus the count of copies that missed the 4 ms spin.
+        uint64_t tmCopySum = 0, tmQueueSum = 0, tmLeadSum = 0, tmGapSum = 0, tmN = 0, tmGapN = 0, tmSlow = 0;
+        uint32_t tmCopyMax = 0, tmQueueMax = 0, tmLeadMax = 0, tmGapMax = 0;
+        uint64_t tmLastFlip = 0;
         uint32_t flipBy[4] = {};        // flips completed by: timeout (0), notifier (1), armed state (2), armed
                                         // state with the raster not seen passing a vblank (3)
         uint16_t latchLine[24] = {};    // raster line at which the first flips were seen latched

@@ -1850,6 +1850,48 @@ int NVBringup::pipeSrcMap(OSObject *key, IOMemoryDescriptor *md)
     return (int)slot;
 }
 
+// The per-frame timeline of the pipe (see GspState::DispHw): accumulates, published every 120 flips as
+// NVPipeTiming ("us mean/max"). Two mach_absolute_time reads per flip; the property is built once per 120.
+template <class D>
+static bool pipeTiming(D &dd, uint64_t tSubmit, uint64_t tCopied, uint64_t showAt, char *m, size_t cap)
+{
+    const uint64_t tNow = mach_absolute_time();
+    auto us = [](uint64_t abs) { uint64_t ns = 0; absolutetime_to_nanoseconds(abs, &ns); return (uint32_t)(ns / 1000); };
+    const uint32_t copy = us(tCopied - tSubmit), queue = us(tNow - tCopied), lead = us(showAt > tNow ? showAt - tNow : 0);
+    dd.tmN++;
+    dd.tmCopySum += copy;
+    dd.tmQueueSum += queue;
+    dd.tmLeadSum += lead;
+    if (copy > dd.tmCopyMax)
+        dd.tmCopyMax = copy;
+    if (queue > dd.tmQueueMax)
+        dd.tmQueueMax = queue;
+    if (lead > dd.tmLeadMax)
+        dd.tmLeadMax = lead;
+    if (copy > 2500)
+        dd.tmSlow++;
+    if (dd.tmLastFlip) {
+        const uint32_t gap = us(tSubmit - dd.tmLastFlip);
+        dd.tmGapN++;
+        dd.tmGapSum += gap;
+        if (gap > dd.tmGapMax)
+            dd.tmGapMax = gap;
+    }
+    dd.tmLastFlip = tNow;
+    if (dd.tmN >= 120) {
+        snprintf(m, cap, "%llu flips: copy %llu/%u us, queue %llu/%u us, latch in %llu/%u us, gap %llu/%u us, %llu slow",
+                 (unsigned long long)dd.tmN, (unsigned long long)(dd.tmCopySum / dd.tmN), dd.tmCopyMax,
+                 (unsigned long long)(dd.tmQueueSum / dd.tmN), dd.tmQueueMax,
+                 (unsigned long long)(dd.tmLeadSum / dd.tmN), dd.tmLeadMax,
+                 (unsigned long long)(dd.tmGapN ? dd.tmGapSum / dd.tmGapN : 0), dd.tmGapMax,
+                 (unsigned long long)dd.tmSlow);
+        dd.tmN = dd.tmCopySum = dd.tmQueueSum = dd.tmLeadSum = dd.tmGapSum = dd.tmGapN = dd.tmSlow = 0;
+        dd.tmCopyMax = dd.tmQueueMax = dd.tmLeadMax = dd.tmGapMax = 0;
+        return true;
+    }
+    return false;
+}
+
 IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy *a)
 {
     if (!key || !md || !a || a->version != NV_PIPE_COPY_VERSION || a->x1 <= a->x0 || a->y1 <= a->y0 ||
@@ -1955,12 +1997,27 @@ IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy
         // physical source and destination
         pbHeader(subch, 0x300, 1), 2u | 1u << 2 | 1u << 3 | 1u << 7 | 1u << 8 | 1u << 9 | 1u << 12 | 1u << 13,
     };
+    // One pushbuffer and one wait for both copies: they run in order on the same channel (non-pipelined, flushed),
+    // and the second reads what the first wrote. Its semaphore value is the one waited for; the first's stays
+    // readable for the diagnosis below. The copy takes 1-2 ms: spin through it rather than sleep a tick or two.
+    static const uint32_t kPipeSpinUs = 2500;
+    uint32_t both[sizeof(push) / 4 + sizeof(push2) / 4];
+    memcpy(both, push, sizeof(push));
+    memcpy(both + sizeof(push) / 4, push2, sizeof(push2));
     const uint64_t t0 = mach_absolute_time();
-    bool ok = submitAndWait(c, push, sizeof(push) / 4, payload, 100, false);
-    if (ok && flips && !submitAndWait(c, push2, sizeof(push2) / 4, payload2, 100, false))
-        LOG("GSP: display pipe: copy into the aperture did not complete");
+    bool ok = flips ? submitAndWait(c, both, sizeof(both) / 4, payload2, 100, false, kPipeSpinUs)
+                    : submitAndWait(c, push, sizeof(push) / 4, payload, 100, false, kPipeSpinUs);
+    if (!ok && flips) {                         // the first copy done and the aperture copy not: still a flip
+        const uint32_t sem = praminRd32(c.sem);
+        praminRestore();
+        if (sem == payload) {
+            ok = true;
+            LOG("GSP: display pipe: copy into the aperture did not complete");
+        }
+    }
+    const uint64_t t1 = mach_absolute_time();
     uint64_t ns = 0;
-    absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+    absolutetime_to_nanoseconds(t1 - t0, &ns);
     a->gpuUs = (uint32_t)(ns / 1000);
     if (!ok)                                    // what the slot held is suspect: map it again next time
         pipeSrcDrop((uint32_t)slot, true);
@@ -1983,6 +2040,9 @@ IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy
         if (dd.pipeArmed < 3)
             dd.pipeFreeAt[dd.pipeArmed] = showAt;
         dd.pipeShowAt = showAt;
+        char tm[160];
+        if (pipeTiming(dd, t0, t1, showAt, tm, sizeof(tm)))
+            setProperty("NVPipeTiming", tm);
         dd.pipeArmed = (uint32_t)target;
         dd.front = (uint32_t)target;
         dd.pipeFlips++;
