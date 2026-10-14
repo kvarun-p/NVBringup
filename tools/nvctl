@@ -183,6 +183,7 @@ class Runner:
         if self.lay.fake and (base in self.SYSTEM or base.endswith(".sh") or argv[0] in ("/bin/sh", "/bin/zsh")):
             self.recorded.append(argv)
             return True
+        sys.stdout.flush()
         r = subprocess.run(shown)
         if check and r.returncode != 0:
             raise StepError("%s failed (exit %d)" % (" ".join(shown), r.returncode))
@@ -368,6 +369,7 @@ def gate(args, repo, out=print):
     cmd = [args.nvcheck or str(repo / "tools/nvcheck"), "--tier", str(args.check_tier),
            "--json", str(repo / "build/nvcheck.json")]
     out("nvcheck gate: " + " ".join(shlex.quote(c) for c in cmd))
+    sys.stdout.flush()      # before the child's output
     r = subprocess.run(cmd)
     try:
         summary = json.loads((repo / "build/nvcheck.json").read_text())
