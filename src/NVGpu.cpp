@@ -4056,7 +4056,7 @@ void NVBringup::fillInfo(nvmac_info *i)
     GspState *g = gsp_;
     *i = {};
     i->version = NVMAC_ABI_VERSION;
-    i->features = NVMAC_FEATURE_IMPORT;
+    i->features = NVMAC_FEATURES;
     i->device_id = pci_->configRead16(kIOPCIConfigDeviceID);
     i->chipset = (uint16_t)chipset_;
     i->pci_bus = pci_->getBusNumber();
