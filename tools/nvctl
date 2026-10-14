@@ -295,7 +295,7 @@ def install_steps(comps, lay, cfg, repo, manifest, stamp, notes):
                                                                   "gui/%d/io.github.kvarun-p.nvvdisplay" % os.getuid()])))
                               if had else (lambda r: r.cmd(["/bin/sh", repo / "display/vdisplay/install.sh", "-u"]))))
             notes.append("vdisplay: a rebuilt nvvdisplay loses Screen Recording unless it is signed with a stable "
-                         "identity (display/vdisplay/SIGNING.md)")
+                         "identity (tools/devsign.sh howto)")
         elif c == "daemon":
             steps.append(Step(c, "install the boot daemon",
                               lambda r: r.cmd(["/bin/zsh", repo / "tools/install_daemon.sh"], root=True),
