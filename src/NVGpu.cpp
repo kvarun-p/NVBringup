@@ -1036,8 +1036,11 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
     if (!sink.hdmi && linkMax > 165000)
         linkMax = 165000;
     const uint32_t sinkMax = nv_sink_max_tmds_khz(&sink);
+    // The preferred timing if it fits; else the biggest that fits at 50 Hz or more (a 4K TV beyond the port: 1080p60
+    // rather than 4K30), then the highest refresh up to 60 Hz, then EDID order.
     const nv_edid_timing *mode = nullptr;
-    for (uint32_t i = 0; i < nCand && !mode; i++) {
+    uint64_t best = 0;
+    for (uint32_t i = 0; i < nCand && !(mode && mode == &cand[0]); i++) {
         const nv_edid_timing &c = cand[i];
         const bool preferred = i == 0 && c.source == NV_EDID_SRC_DTD;
         const uint32_t lim = preferred || sinkMax > linkMax ? linkMax : sinkMax;
@@ -1050,7 +1053,13 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
                     c.interlaced ? "i" : "p", c.pclkKhz, c.vic, why, lim);
             continue;
         }
-        mode = &c;
+        const uint32_t hz = (uint32_t)((uint64_t)c.pclkKhz * 1000 / ((uint64_t)c.htotal * c.vtotal));
+        const uint64_t score = (uint64_t)(hz >= 49) << 63 | (uint64_t)c.hact * c.vact << 16 |
+                               (uint64_t)(hz <= 61 ? hz : 0) << 8 | (255 - (i < 255 ? i : 255));
+        if (!mode || score > best) {
+            mode = &c;
+            best = score;
+        }
     }
     if (!mode && nCand && !cand[0].interlaced && cand[0].hact && cand[0].vact && cand[0].hsw && cand[0].vsw) {
         LOG("GSP: display: no timing within the limits; trying the preferred one anyway");
