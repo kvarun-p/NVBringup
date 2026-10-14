@@ -381,8 +381,10 @@ IOReturn NVBringup::powerCall(uint32_t selector, IOExternalMethodArguments *a)
             uint32_t st = 0;
             if (in[0] != boostPolicy_ && boostLevel_ && gsp_ && gsp_->booted)
                 perfBoostLocked(NVMAC_BOOST_CLEAR, 0, &st);     // a new policy starts unboosted
-            if (in[0] != boostPolicy_)
+            if (in[0] != boostPolicy_) {
                 boostLevel_ = NVMAC_BOOST_CLEAR;
+                boostPend_ = ~0u;                              // a queued boost belongs to the old policy
+            }
             boostPolicy_ = (uint32_t)in[0];
             boostSec_ = (uint32_t)in[1];
             boostBurst_ = (uint32_t)in[2];

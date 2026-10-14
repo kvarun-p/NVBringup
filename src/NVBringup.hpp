@@ -403,6 +403,9 @@ private:
     uint32_t  boostCount_ = 0;              // accepted requests
     bool      boostTicking_ = false;        // boostCall_ is armed
     bool      boostStopping_ = false;       // driver stopping: don't re-arm
+    uint32_t  boostPend_ = ~0u;             // a boost request autoBoostLocked queued for boostCall_ (~0u: none)
+    uint32_t  boostPendSec_ = 0;
+    uint64_t  boostTickAt_ = 0;             // when the armed sampler tick is due
     thread_call_t boostCall_ = nullptr;     // 20 ms sampler while an adaptive boost is held
     static void boostThunk(thread_call_param_t self, thread_call_param_t);
     void      boostTickLocked();

@@ -3755,6 +3755,7 @@ void NVBringup::boostArmLocked()
     boostTicking_ = true;
     uint64_t dl = 0;
     clock_interval_to_deadline(kBoostTickMs, kMillisecondScale, &dl);
+    boostTickAt_ = dl;
     thread_call_enter_delayed(boostCall_, dl);
 }
 
@@ -3762,11 +3763,33 @@ void NVBringup::boostThunk(thread_call_param_t self, thread_call_param_t)
 {
     NVBringup *d = (NVBringup *)self;
     IOLockLock(d->gspLock_);
-    d->boostTicking_ = false;
-    if (d->gsp_ && d->gsp_->booted)
-        d->boostTickLocked();
-    else
-        d->boostLevel_ = 0;                 // GSP-RM went away, and its boosts with it
+    const bool up = d->gsp_ && d->gsp_->booted;
+    // A boost request queued by an EXEC (autoBoostLocked): the RPC goes out here, not on the submitting thread.
+    if (d->boostPend_ != ~0u) {
+        const uint32_t want = d->boostPend_, sec = d->boostPendSec_;
+        d->boostPend_ = ~0u;
+        uint32_t st = 0;
+        if (up && d->boostPolicy_ != NVMAC_PERF_POLICY_OFF && !d->perfBoostLocked(want, sec, &st)) {
+            d->log("perf: P-state boost refused (status 0x%x); clocks left to GSP-RM\n", st);
+            d->boostPolicy_ = NVMAC_PERF_POLICY_OFF;
+            d->boostLevel_ = 0;
+        }
+    }
+    if (d->boostTicking_) {
+        // The call may have been entered early for the request above: the sampler keeps its own 20 ms grid.
+        uint64_t now = mach_absolute_time();
+        if (up && now < d->boostTickAt_ && !d->boostStopping_) {
+            thread_call_enter_delayed(d->boostCall_, d->boostTickAt_);
+        } else {
+            d->boostTicking_ = false;
+            if (up)
+                d->boostTickLocked();
+            else
+                d->boostLevel_ = 0;         // GSP-RM went away, and its boosts with it
+        }
+    } else if (!up) {
+        d->boostLevel_ = 0;
+    }
     IOLockUnlock(d->gspLock_);
 }
 
@@ -3792,13 +3815,17 @@ void NVBringup::autoBoostLocked(bool backlog)
         return;
     }
     boostLast_ = now;
-    if (want != NVMAC_BOOST_CLEAR &&
-        !perfBoostLocked(want, boostPolicy_ == NVMAC_PERF_POLICY_FIXED ? boostSec_ : kBoostHoldSec, &st)) {
-        LOG("perf: P-state boost refused (status 0x%x); clocks left to GSP-RM", st);
-        boostPolicy_ = NVMAC_PERF_POLICY_OFF;
-        boostLevel_ = 0;
-        return;
+    // The RPC is a GSP round trip (about a millisecond): queued for boostCall_ so EXEC doesn't wait for it. The
+    // level is taken as held right away (the next EXEC doesn't ask again); a refusal turns the policy off from
+    // boostThunk, as it did here.
+    if (want != NVMAC_BOOST_CLEAR) {
+        if (!boostCall_ || boostStopping_)
+            return;
+        boostPend_ = want;
+        boostPendSec_ = boostPolicy_ == NVMAC_PERF_POLICY_FIXED ? boostSec_ : kBoostHoldSec;
+        thread_call_enter(boostCall_);
     }
+    (void)st;
     boostLevel_ = want;
     if (boostPolicy_ == NVMAC_PERF_POLICY_ADAPTIVE)
         boostArmLocked();                   // even with no burst boost: the sampler may escalate

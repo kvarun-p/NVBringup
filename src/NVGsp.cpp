@@ -318,6 +318,7 @@ IOReturn NVBringup::bootGsp()
     g->booted = true;
     boostLast_ = 0;         // a new GSP-RM holds no boost
     boostLevel_ = 0;
+    boostPend_ = ~0u;
     LOG("GSP: SUCCESS: GSP-RM initialized");
     if (!sleepNotifier_)
         sleepNotifier_ = registerPrioritySleepWakeInterest(&NVBringup::sleepHandler, this);
