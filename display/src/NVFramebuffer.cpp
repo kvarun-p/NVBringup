@@ -32,8 +32,24 @@
 
 #define LOG(fmt, ...) IOLog("NVFramebuffer: " fmt "\n", ##__VA_ARGS__)
 
+class NVFramebuffer;
+
+// Display sleep. NVFramebuffer can't be a power driver itself (see start), so macOS's display sleep never reaches
+// setAttribute(kIOPowerAttribute). This object registers as an interested driver of the IODisplayWrangler, whose
+// power state is the display's (4 on, 3 dimmed, below that asleep), and turns the signal off and on with it.
+// IOFramebuffer overrides powerStateDidChangeTo for itself, hence a separate object.
+class NVDisplaySleepWatch : public IOService {
+    OSDeclareDefaultStructors(NVDisplaySleepWatch)
+public:
+    NVFramebuffer *fb = nullptr;
+    int last = -1;                      // the wrangler state acted on last: -1 none yet
+    IOReturn powerStateDidChangeTo(IOPMPowerFlags caps, unsigned long state, IOService *who) override;
+};
+OSDefineMetaClassAndStructors(NVDisplaySleepWatch, IOService)
+
 class NVFramebuffer : public IOFramebuffer {
     OSDeclareDefaultStructors(NVFramebuffer)
+    friend class NVDisplaySleepWatch;
 
     static constexpr IODisplayModeID kMode = 1;
 
@@ -74,6 +90,11 @@ class NVFramebuffer : public IOFramebuffer {
     static constexpr uint32_t kCursorBufPx = 256 * 256;
 
     static constexpr UInt32 kMsgState = 0x4e564442;     // NVBringup's kNVDisplayMsgState ('NVDB'), the nub's change
+
+    NVDisplaySleepWatch *sleepWatch_ = nullptr;
+    IOService *wrangler_ = nullptr;     // retained while sleepWatch_ is registered with it
+    IONotifier *wranglerNote_ = nullptr;
+    static bool wranglerPublished(void *target, void *ref, IOService *wrangler, IONotifier *note);
 
     bool readDisplay(OSDictionary *d);
     void displayPower(bool on, const char *why, uintptr_t value);
@@ -331,7 +352,17 @@ bool NVFramebuffer::start(IOService *provider)
     }
     // No registerPowerDriver: IOFramebuffer's power callbacks use its controller, which IOGraphics sets up
     // later than this; a power change from here panicked in IOFramebuffer::powerStateWillChangeTo on a NULL
-    // controller (2026-10-09). The display's power follows NVBringup's GPU anyway.
+    // controller (2026-10-09). Display sleep comes from the IODisplayWrangler instead (NVDisplaySleepWatch).
+    uint32_t dpms = 1;
+    if (!(PE_parse_boot_argn("nvdpms", &dpms, sizeof(dpms)) && !dpms) && (sleepWatch_ = new NVDisplaySleepWatch)) {
+        if (sleepWatch_->init()) {
+            sleepWatch_->fb = this;
+            wranglerNote_ = addMatchingNotification(gIOFirstPublishNotification, serviceMatching("IODisplayWrangler"),
+                                                    wranglerPublished, this);
+        } else {
+            OSSafeReleaseNULL(sleepWatch_);
+        }
+    }
     publishTiming();
     publishVblanks();
     const uint64_t now = mach_absolute_time();
@@ -354,6 +385,17 @@ void NVFramebuffer::stop(IOService *provider)
     vblActive_ = false;
     IOSimpleLockUnlock(vblLock_);
     nub_ = nullptr;                 // no more messages: NVBringup terminates the nub only from its dispNubSync
+    if (wranglerNote_) {
+        wranglerNote_->remove();    // waits out a running wranglerPublished
+        wranglerNote_ = nullptr;
+    }
+    if (wrangler_) {
+        wrangler_->deRegisterInterestedDriver(sleepWatch_);     // synchronous against powerStateDidChangeTo
+        OSSafeReleaseNULL(wrangler_);
+    }
+    if (sleepWatch_)
+        sleepWatch_->fb = nullptr;
+    OSSafeReleaseNULL(sleepWatch_);
     thread_call_cancel(vblCall_);
     for (;;) {
         IOSimpleLockLock(vblLock_);
@@ -691,6 +733,29 @@ void NVFramebuffer::displayPower(bool on, const char *why, uintptr_t value)
         r = gpu_->callPlatformFunction(fn, false, (void *)(uintptr_t)on, nullptr, nullptr, nullptr);
     if (logged++ < 16)
         LOG("display power %s (%s %lu): %#x", on ? "on" : "off", why, (unsigned long)value, r);
+}
+
+bool NVFramebuffer::wranglerPublished(void *target, void *, IOService *wrangler, IONotifier *)
+{
+    NVFramebuffer *self = (NVFramebuffer *)target;
+    if (self->wrangler_ || !self->sleepWatch_)
+        return true;
+    wrangler->retain();
+    self->wrangler_ = wrangler;
+    const IOPMPowerFlags flags = wrangler->registerInterestedDriver(self->sleepWatch_);
+    LOG("display sleep: watching %s (power flags 0x%lx)", wrangler->getName(), (unsigned long)flags);
+    return true;
+}
+
+IOReturn NVDisplaySleepWatch::powerStateDidChangeTo(IOPMPowerFlags caps, unsigned long state, IOService *)
+{
+    const int on = state >= 3;          // dimmed keeps the signal
+    if (fb && on != last) {
+        last = on;
+        fb->displayPower(on, "display wrangler state", state);
+    }
+    (void)caps;
+    return kIOPMAckImplied;
 }
 
 // IOFramebuffer runs power management and asks for each change through kIOPowerAttribute. IOGraphics' notifications

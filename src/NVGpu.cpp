@@ -1479,7 +1479,7 @@ IOReturn NVBringup::dispPower(bool on)
         return kIOReturnNotReady;
     IOLockLock(gspLock_);
     GspState *g = gsp_;
-    if (!g || !g->booted || !g->disp.ready || !g->disp.litId) {
+    if (!g || !g->booted || !g->disp.ready || !g->disp.litId || g->disp.parkedId) {
         IOLockUnlock(gspLock_);
         return kIOReturnNotReady;
     }
@@ -1495,17 +1495,14 @@ IOReturn NVBringup::dispPower(bool on)
     put32(mp, 8, on ? 1 : 0);                       // NV0073_CTRL_SPECIFIC_SET_MONITOR_POWER_ON / _OFF
     put32(mp, 12, 0);                               // head 0
     if (!on) {
-        if (gspRmControl(g->hClient, g->hDisp, 0x730295, mp, sizeof(mp), &st)) {
-            d.dpmsBySor = false;
-        } else {
-            LOG("GSP: display: SET_MONITOR_POWER off failed (status 0x%x): detaching the SOR instead", st);
-            cursorLive(false);
-            if (d.sorIdx != ~0u)
-                dispMthd(false, 0x300 + d.sorIdx * 0x20, 0);                      // SOR_SET_CONTROL: no owner
-            dispCoreUpdate(0);
-            d.dpmsBySor = true;
-            d.cursOn = false;                       // re-enabled after the relight
+        // No SOR detach when GSP-RM refuses: the relight that would follow gives no signal (2026-10-15).
+        if (!gspRmControl(g->hClient, g->hDisp, 0x730295, mp, sizeof(mp), &st)) {
+            LOG("GSP: display: SET_MONITOR_POWER off failed (status 0x%x): the signal stays on", st);
+            setProperty("NVDisplayPower", "on (SET_MONITOR_POWER off refused)");
+            IOLockUnlock(gspLock_);
+            return kIOReturnUnsupported;
         }
+        d.dpmsBySor = false;
         d.dpmsOff = true;
     } else {
         bool lit = false;
@@ -1698,6 +1695,10 @@ void NVBringup::dispHotplugTick()
     d.pendCount = 0;
     uint32_t keep = 1;
     PE_parse_boot_argn("nvunplug", &keep, sizeof(keep));
+    // NVRAM one-shot nvunplug-detach (sudo nvram nvunplug-detach=1): the next unplug detaches as with nvunplug=0,
+    // to reproduce the relight without a reboot. Read only at an unplug of the lit display.
+    if (!want && keep && d.litId && !d.parkedId && nvramOneShot("nvunplug-detach"))
+        keep = 0;
     if (!want && keep && d.litId && !d.parkedId) {
         // Unplugged: offline for macOS, the hardware left running (see parkedId)
         d.parkedId = d.litId;
