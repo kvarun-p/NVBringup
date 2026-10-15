@@ -6,7 +6,8 @@
 NVBringup publishes two registry properties on the display pipe: NVPipeFlips (the flip count, every 120 flips) and
 NVPipeTiming (the last 120 flips: copy, queue, latch-in and gap, as mean/max us, and the slow copies). This polls them
 with ioreg every interval (default 1 s) and prints a line each time they change: flips per second from the 120-flip
-windows, and the timing line as published. NVPipeSubmits is not published by this tree, so it is not read.
+windows, and the timing line as published. NVMetalAccelerator's counters (NVPipeSubmits, NVPipeGpuCopies,
+NVPipeCpuCopies) give WindowServer's submissions per second and how many frames fell back to the CPU copy.
 Times are the poll's clock, so with a 1 s interval the rate is good to about one window in two seconds.
 """
 import argparse
@@ -17,6 +18,14 @@ import time
 
 FLIPS_RE = re.compile(r'"NVPipeFlips" = "(\d+) flips')
 TIMING_RE = re.compile(r'"NVPipeTiming" = "([^"]*)"')
+ACCEL_RE = {k: re.compile(r'"%s" = (\d+)' % k) for k in ("NVPipeSubmits", "NVPipeGpuCopies", "NVPipeCpuCopies")}
+
+
+def read_accel():
+    """NVMetalAccelerator's display pipe counters, or {} when it isn't loaded"""
+    out = subprocess.run(["/usr/sbin/ioreg", "-r", "-c", "NVMetalAccelerator", "-d", "1", "-l", "-w0"],
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout.decode("utf-8", "replace")
+    return {k: int(m.group(1)) for k, r in ACCEL_RE.items() for m in [r.search(out)] if m}
 
 
 def read_props():
@@ -36,6 +45,7 @@ def main(argv):
     ap.add_argument("-n", "--count", type=int, default=0, help="polls to make (0: until Ctrl-C)")
     args = ap.parse_args(argv)
     last_timing, last_change = None, None
+    last_accel, last_accel_at = None, None
     polls = 0
     try:
         while not args.count or polls < args.count:
@@ -55,6 +65,15 @@ def main(argv):
                     last_timing, last_change = timing, now
                 if timing is None and flips is not None:
                     print("%s  %d flips (no timing published yet)" % (time.strftime("%H:%M:%S"), flips))
+            accel = read_accel()
+            if accel and last_accel is not None and accel.get("NVPipeSubmits", 0) != last_accel.get("NVPipeSubmits", 0):
+                dt = now - last_accel_at
+                d = {k: accel.get(k, 0) - last_accel.get(k, 0) for k in accel}
+                # the copy counters are published in batches (every 60 frames): totals, not per interval
+                print("%s  submits %.1f/s; copies so far by GPU %d, by CPU %d" % (time.strftime("%H:%M:%S"),
+                      d.get("NVPipeSubmits", 0) / dt, accel.get("NVPipeGpuCopies", 0), accel.get("NVPipeCpuCopies", 0)))
+            if accel:
+                last_accel, last_accel_at = accel, now
             sys.stdout.flush()
             if args.count and polls >= args.count:
                 break
