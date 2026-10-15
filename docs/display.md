@@ -279,3 +279,14 @@ binary's ad-hoc signature, so a rebuild needs it granted again.
 - **Tested on Sonoma only.** The private interfaces the display pipe uses (IOAcceleratorFamily2's vtables, AGDC
   selectors) must be checked again on Sequoia and Tahoe (`make verify` in `accel/` and `display/`).
 - **The GPU stays powered with `nvdisp=2`,** monitor or not.
+
+## HDMI audio (boot-arg `nvhdmiaudio`, default off)
+
+`src/NVHdmiAudio.cpp` is the GPU's half of HDMI audio on the HDMI port. Bit 0 (1): after an HDMI modeset, at a
+reconnect with the same EDID, and at a hot-plug it sends GSP-RM the unmuting general control packet, the stream
+unmute and the ELD built from the EDID (`nv_eld_build`) through `DFP_SET_ELD_AUDIO_CAPS` with PD=1 ELDV=1, as
+NVKMS's `nvHdmiDpEnableDisableAudio` does. Before a modeset the ELD goes invalid, at an unplug or detach it is
+cleared. Bit 1 (2): reads the ELD back through the GPU's HDA function (PCI function 1) when no driver owns it.
+Bit 2 (4): sets bit 25 of function 0's config register 0x488 if function 1 is absent (Linux quirk). The audio
+InfoFrame, ACR and the stream belong to the HDA driver, not to this kext. Results: ioreg `NVHdaFunction`,
+`NVDisplayAudio` on the NVBringup service and the `HDMI audio:` log lines.
