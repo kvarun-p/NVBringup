@@ -1218,6 +1218,18 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
         dispMthd(false, 0x1000 + i * 0x80, i >> 1);
     if (!dispCoreUpdate(0))
         FAIL("core update (head, SOR, window owner) did not complete");
+    // The SOR must have taken its owner. After a detach and replug it sometimes didn't: the control read 0 in the
+    // assembly and armed state after this update, with no exception, and the TV got no signal (2026-10-15; not on
+    // every try, likely GSP-RM's hot-plug handling resetting the SOR around our modeset). Sent again until it holds.
+    for (uint32_t t = 1; t <= 5 && rd32(0x688300 + sorIdx * 0x20) != (rmProto << 8 | 1u << head); t++) {
+        LOG("GSP: display: SOR %u control is 0x%x after the update, not 0x%x: attaching again (%u of 5)", sorIdx,
+            rd32(0x688300 + sorIdx * 0x20), rmProto << 8 | 1u << head, t);
+        IOSleep(200);
+        dispMthd(false, 0x300 + sorIdx * 0x20, rmProto << 8 | 1u << head);
+        dispCoreUpdate(0);
+    }
+    if (rd32(0x688300 + sorIdx * 0x20) != (rmProto << 8 | 1u << head))
+        FAIL("the SOR did not take its owner");
     {
         // Diagnostics (relight gives no signal, 2026-10-15): the SOR's control in the core's assembly and armed
         // state after the update, against what was written, with the channel's position and exception state.
@@ -1461,8 +1473,10 @@ void NVBringup::dispBlank()
         dispMthd(false, 0x2088, 0);                                               // CONTEXT_DMA_CURSOR: none
         d.cursOn = false;
     }
+    // SOR_SET_CONTROL: no owner, the protocol kept (NVKMS's ORSetControl with an empty owner mask; at boot the
+    // SOR's control reads 0x100, TMDS without an owner)
     if (d.sorIdx != ~0u)
-        dispMthd(false, 0x300 + d.sorIdx * 0x20, 0);                              // SOR_SET_CONTROL: no owner
+        dispMthd(false, 0x300 + d.sorIdx * 0x20, d.proto << 8);
     // HEAD_SET_DISPLAY_ID 0: no display on the head any more, which is how GSP-RM learns the display is off
     // (NVKMS nvkms-evo.c "Tell RM that there is no DisplayID is associated with this head anymore", nouveau
     // dispnv50 display_id(head, 0)). Without it GSP-RM kept head 0 -> 0x400 and the relight's SOR attach
