@@ -471,6 +471,7 @@ firmware and your Mesa and llama.cpp builds. By hand:
 | `nvhdmi20=1` | With `nvdisp=2`: HDMI 2.0 modes above 340 MHz TMDS (4K60 at 594 MHz) for an HDMI sink with SCDC and a higher Max_TMDS_Character_Rate. Untested on hardware: the 4K60 TV is not here. Default off |
 | `nvdpipe=1` | With `nvdisp=2`: the display pipe (step 9): NVDisplayNub from boot for NVFramebuffer, and NVMetalAccel on the GPU's PCI device. `sudo nvram nvdpipe-once=1` does it for one boot (NVBringup deletes the variable) |
 | `nvdpms=0` | With `nvdisp=2`: keep the HDMI signal on while macOS sleeps the display |
+| `nvlocksplit=1` | Display flows (hot-plug tick, DPMS, flips, the pipe's copy, the cursor image) take a display lock in front of the GSP lock and give the GSP lock up across their sleeps (relight retries, channel and notifier waits), so a modeset no longer stalls EXEC. Default off (one lock). `NVLockSplit` and `NVLockStats` in `ioreg -l -w0 \| grep NVLock` show the mode and per-lock hold and wait counters; kdebug 0x30/0x31 (nv_trace.h) |
 | `nvhpdevent=0` | With `nvdisp=2`: poll the connect state once a second instead of using GSP-RM's hot-plug events (the poll uses GSP-RM's cached state while lit, which misses short unplugs) |
 | `nvunplug=0` | With `nvdisp=2`: detach the output on every unplug and do a full modeset on replug, instead of keeping it running and only taking the display offline. `sudo nvram nvunplug-detach=1` does it for the next unplug only |
 | `nvswcursor=1` | With the display pipe: no hardware cursor; WindowServer draws it |
