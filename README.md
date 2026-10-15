@@ -474,6 +474,13 @@ firmware and your Mesa and llama.cpp builds. By hand:
 
 - **Start with `tools/verify_install.sh`:** it points at the failing step. More recipes (logs,
   device-lost, power) are in [docs/howto.md](docs/howto.md).
+- **Display pipe frame rate and latency:** `tools/nvframes` prints NVBringup's per-120-flip timing (copy, queue,
+  latch, gap) and the accelerator's submissions per second and GPU/CPU copy counts, from the registry, without
+  privileges.
+- **Where a frame's time goes:** `tools/nvtrace record --kernel` records NVMetal's os_signposts (needs
+  `NVMETAL_SIGNPOST=1` in the app's environment, or in `/Library/Preferences/io.github.kvarun-p.nvmetal.env` for
+  WindowServer) and NVBringup's kdebug points (`ktrace`, root) together; `tools/nvtrace merge <dir>` prints one
+  time-sorted timeline. `tools/nvtrace codes` lists the kernel points (`src/nv_trace.h`).
 - **`NVFrtsResult` is "refused" with "WPR2 already set up":** the GPU is still secured from a
   previous session, usually after restarting from another OS. Shut down fully and power on.
 - **GSP-RM doesn't boot:** check `/Library/Logs/NVBringup/boot-*.txt`. The boot-args must
