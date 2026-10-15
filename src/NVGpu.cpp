@@ -1042,11 +1042,16 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
     PE_parse_boot_argn("nvhdmi", &hdmiArg, sizeof(hdmiArg));
     const uint32_t sinkMax = nv_sink_max_tmds_khz(&sink);
     const bool hdmi20 = hdmi20Arg != 0 && hdmiArg != 0 && sink.hdmi && sink.hf && sink.scdc && sinkMax > 340000;
+    // The OR figure is RM's for single-link DVI (165 MHz, "The RM returns a 165MHz max pclk for single link TMDS",
+    // nvkms-dpy.c): NVKMS replaces it with the SOR's TMDS maximum for an HDMI sink, so it limits only a DVI sink
+    // here. Taking it for HDMI too capped HDMI at 165 MHz (1080p60 fit under it; 1440p60 and 1080p120 didn't).
     uint32_t linkMax = 340000;
-    if (orLimit >= 25000 && orLimit < linkMax)      // kHz; anything below VGA's clock is not believed
-        linkMax = orLimit;
-    if (!sink.hdmi && linkMax > 165000)
-        linkMax = 165000;
+    if (!sink.hdmi) {
+        if (orLimit >= 25000 && orLimit < linkMax)  // kHz; anything below VGA's clock is not believed
+            linkMax = orLimit;
+        if (linkMax > 165000)
+            linkMax = 165000;
+    }
     if (hdmi20) {
         // The SOR's TMDS maximum: SOR_CLK_CAP TMDS_MAX (0x608, 10 MHz units) on C573, reset value 0x3C = 600 MHz
         // (clc573.h NVC573_SOR_CLK_CAP_TMDS_MAX_INIT). NVKMS reads it from the caps notifier; this doesn't, so it
