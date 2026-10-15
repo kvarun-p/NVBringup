@@ -573,6 +573,10 @@ static int child_hang(void)
         pause();
 }
 
+// vram_used is the whole GPU's: with WindowServer on NVMetal it moves by what other processes allocate or free
+// meanwhile (-68 KiB, +200 KiB on 2026-10-15). Up to 1 MiB of that is tolerated; the child holds 64 MiB.
+static const uint64_t kOtherClients = 1 << 20;
+
 static void test_kill(struct tdev *main, const char *self)
 {
     printf("[5c] process killed with a blocked context\n");
@@ -595,13 +599,12 @@ static void test_kill(struct tdev *main, const char *self)
         usleep(100000);
         nvmac_refresh_info(main->d);
         after = nvmac_info(main->d)->vram_used;
-        if (after <= before)
+        if (after <= before + kOtherClients)
             break;
     }
     CHECK(during >= before + (64 << 20), "child held its VRAM (%+lld MiB)", (long long)(during - before) >> 20);
-    // vram_used is the whole GPU's: with WindowServer on NVMetal it also moves by what other processes free or
-    // allocate meanwhile, so only more than before counts as a leak.
-    CHECK(after <= before, "all of it freed after SIGKILL (%+lld KiB left)", (long long)(after - before) >> 10);
+    CHECK(after <= before + kOtherClients, "all of it freed after SIGKILL (%+lld KiB left)",
+          (long long)(after - before) >> 10);
     uint32_t c2, s2;
     TRY(nvmac_ctx_create(main->d, NVMAC_ENGINE_COMPUTE | NVMAC_ENGINE_3D | NVMAC_ENGINE_COPY, &c2, &s2));
     CHECK(copy_roundtrip(main, c2, s2, 64 << 10, 1) == 0, "GPU still works");
