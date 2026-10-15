@@ -336,5 +336,13 @@ ioreg `NVLog` (`nvgsp status` shows only the `GSP:` lines).
 On this TU117 laptop (2026-10-16): with `nvhdmiaudio=3` the codec (vendor 0x10de0094) reports the TV on pin 4 with
 a valid ELD identical to the one sent. macOS needs DeviceProperties for AppleHDAController to take function 1:
 `hda-gfx` = `onboard-2` on the GPU and on `PciRoot(0x0)/Pci(0x1,0x0)/Pci(0x0,0x1)`, which also gets `layout-id`
-7 (the Intel pair keeps `onboard-1`). With those alone AppleHDA asserted in IOHDACodecDevice and no output
-appeared; bit 3 is the next thing tried.
+7 (the Intel pair keeps `onboard-1`). That alone attaches nothing: AppleHDAController::probe accepts only the PCI
+IDs in its own table (16 NVIDIA ones, up to GK10x; not 10de:10fa) and, for a provider not named HDEF/HDAU, only with
+the boot-arg `hdax=1` (scratchpad/hda-attach-2026-10-16/REPORT.md). Bit 3's snoop bytes read 0 and ignore writes on
+TU117, so they are not it.
+
+`hdmiaudio/` builds NVHDAPatch.kext, a Lilu plugin (OpenCore Kernel → Add after Lilu) that rewrites the table's
+10de:0e1b record to 10de:10fa (boot-arg `nvhdadid` for another ID) when AppleHDAController loads; `-nvhdaoff` turns
+it off. With `hdax=1` the controller should then attach. Building it needs a Lilu source tree and acidanthera's
+MacKernelSDK (see its Makefile). What AppleHDA needs from the graphics side afterwards (an IODisplay below a node with
+the same `hda-gfx` and `connector-type` 0x800) is not done yet.
