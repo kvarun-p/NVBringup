@@ -17,6 +17,11 @@
 // 0x12  PIPE_FLIP   NONE         flip number    target buffer          lines to vblank   wait for a free buffer, ticks
 // 0x20  FLIP_LATCH  START        buffer         -                      -                 -
 // 0x20  FLIP_LATCH  END          how (see below) wait, ticks           latch raster line -
+// 0x30  LOCK_WAIT   NONE         lock (0 gsp, 1 disp)  wait, abs units         -                 -
+// 0x31  LOCK_HOLD   NONE         lock                   hold, abs units         -                 -
+//
+// LOCK_WAIT (a contended acquire) and LOCK_HOLD (a hold over 1 ms) are emitted at the release/acquire; the abs units
+// are mach_absolute_time ticks, as the stamps. The holder's site is in the NVLockStats registry property.
 //
 // FLIP_LATCH how: 0 timeout, 1 notifier left NOT_BEGUN, 2 armed state is the new buffer, 3 armed with no vblank seen.
 // Arguments are raw uintptr_t values; unused ones are 0.
@@ -33,6 +38,8 @@
 #define NV_TRACE_PIPE_COPY  0x10                       // START and END
 #define NV_TRACE_PIPE_FLIP  0x12
 #define NV_TRACE_FLIP_LATCH 0x20                       // START and END
+#define NV_TRACE_LOCK_WAIT  0x30
+#define NV_TRACE_LOCK_HOLD  0x31
 
 #define NV_TRACE_ID(code) KDBG_EVENTID(DBG_DRIVERS, NV_TRACE_SUBCLASS, (code))
 
