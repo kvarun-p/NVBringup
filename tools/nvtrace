@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+"""nvtrace: one timeline for a frame, from NVMetal's os_signpost points and NVBringup's kdebug points.
+
+  tools/nvtrace record [-t SECONDS] [-o DIR] [--kernel]   record while you run the app (see the recipe below)
+  tools/nvtrace merge DIR [--kernel-unit ticks|ns] [--limit N]
+                                                          one time-sorted timeline, printed and in DIR/timeline.txt
+  tools/nvtrace codes                                     the kernel code table (src/nv_trace.h)
+  tools/nvtrace selftest                                  merge on synthetic records (no privileges, no GPU)
+
+Recording:
+  signposts   `log stream --signpost` on subsystem io.github.kvarun-p.nvmetal. No privileges needed, and it sees the
+              signposts of every process that has NVMetal loaded (the app's, and WindowServer's when NVMetal is there).
+  kernel      `sudo ktrace trace --ndjson -f S0x064e`: class DBG_DRIVERS (6), subclass 'N' (0x4e), the NVBringup points.
+              Needs root, so `record --kernel` runs it under sudo and asks for the password in this terminal.
+Clocks:
+  Both sides stamp mach_absolute_time ticks (log entries as "machTimestamp", kdebug as its timestamp), so the
+  merge needs no offset. `ktrace` may print wall-clock or continuous time instead: --kernel-unit says what the
+  kernel records hold ("ticks", the default, or "ns"). Check the first recording with `tools/nvtrace merge` and the
+  kernel points' times against the signposts' before trusting the order (the merge prints both ends of each side).
+Inferred, not yet checked on hardware: the ktrace --ndjson field names (timestamp, debugid, arg1..arg4); the merge
+accepts the variants it knows and reports the keys it did not find.
+
+Requires Python 3.9 or later, macOS only (mach_timebase_info through ctypes). No third-party packages.
+"""
+import argparse
+import ctypes
+import datetime
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SUBSYSTEM = "io.github.kvarun-p.nvmetal"
+LOG = "/usr/bin/log"          # `log` is a zsh builtin in interactive shells: always the binary
+KTRACE = "/usr/bin/ktrace"
+REPO = Path(__file__).resolve().parent.parent
+
+# NVBringup's kernel points (src/nv_trace.h): code -> (name, {func: label})
+DBG_DRIVERS = 6
+NV_SUBCLASS = 0x4e
+KERNEL_CODES = {
+    0x01: ("EXEC", ("context", "seqno", "pushes", "waits")),
+    0x10: ("PIPE_COPY", ("copy id", "source slot", "target", "rows")),
+    0x12: ("PIPE_FLIP", ("flip number", "target", "lines to vblank", "free-buffer wait ticks")),
+    0x20: ("FLIP_LATCH", ("buffer", "how", "wait ticks", "latch line")),
+}
+FUNC_NAMES = {0: "", 1: "START", 2: "END"}   # the event (func 0) has no suffix
+FLIP_HOW = {0: "timeout", 1: "notifier", 2: "armed state", 3: "armed, no vblank seen"}
+
+
+class Timebase(ctypes.Structure):
+    _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
+
+
+def timebase_ns_per_tick():
+    """mach_absolute_time ticks to nanoseconds, as this Mac's kernel reports them"""
+    libsystem = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+    tb = Timebase()
+    libsystem.mach_timebase_info(ctypes.byref(tb))
+    return tb.numer / float(tb.denom)
+
+
+def decode_debugid(d):
+    cls, sub = (d >> 24) & 0xff, (d >> 16) & 0xff
+    code, func = (d >> 2) & 0x3fff, d & 3
+    return cls, sub, code, func
+
+
+def parse_int(v):
+    if isinstance(v, bool):
+        return int(v)
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str):
+        return int(v, 0)
+    return None
+
+
+def record(args):
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    out = Path(args.out) if args.out else REPO / "build" / "nvtrace" / stamp
+    out.mkdir(parents=True, exist_ok=True)
+    print("recording %s s into %s" % (args.seconds, out))
+    sig_file = open(out / "signposts.ndjson", "w")
+    sig = subprocess.Popen(
+        [LOG, "stream", "--style", "ndjson", "--signpost", "--predicate",
+         'subsystem == "%s"' % SUBSYSTEM],
+        stdout=sig_file, stderr=subprocess.DEVNULL)
+    kern = None
+    if args.kernel:
+        # sudo asks for the password on this terminal before ktrace starts
+        kern = subprocess.Popen(
+            ["sudo", KTRACE, "trace", "--ndjson", "-f", "S0x%02x%02x" % (DBG_DRIVERS, NV_SUBCLASS),
+             "-T", "%ds" % args.seconds],
+            stdout=open(out / "kdebug.ndjson", "w"), stderr=subprocess.PIPE)
+    try:
+        time.sleep(args.seconds)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sig.send_signal(signal.SIGINT)
+        sig.wait()
+        sig_file.close()
+        if kern is not None:
+            try:
+                kern.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                kern.send_signal(signal.SIGINT)
+                kern.wait()
+            err = kern.stderr.read().decode("utf-8", "replace").strip()
+            if kern.returncode:
+                print("ktrace failed (%d): %s" % (kern.returncode, err), file=sys.stderr)
+    print("signposts: %s" % (out / "signposts.ndjson"))
+    if args.kernel:
+        print("kernel: %s" % (out / "kdebug.ndjson"))
+    print("merge with: tools/nvtrace merge %s" % out)
+    return 0
+
+
+def read_ndjson(path):
+    rows = []
+    with open(path, "r", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                pass
+    return rows
+
+
+def signpost_events(rows, unknown):
+    """log entries of our subsystem: (ticks, source, label, detail)"""
+    out = []
+    for r in rows:
+        if r.get("subsystem") != SUBSYSTEM and not r.get("signpostName"):
+            continue
+        ticks = parse_int(r.get("machTimestamp"))
+        if ticks is None:
+            unknown.add("machTimestamp")
+            continue
+        # `log stream` and `log show` give signpostType begin/end/event (eventType is signpostEvent for all three)
+        kind = r.get("signpostType") or r.get("eventType", "")
+        short = {"begin": "BEGIN", "end": "END", "event": "event", "signpostIntervalBegin": "BEGIN",
+                 "signpostIntervalEnd": "END", "signpostEvent": "event"}.get(kind, kind)
+        name = r.get("signpostName") or r.get("eventMessage", "")
+        sid = r.get("signpostID", "")
+        detail = "%s id %s pid %s %s" % (short, sid, r.get("processID", "?"), r.get("eventMessage", ""))
+        out.append((ticks, "nvmetal", name, detail.strip(), (sid, short)))
+    return out
+
+
+KERNEL_TIME_KEYS = ("timestamp", "time", "ticks")
+KERNEL_ARG_KEYS = ("arg1", "arg2", "arg3", "arg4")
+
+
+def kernel_events(rows, unit, unknown):
+    """NVBringup's points: (ticks, source, label, detail, key)"""
+    out = []
+    scale = 1.0 / timebase_ns_per_tick() if unit == "ns" else 1.0
+    for r in rows:
+        d = parse_int(r.get("debugid"))
+        if d is None:
+            unknown.add("debugid")
+            continue
+        cls, sub, code, func = decode_debugid(d)
+        if cls != DBG_DRIVERS or sub != NV_SUBCLASS:
+            continue
+        t = None
+        for k in KERNEL_TIME_KEYS:
+            if k in r:
+                t = parse_int(r[k])
+                break
+        if t is None:
+            unknown.add("timestamp")
+            continue
+        args = []
+        for k in KERNEL_ARG_KEYS:
+            v = parse_int(r.get(k))
+            args.append(v if v is not None else 0)
+        name, labels = KERNEL_CODES.get(code, ("code 0x%02x" % code, ()))
+        fn = FUNC_NAMES.get(func, "")
+        if code == 0x20 and fn == "END":
+            how = FLIP_HOW.get(args[0], "?")
+            detail = "how %d (%s)" % (args[0], how)
+        elif code == 0x10 and fn == "END":
+            detail = "copy %d ok %d, %d us, flipping %d" % tuple(args)
+        else:
+            detail = ", ".join("%s %d" % (lab, v) for lab, v in zip(labels, args))
+        out.append((int(round(t * scale)), "kernel", name + (" " + fn if fn else ""), detail,
+                    (code, fn, args[0])))
+    return out
+
+
+def merge(args):
+    d = Path(args.dir)
+    unknown = set()
+    sig = read_ndjson(d / "signposts.ndjson") if (d / "signposts.ndjson").exists() else []
+    kern = read_ndjson(d / "kdebug.ndjson") if (d / "kdebug.ndjson").exists() else []
+    events = signpost_events(sig, unknown) + kernel_events(kern, args.kernel_unit, unknown)
+    if not events:
+        print("nothing to merge in %s (signposts %d, kernel records %d)" % (d, len(sig), len(kern)))
+        if unknown:
+            print("keys not found: %s" % ", ".join(sorted(unknown)))
+        return 1
+    events.sort(key=lambda e: e[0])
+    ns_per_tick = timebase_ns_per_tick()
+    t0 = events[0][0]
+
+    def ms(t):
+        return (t - t0) * ns_per_tick / 1e6
+
+    # One line per event, then a summary per command buffer: its interval and the kernel points inside it.
+    lines = ["# nvtrace timeline: %d events (signposts %d, kernel %d); time 0 is the first event"
+             % (len(events), sum(1 for e in events if e[1] == "nvmetal"),
+                sum(1 for e in events if e[1] == "kernel")),
+             "# times are mach ticks converted to ms (ticks/ns %.3f); kernel points are joined to a command buffer by"
+             " time window only (inferred)" % ns_per_tick, ""]
+    for t, src, name, detail, _ in events:
+        lines.append("%10.3f ms  %-7s %-24s %s" % (ms(t), src, name, detail))
+    # command buffers: pair the "command buffer" interval by its signpost id
+    open_cb, summary = {}, []
+    for t, src, name, detail, key in events:
+        if src != "nvmetal" or name != "command buffer":
+            continue
+        sid, short = key
+        if short == "BEGIN":
+            open_cb[sid] = t
+        elif short == "END" and sid in open_cb:
+            summary.append((open_cb.pop(sid), t, sid))
+    lines += ["", "# command buffers (commit to completion) and the kernel points inside each:"]
+    for start, end, sid in summary[-args.limit:]:
+        inside = [e for e in events if e[1] == "kernel" and start <= e[0] <= end]
+        flips = sum(1 for e in inside if e[2].startswith("PIPE_FLIP"))
+        copies = sum(1 for e in inside if e[2].startswith("PIPE_COPY START"))
+        lines.append("  cb %-12s %8.3f ms  kernel: %d pipe copies, %d flips armed, %d other points"
+                     % (sid, (end - start) * ns_per_tick / 1e6, copies, flips,
+                        len(inside) - copies - flips))
+    if unknown:
+        lines += ["", "# keys not found in the records: %s" % ", ".join(sorted(unknown))]
+    text = "\n".join(lines) + "\n"
+    (d / "timeline.txt").write_text(text)
+    print(text, end="")
+    return 0
+
+
+def codes(_args):
+    print("NVBringup kernel points: class DBG_DRIVERS (6), subclass 0x4e ('N'), debugid = KDBG_EVENTID(6, 0x4e, code)")
+    for code, (name, labels) in sorted(KERNEL_CODES.items()):
+        print("  0x%02x %-10s args: %s" % (code, name, ", ".join(labels)))
+    print("  func: START (1) and END (2) bracket an interval; none (0) is an event")
+    print("  ktrace decode 0x%08x   # EXEC" % (DBG_DRIVERS << 24 | NV_SUBCLASS << 16 | 0x01 << 2))
+    return 0
+
+
+def selftest(_args):
+    """merge on synthetic records: checks the sort, the decoding, the join by time window, and the unit switch"""
+    import tempfile
+    tb = timebase_ns_per_tick()
+    base = 1000000
+    sig = [
+        {"eventType": "signpostEvent", "signpostType": "begin", "subsystem": SUBSYSTEM, "signpostName": "command buffer",
+         "signpostID": "7", "machTimestamp": base, "processID": 1, "eventMessage": "2 surface writes"},
+        {"eventType": "signpostEvent", "signpostType": "event", "subsystem": SUBSYSTEM, "signpostName": "submitted",
+         "signpostID": "7", "machTimestamp": base + 200000, "processID": 1, "eventMessage": "seq 3"},
+        {"eventType": "signpostEvent", "signpostType": "event", "subsystem": SUBSYSTEM, "signpostName": "IOSurface",
+         "signpostID": "7", "machTimestamp": base + 900000, "processID": 1, "eventMessage": "id 42"},
+        {"eventType": "signpostEvent", "signpostType": "end", "subsystem": SUBSYSTEM, "signpostName": "command buffer",
+         "signpostID": "7", "machTimestamp": base + 1000000, "processID": 1, "eventMessage": "status 4"},
+    ]
+
+    def dbg(code, func):
+        return (DBG_DRIVERS << 24) | (NV_SUBCLASS << 16) | (code << 2) | func
+
+    ker = [
+        {"timestamp": base + 300000, "debugid": dbg(0x10, 1), "arg1": 5, "arg2": 3, "arg3": 3, "arg4": 1000},
+        {"timestamp": base + 400000, "debugid": dbg(0x10, 2), "arg1": 5, "arg2": 1, "arg3": 900, "arg4": 1},
+        {"timestamp": base + 450000, "debugid": dbg(0x12, 0), "arg1": 6, "arg2": 1, "arg3": 4000, "arg4": 0},
+        {"timestamp": base + 2000000, "debugid": dbg(0x12, 0), "arg1": 7, "arg2": 2, "arg3": 4000, "arg4": 0},
+        {"timestamp": base + 500000, "debugid": (5 << 24) | 0x0001, "arg1": 0},   # another subsystem: skipped
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        with open(d / "signposts.ndjson", "w") as f:
+            for r in sig:
+                f.write(json.dumps(r) + "\n")
+        with open(d / "kdebug.ndjson", "w") as f:
+            for r in ker:
+                f.write(json.dumps(r) + "\n")
+        unknown = set()
+        ev = signpost_events(sig, unknown) + kernel_events(ker, "ticks", unknown)
+        ev.sort(key=lambda e: e[0])
+        names = [e[2] for e in ev]
+        # the second flip (+2 ms) is after the command buffer's end (+1 ms), so it is outside the window
+        want = ["command buffer", "submitted", "PIPE_COPY START", "PIPE_COPY END", "PIPE_FLIP", "IOSurface",
+                "command buffer", "PIPE_FLIP"]
+        if names != want:
+            print("selftest: merged order %s" % names, file=sys.stderr)
+            return 1
+        if unknown:
+            print("selftest: unexpected missing keys %s" % unknown, file=sys.stderr)
+            return 1
+        ns = kernel_events(ker[1:2], "ticks", set())[0][3]
+        if ns != "copy 5 ok 1, 900 us, flipping 1":
+            print("selftest: END detail is %r" % ns, file=sys.stderr)
+            return 1
+        # records in nanoseconds come back as ticks: base ticks is base * tb ns
+        ns_unit = kernel_events([dict(ker[0], timestamp=int(round((base + 300000) * tb)))], "ns", set())
+        if not ns_unit or abs(ns_unit[0][0] - (base + 300000)) > 2:
+            print("selftest: ns unit conversion off: %r" % ns_unit[:1], file=sys.stderr)
+            return 1
+        args = argparse.Namespace(dir=str(d), kernel_unit="ticks", limit=10)
+        import io
+        buf = io.StringIO()
+        real = sys.stdout
+        sys.stdout = buf
+        try:
+            rc = merge(args)
+        finally:
+            sys.stdout = real
+        text = buf.getvalue()
+        if rc != 0 or "cb 7" not in text or "2 pipe copies" in text:
+            print("selftest: merge output unexpected:\n%s" % text, file=sys.stderr)
+            return 1
+        if "1 flips armed" not in text:
+            print("selftest: the flip inside the command buffer was not counted:\n%s" % text, file=sys.stderr)
+            return 1
+    print("selftest ok: %d synthetic events merged in order; %.3f ns per tick here" % (len(ev), tb))
+    return 0
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    r = sub.add_parser("record")
+    r.add_argument("-t", "--seconds", type=int, default=10)
+    r.add_argument("-o", "--out")
+    r.add_argument("--kernel", action="store_true", help="also record the kernel points (sudo ktrace)")
+    r.set_defaults(fn=record)
+    m = sub.add_parser("merge")
+    m.add_argument("dir")
+    m.add_argument("--kernel-unit", choices=("ticks", "ns"), default="ticks")
+    m.add_argument("--limit", type=int, default=20, help="command buffers in the summary")
+    m.set_defaults(fn=merge)
+    sub.add_parser("codes").set_defaults(fn=codes)
+    sub.add_parser("selftest").set_defaults(fn=selftest)
+    args = ap.parse_args(argv)
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
