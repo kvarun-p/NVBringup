@@ -1,9 +1,14 @@
 # HDMI display on the NVIDIA GPU
 
 NVBringup lights the HDMI output at boot (boot-arg `nvdisp=2`, monitor connected): it does the modeset over
-GSP-RM and scans out one pitch-linear X8R8G8B8 surface in VRAM. This directory gets macOS to draw into it.
+GSP-RM and scans out pitch-linear X8R8G8B8 surfaces in VRAM. This directory gets macOS to draw into them, in one
+of two ways:
 
-## nvvdisplay (what works)
+- **The display pipe** (`nvdpipe=1`, with NVMetalAccel and NVMetal installed): NVFramebuffer.kext below is a real
+  macOS display, composited by WindowServer on the NVIDIA GPU. This is the main route since 2026-10-11.
+- **nvvdisplay:** a virtual display whose frames are captured and copied across. It needs no auxiliary kexts.
+
+## nvvdisplay (the virtual display)
 
 `vdisplay/nvvdisplay` creates a macOS virtual display (CGVirtualDisplay, the private API DeskPad and
 BetterDisplay use) with the monitor's EDID name and mode. It takes the frames WindowServer composes for that display
@@ -40,19 +45,25 @@ hand), then set `NVB_SIGN_IDENTITY` in `local.env`; `make -C display vdisplay` s
 Hot-plug: while GSP-RM runs with `nvdisp=2`, NVBringup listens for GSP-RM's hot-plug events and then checks the TMDS
 outputs' connect state every 300 ms until a change has held for two checks (otherwise every 5 s; once a second
 without events, or with `nvhpdevent=0`). On plug-in it reads the EDID and lights the output at its preferred mode
-(or the best one the port can carry), in HDMI mode with InfoFrames for an HDMI sink (see docs/display.md);
-on unplug it detaches window 0 and the SOR. Either way it bumps `NVDisplayGen`. nvvdisplay follows that counter: it
+(or the best one the port can carry), in HDMI mode with InfoFrames for an HDMI sink (see docs/display.md).
+On unplug it keeps the output running and only takes the display offline; the same sink plugged back in comes
+back without a modeset, another one gets a full modeset (`nvunplug=0`: detach on every unplug). Either way it
+bumps `NVDisplayGen`. nvvdisplay follows that counter: it
 removes the virtual display while nothing is lit, so macOS moves the windows back, and makes it again at the new
 monitor's mode. To be able to see a plug-in, `nvdisp=2` keeps the GPU powered even with no monitor, so the idle
 power-off never happens.
 
-## NVFramebuffer.kext (does not work, kept for reference)
+## NVFramebuffer.kext (the display pipe's framebuffer)
 
 An IOFramebuffer for the display NVBringup lights, so macOS sees the NVIDIA GPU's HDMI output as a
 screen. NVBringup does the modeset over GSP-RM (boot-arg `nvdisp=2`) and scans out one pitch-linear
 X8R8G8B8 surface in VRAM. This driver hands that surface to IOGraphics as the aperture (its physical
-BAR1 range), with the one mode it was lit at, and the sink's EDID over DDC. There's no acceleration:
-WindowServer draws into the aperture with the CPU. The vertical blank comes from a timer at the mode's refresh rate.
+BAR1 range), with the one mode it was lit at, and the sink's EDID over DDC (every block). With NVMetalAccel's
+display pipe (`accel/`), WindowServer composites with NVMetal and the pipe copies each frame into the scanout; on its
+own it is an unaccelerated framebuffer, which WindowServer doesn't accept (below). The vertical blank comes from a
+timer at the mode's refresh rate, re-phased from the head's raster line. It drives NVBringup's hardware cursor
+(`nvswcursor=1`: WindowServer's) and display sleep: `NVDisplaySleepWatch` follows the IODisplayWrangler's power
+state and turns the HDMI signal off below "dimmed" (`nvdpms=0`: never).
 
 - It matches `NVDisplayNub`, which NVBringup publishes while a display is lit, as a client of the GPU's
   IOPCIDevice (NVBringup is another client of that device, and owns the nub). Only with boot-arg `nvfb=1` or
@@ -65,8 +76,8 @@ WindowServer draws into the aperture with the CPU. The vertical blank comes from
   `NVDisplayFB` on the same nub and sends it `kMsgState` ('NVDB', the value NVBringup's `kNVDisplayMsgState` also
   uses). `kConnectionEnable` follows `Online`, `kConnectionCheckEnable` stays on, `kConnectionChanged` is raised until
   IOGraphics acknowledges it, and a change fires the connect interrupt (`kIOFBConnectInterruptType`) so IOGraphics
-  senses the connection again. The aperture stays valid while offline; a new surface gets a new aperture. Not yet
-  tested on hardware.
+  senses the connection again. The aperture stays valid while offline; a new surface gets a new aperture.
+  Verified with hot-plug on 2026-10-15.
 - Timing for the display pipe: `IOFBCurrentPixelCount` (htotal x vtotal) and `IOFBCurrentPixelClock` (Hz) are
   published on the framebuffer when the mode is set. The VBL timer delivers `'vbl '` through
   `registerForInterruptType` / `setInterruptState` at absolute deadlines of one frame, and `getVBLTime` returns
@@ -93,15 +104,16 @@ WindowServer draws into the aperture with the CPU. The vertical blank comes from
   plane block, one BGRA8 plane, and the pipeline-scaler block). Without them the set fails with 0x80e and CoreDisplay
   logs "Attempting to get capabilities when none exist" and presents nothing.
 
-On hardware (2026-10-09) WindowServer opens it as an unaccelerated display, then CoreDisplay looks for its display
-pipe every frame (`Unable to find display pipe for IOFB service`) and its compositor stops within a minute, the
-internal panel's too. It needs an accelerator with a display pipe on the NVIDIA GPU. The earlier attempts and the
-bugs found on the way are in [docs/display.md](../docs/display.md).
+Alone (2026-10-09), WindowServer opened it as an unaccelerated display, then CoreDisplay looked for its display
+pipe every frame (`Unable to find display pipe for IOFB service`) and its compositor stopped within a minute, the
+internal panel's too. With NVMetalAccel's display pipe and NVAGDCControl it works (2026-10-11). The attempts and
+the bugs found on the way are in [docs/display.md](../docs/display.md).
 
-It never supported mode changes, gamma, or sleep and wake (nvvdisplay handles the last).
+It doesn't support mode changes or gamma. Sleep and wake: the nub goes away at sleep and comes back at wake.
 
 Loading: IOGraphicsFamily is in the system kernel collection, so OpenCore can't inject this kext. It has to go in the
-auxiliary collection, the same way as NVMetalAccel:
+auxiliary collection, the same way as NVMetalAccel. `tools/nvctl install efi accel fb` installs it with the matching
+NVBringup and NVMetalAccel (they check each other's stack ABI and refuse a mismatch). By hand:
 
 ```
 sudo cp -R display/build/NVFramebuffer.kext /Library/Extensions/
@@ -109,5 +121,5 @@ sudo chown -R root:wheel /Library/Extensions/NVFramebuffer.kext
 sudo kmutil load -p /Library/Extensions/NVFramebuffer.kext   # approve in System Settings → Privacy & Security
 ```
 
-Then `sudo nvram nvfb-once=1` and reboot with the monitor connected and `nvdisp=2`: `ioreg -c NVFramebuffer` should
-show it on `NVDisplayNub`.
+Then reboot with the monitor connected and `nvdisp=2 nvdpipe=1` (or `sudo nvram nvdpipe-once=1` for one boot):
+`ioreg -c NVFramebuffer` should show it on `NVDisplayNub`.

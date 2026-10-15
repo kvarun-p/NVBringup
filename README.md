@@ -66,20 +66,19 @@ on any of them; FWSEC and GSP-RM only run with the boot-arg `nvexperimental=1`. 
   CAMetalLayer, which WindowServer composites on the Intel GPU (unmodified wgpu and MoltenVK
   apps run, for example vkcube). Only apps listed in an allow file get the GPU.
 - **H.264 video decode** through Vulkan Video (`NVK_EXPERIMENTAL=video`), on NVDEC.
-- **An HDMI monitor on the NVIDIA GPU (optional, `nvdisp=2`):** the kext lights the port over GSP-RM, and
-  `nvvdisplay` makes it a macOS screen. Arrangement, mirroring and full screen work, with tear-free flips,
-  hot-plug, and sleep and wake. The copy engine moves the frames (~55 frames/s at ~1.6 % CPU). See
-  [docs/display.md](docs/display.md).
+- **An HDMI monitor on the NVIDIA GPU (optional, `nvdisp=2`):** the kext lights the port over GSP-RM, in HDMI
+  mode with AVI/SPD InfoFrames. With the display pipe (`nvdpipe=1`, NVMetalAccel, NVFramebuffer and NVMetal) it
+  is a real macOS display that WindowServer composites with NVMetal on the NVIDIA GPU: arrangement, mirroring,
+  full screen, a hardware cursor, tear-free flips at vblank, hot-plug, display sleep, and sleep and wake. Without
+  the auxiliary kexts, `nvvdisplay` makes it a virtual display instead. See [docs/display.md](docs/display.md).
 
 ## What it can't do
 
-- **Display output only through a virtual display** (optional step 9). The kext lights a TMDS
-  (HDMI/DVI) port on the NVIDIA GPU at the monitor's preferred mode. WindowServer still composes everything
-  on the Intel GPU, and `nvvdisplay` copies it across: no mode switching, no HDMI audio or InfoFrames (TVs
-  may need their input set to PC). Capture uses ScreenCaptureKit, which Sequoia and Tahoe have too, but only
-  Sonoma is tested (the other GPU-side pieces aren't checked there either). A real framebuffer driver hangs
-  the boot, because macOS wants a Metal display pipeline for a GPU that drives a screen (see
-  [docs/display.md](docs/display.md)). DisplayPort is untested.
+- **One display mode, no HDMI audio** (optional step 9). The kext lights a TMDS (HDMI/DVI) port on the NVIDIA GPU at
+  the monitor's preferred mode (or the best one the port carries, up to 340 MHz): no mode switching or HiDPI
+  modes, no HDMI 2.0, no audio. The display pipe copies each frame into the scanout rather than scanning out
+  WindowServer's image directly. It relies on private IOAcceleratorFamily2 and AppleGraphicsDeviceControl
+  interfaces checked only on Sonoma, needs AMFI relaxed for WindowServer, and DisplayPort is untested.
 - **No OpenGL, OpenCL or CUDA.** Metal only with the optional Metal step, and only for apps
   that opt in: macOS itself (WindowServer, system apps) keeps using the Intel GPU. Metal
   features Turing or NVK lack aren't there: mesh and object shaders, ray tracing, imageblocks and
@@ -298,10 +297,19 @@ Enable "Launch at login" in its menu. Add the widget from the desktop's widget g
 ### 9. HDMI display (optional)
 
 For a monitor on a port the NVIDIA GPU drives (on the test laptop, HDMI). It keeps the GPU powered, even with no
-monitor connected, so that plugging one in can be noticed.
+monitor connected, so that plugging one in can be noticed. There are two ways to make it a macOS screen.
 
-1. Add `nvdisp=2` to the boot-args and reboot with the monitor connected. The port shows colour bars once
-   GSP-RM is up. `ioreg -r -c NVBringup -d 1 | grep NVDisplayModeset` should say `ok`.
+**The display pipe** (recommended; needs the Metal step):
+
+1. Install the three kexts and the NVMetal bundle from the same build: `tools/nvctl install efi accel fb`
+   (read the plan, then `--apply`), and the bundle with `accel/tools/nvmetal_root_install.sh install <bundle>`.
+2. Add `nvdisp=2 nvdpipe=1` to the boot-args (or `sudo nvram nvdpipe-once=1` for one boot) and reboot with the
+   monitor connected. `ioreg -c NVMetalAccelerator -d 1 | grep NVPipe` shows the pipe bound and copying.
+
+**The virtual display** (`nvvdisplay`, no auxiliary kexts):
+
+1. Add `nvdisp=2` to the boot-args and reboot with the monitor connected.
+   `ioreg -r -c NVBringup -d 1 | grep NVDisplayModeset` should say `ok`.
 2. Build and install the helper for your user (no sudo; a LaunchAgent that starts at login):
 
    ```bash
@@ -451,8 +459,11 @@ firmware and your Mesa and llama.cpp builds. By hand:
 | `nvdisp=2` | Light a connected HDMI/DVI port at boot and on hot-plug, for `nvvdisplay` (step 9). Keeps the GPU powered |
 | `nvhdmi=0` | With `nvdisp=2`: a DVI-style signal even for an HDMI sink (no HDMI mode, no InfoFrames), as before 2026-10-14 |
 | `nvrange=1` / `nvrange=2` | With `nvdisp=2`: RGB always full range / always limited (16-235). Default automatic: limited only for a CTA video format (e.g. 1080p60) on an HDMI sink that can't be told the range |
+| `nvdpipe=1` | With `nvdisp=2`: the display pipe (step 9): NVDisplayNub from boot for NVFramebuffer, and NVMetalAccel on the GPU's PCI device. `sudo nvram nvdpipe-once=1` does it for one boot (NVBringup deletes the variable) |
 | `nvdpms=0` | With `nvdisp=2`: keep the HDMI signal on while macOS sleeps the display |
-| `nvhpdevent=0` | With `nvdisp=2`: poll the connect state once a second instead of using GSP-RM's hot-plug events |
+| `nvhpdevent=0` | With `nvdisp=2`: poll the connect state once a second instead of using GSP-RM's hot-plug events (the poll uses GSP-RM's cached state while lit, which misses short unplugs) |
+| `nvunplug=0` | With `nvdisp=2`: detach the output on every unplug and do a full modeset on replug, instead of keeping it running and only taking the display offline. `sudo nvram nvunplug-detach=1` does it for the next unplug only |
+| `nvswcursor=1` | With the display pipe: no hardware cursor; WindowServer draws it |
 | `nvfb=1` | Experiment only, don't use: NVBringup publishes `NVDisplayNub` for NVFramebuffer.kext, and WindowServer stops within a minute (see docs/display.md). `sudo nvram nvfb-once=1` does the same for one boot |
 | `-nvoff` | Recovery: NVBringup, NVMetalAccel and NVFramebuffer all decline to start, and the GPU is left as the firmware left it. OpenCore rewrites the boot-args every boot, so add it to config.plist (from another computer if this one hangs) or keep a spare EFI with it |
 | `nvguard=1` | Boot-attempt guard: NVBringup counts boots in NVRAM `nv-boot-try`, and the boot daemon deletes it once WindowServer has run for a minute. After 2 boots in a row that never got there, the next boot is a safe one: `nvdpipe`, `nvdpipe-once`, `nvfb` and `nvfb-once` are ignored, `NVSafeMode` is published, and the auxiliary kexts stay out. `tools/nvctl boot-ok` clears the counter by hand. Needs the boot daemon from this version (`tools/install_daemon.sh`), or every third boot is a safe one |

@@ -4,10 +4,13 @@ How a monitor on the NVIDIA GPU's HDMI port becomes a macOS screen (boot-arg `nv
 and what was found on hardware. The test laptop (Lenovo IdeaPad L340-15IRH, GTX 1650 TU117) wires its HDMI
 port to the NVIDIA GPU: display `0x400`, TMDS, SOR 0. The Intel iGPU drives only the internal panel.
 
-In short, the kext lights the port over GSP-RM and scans out a buffer in VRAM. A user-space helper,
-`nvvdisplay` (`display/vdisplay/`), creates a macOS virtual display and copies what WindowServer draws there
-into that buffer with the GPU's copy engine, flipping three buffers at vblank. Usage is in
-[display/README.md](../display/README.md); installation is step 9 of the top-level README.
+In short, the kext lights the port over GSP-RM and scans out a buffer in VRAM. Since 2026-10-11 the HDMI port is a
+real macOS display (boot-arg `nvdpipe=1`): NVFramebuffer is its IOFramebuffer, NVMetalAccel gives it an
+IOAccelDisplayPipe, and WindowServer composites it with NVMetal on the NVIDIA GPU; each frame is copied into the
+scanout by the copy engine and flipped at vblank ([the display pipe](#what-works-the-display-pipe-nvdpipe1)). The
+earlier route, `nvvdisplay` (`display/vdisplay/`), a virtual display whose frames are captured and copied across,
+still works without the auxiliary kexts. Usage is in [display/README.md](../display/README.md); installation is
+step 9 of the top-level README.
 
 ## Lighting the port (the kext)
 
@@ -22,7 +25,8 @@ X8R8G8B8 buffer. The code is in `src/NVGpu.cpp`:
 - `dispSetMode`: per connect. The mode (below), SOR assignment (`DFP_ASSIGN_SOR`), HDMI or DVI
   (`SET_HDMI_ENABLE`), head timing and output range, both buffers (colour bars until something draws), window 0,
   then the HDMI InfoFrames.
-- `dispBlank`: per disconnect. Window 0 and the SOR are detached, the InfoFrames stopped.
+- `dispBlank`: per detach. Window 0 is cleared, the SOR loses its owner (keeping its protocol, as NVKMS's
+  `ORSetControl` does), the head's display ID goes to 0, and the InfoFrames stop.
 - `dispPower`: DPMS, from NVFramebuffer when macOS sleeps or wakes the display.
 
 **Found on hardware.** Each item cost a boot or more to find. All are now in the code:
@@ -71,10 +75,14 @@ checks that they read sanely first and logs them before and after.
   says "default". With QS, full range and the AVI InfoFrame says so. `nvrange=1`/`2` forces full/limited.
 - `nvhdmi=0` keeps the DVI-style signal. `NVDisplaySignal` says what was sent.
 
-**Display sleep (DPMS):** when macOS sleeps the display, NVFramebuffer's `kIOPowerAttribute` or `kConnectionPower`
-goes to 0 and the kext turns the signal off with `SET_MONITOR_POWER` (0x730295, NVKMS's DPMS for TMDS), keeping the
-head, the mode and the surfaces, so the sink goes to standby; waking turns it on. If GSP-RM refuses, the SOR is
-detached and waking relights it. `NVDisplayPower` shows the state; `nvdpms=0` ignores the requests.
+**Display sleep (DPMS):** NVFramebuffer can't be a power driver (`registerPowerDriver` panicked, see below), so
+IOGraphics never sends it `kIOPowerAttribute`, and WindowServer sends no `kConnectionPower` either. Instead a small
+object in NVFramebuffer (`NVDisplaySleepWatch`) registers as an interested driver of the IODisplayWrangler, whose
+power state is the display's (4 on, 3 dimmed, below that asleep). Below 3 the kext turns the signal off with
+`SET_MONITOR_POWER` (0x730295, NVKMS's DPMS for TMDS), keeping the head, the mode and the surfaces, so the sink goes
+to standby; waking turns it on. If GSP-RM refuses, the signal stays on (detaching the SOR instead led into the
+relight race below). It is ignored while the display is unplugged. `NVDisplayPower` shows the state; `nvdpms=0`
+turns it off. Verified 2026-10-15 with `pmset displaysleepnow`.
 
 **Hot-plug:** GSP-RM handles the HPD interrupts and posts `NV2080_NOTIFIERS_HOTPLUG` to an event object the kext
 allocates on its subdevice (`NV01_EVENT_KERNEL_CALLBACK_EX` with `NV01_EVENT_CLIENT_RM`, then
@@ -86,6 +94,25 @@ since HPD bounces while a cable goes in; otherwise every 5 s as a fallback. With
 to light is skipped until it's unplugged. The push buffers wrap with a JUMP to 0 (nouveau's `nv50_dmac_wind`), so modesets can
 repeat. A bigger mode gets new buffers. The old ones' VRAM stays allocated, because a user mapping may outlive the
 mode. `NVDisplayGen` changes on every connect and disconnect.
+
+**Unplug and replug (2026-10-15):**
+
+- An unplug keeps the output running: macOS sees the display go offline (`Online` false on the nub), but the head
+  and the SOR stay lit (`parkedId`). A replug of the same sink, the same EDID compared over its own length (GSP-RM's
+  EDID buffer is padded: 384 bytes for a 256-byte EDID), only brings it back online, without a modeset. Another
+  sink on the port gets a detach and a full modeset. `nvunplug=0` detaches on every unplug; the NVRAM one-shot
+  `nvunplug-detach=1` does it for the next unplug only, to test the relight.
+- The relight after a detach raced GSP-RM: on some tries the SOR's control read back 0x100 (no owner) in the
+  assembly and armed state after the core UPDATE, with no channel exception and the notifier finished, and the TV
+  got no signal. Others worked with the same sequence. GSP-RM runs the attach (the supervisor) itself, so the race
+  can't be seen from here. `dispSetMode` now checks the armed SOR control after the update and sends the attach
+  again, up to 5 times 200 ms apart ("attaching again (n of 5)" in the log; one retry was needed in 1 of 3 forced
+  relights); a SOR that never takes fails the modeset.
+- Found on the way: `dispBlank` never cleared `HEAD_SET_DISPLAY_ID`, so GSP-RM went on reporting head 0 -> 0x400
+  (`SYSTEM_GET_ACTIVE`) after a detach. NVKMS (`nvkms-evo.c`, "Tell RM that there is no DisplayID is associated
+  with this head anymore") and nouveau (`display_id(head, 0)`) clear it; so does the kext now.
+- The old once-a-second poll used GSP-RM's cached connect state while lit, which never showed a short unplug: the
+  output stayed lit through it, and that is why replugging seemed to work before hot-plug events.
 
 **Power:** to see a plug-in, the GPU has to be on, so with `nvdisp=2` the idle power-off never happens, even with
 no monitor. Without `nvdisp=2` nothing changes.
@@ -115,7 +142,7 @@ framebuffer once another GPU is accelerated; an unaccelerated framebuffer, as a 
 accelerator test in `accel/README.md` hit the same wall. The `class-code` injection that hides the GPU (see
 [hackintosh.md](hackintosh.md)) didn't cause this: GPUWrangler adopted the GPU anyway. Making this route work means an
 accelerator under the GPU's PCI device whose display pipe takes WindowServer's frames (NullMoth's driver does this on
-Sequoia, over NVKMS); not attempted yet.
+Sequoia, over NVKMS). That is what the display pipe below does.
 
 Found on the way, each a boot:
 
@@ -139,10 +166,45 @@ message (`kNVDisplayMsgState`, 'NVDB'), and it is not terminated or republished.
 IOFramebuffer connection attributes: `kConnectionEnable` is `Online`, `kConnectionCheckEnable` stays on,
 `kConnectionChanged` is raised until IOGraphics acknowledges it, and a change fires the connect interrupt
 (`kIOFBConnectInterruptType`) so IOGraphics senses the connection again. The aperture stays valid while offline. A
-mode that needs a bigger surface gets a new aperture. Sleep still tears the nub down and republishes it at wake. Not
-yet tested on hardware.
+mode that needs a bigger surface gets a new aperture. Sleep still tears the nub down and republishes it at wake.
 
-### What works: a virtual display (`nvvdisplay`)
+### What works: the display pipe (`nvdpipe=1`)
+
+Working since 2026-10-11: the macOS desktop on the HDMI display, composited by WindowServer with NVMetal on the
+NVIDIA GPU. Armed with boot-arg `nvdpipe=1`, or for one boot `sudo nvram nvdpipe-once=1`. The pieces:
+
+- **NVBringup** publishes `NVDisplayNub` once the display engine is up (above), holds the PCI device busy for up to
+  50 s so WindowServer's `IOKitWaitQuiet` waits for the framebuffer, and does the frame copies and flips
+  (`NVPipeCopy` through `callPlatformFunction`, `src/nv_pipe_copy.h`).
+- **NVFramebuffer** (`display/`) is the IOFramebuffer on that nub: one mode, the EDID, a vblank timer re-phased from
+  the head's raster line, a 256x256 hardware cursor (C57A PIO channel; `nvswcursor=1` for WindowServer's), and
+  display sleep (above). **NVAGDCControl** in the same kext is the AppleGraphicsDeviceControl provider IOPresentment
+  needs to find a framebuffer at all (selectors 1, 0x980, 0x921 and 0x711; details in display/README.md).
+- **NVMetalAccel** (`accel/`, PCI personality) is the accelerator with the `IOAccelDisplayPipe`, and publishes the
+  Metal plugin keys so CoreDisplay gets an MTLDevice for it. It sets class-code 0x030000 on itself, because OpenCore
+  spoofs the GPU's, and IOPresentment pairs an AGDC with an accelerator by that.
+- **NVMetal** (Mesa, `src/nouveau/air/metal`) is loaded into WindowServer (installed in the system volume with its
+  ICD and libraries embedded, for library validation; AMFI boot-args relaxed, see the README).
+- **Per frame:** WindowServer submits a transaction; `submitTransaction` has NVBringup copy the IOSurface into one
+  of three scanout buffers with the copy engine (one push, one wait), then flips window 0 to it at the next vblank.
+  `NVPipeTiming` on NVBringup (copy, queue, latch and flip-gap means and maxima per 120 flips) and `NVPipeSubmits`,
+  `NVPipeGpuCopies`, `NVPipeCpuCopies` on the accelerator show how it goes. The CPU copy is the fallback for
+  frames before the display is lit and across mode changes.
+
+Found on hardware, each a boot or more:
+
+| Symptom | Cause |
+|---|---|
+| CoreDisplay: `Unable to find display pipe` every frame | IOPresentment lists framebuffers only through AppleGraphicsDeviceControl services: NVAGDCControl |
+| Panic in `IOAccelDisplayPipe::init` | The family creates a resource on the accelerator: `newResource` and the sysmem/vidmem/memory-map classes must exist |
+| Menu bar items missing | IOSurface row alignment: NVMetal reported 256 bytes, CoreAnimation uses 16 |
+| Black flashes on the laptop panel in mirror mode | The kext wired WindowServer's IOSurface read-only (`kIODirectionOut`); Intel's driver then failed to wire it. Never wire a shared IOSurface read-only |
+| Video stutter, ~65 ms stalls | The once-a-second hot-plug check (full detection, DDC) held `gspLock_`; GSP-RM's cached state while lit, then hot-plug events |
+| Frames out of order, then flicker | Reads of IOSurfaces deferred to submit time, and `commitAndWaitUntilSubmitted` returning before the frame reached the surface; both fixed in NVMetal, with regression tests (scratchpad `s6/tests`) |
+| WindowServer aborts in `get_tile_pipeline` | NVMetal's `supportsFamily:` answered yes for every family (a missing brace), so CoreAnimation took the tile-shader blur path |
+| Slow window animations after login | Cold pipeline compiles in WindowServer, whose Mesa disk cache is off (ruid != euid): NVMetal's own pipeline and translation caches |
+
+### Earlier, and still working: a virtual display (`nvvdisplay`)
 
 `nvvdisplay` creates a virtual display (CGVirtualDisplay, the private CoreGraphics API DeskPad and BetterDisplay
 use) with the monitor's EDID name, size and mode. WindowServer treats it as an ordinary display: arrangement,
@@ -200,12 +262,12 @@ binary's ad-hoc signature, so a rebuild needs it granted again.
 
 ## Limitations and next steps
 
-- **HDMI without audio:** HDMI mode and InfoFrames (above) are new and untested on hardware; HDMI audio needs
-  the RM side (ELD, `SET_ELD_AUDIO_CAPS`) and a macOS driver for the GPU's HDA function. No HDMI 2.0 (above
-  340 MHz), no deep colour, no YCbCr output.
-- **One mode,** the preferred one or the best the port carries, and one head. No mode switching from macOS.
-- **Tested on Sonoma only.** The capture runs on Sequoia and Tahoe too. Those systems may ask from time to
-  time whether `nvvdisplay` may keep recording the screen, and Sonoma may show a recording indicator in the menu bar.
-- **Not scanned out directly:** every frame is composed on the Intel GPU and copied. Composing on the NVIDIA GPU
-  needs the Metal display pipeline above.
+- **HDMI without audio:** HDMI mode, InfoFrames and the range (verified 2026-10-15) are there; HDMI audio needs the
+  RM side (ELD, `SET_ELD_AUDIO_CAPS`) and a macOS driver for the GPU's HDA function. No HDMI 2.0 (above 340 MHz),
+  no deep colour, no YCbCr output.
+- **One mode,** the preferred one or the best the port carries, and one head. No mode switching or HiDPI modes.
+- **A copy per frame:** the display pipe copies each composited frame into the scanout. Scanning out NVMetal's
+  image directly (zero copy) is the next step.
+- **Tested on Sonoma only.** The private interfaces the display pipe uses (IOAcceleratorFamily2's vtables, AGDC
+  selectors) must be checked again on Sequoia and Tahoe (`make verify` in `accel/` and `display/`).
 - **The GPU stays powered with `nvdisp=2`,** monitor or not.

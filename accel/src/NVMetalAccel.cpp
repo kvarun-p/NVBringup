@@ -5,7 +5,7 @@
 //    display-pipe gate is armed.
 //  - IOPCIDevice (S1, the display pipe): on the GPU's PCI device, only while NVBringup on that device has
 //    NVDisplayPipeArmed = true. It owns an IOAccelDisplayPipe for NVBringup's NVFramebuffer, which copies
-//    WindowServer's plane 0 into the scanout (CPU copy, see NVDisplayPipe). It publishes the Metal plugin too
+//    WindowServer's plane 0 into the scanout (copy engine through NVBringup's NVPipeCopy, CPU as the fallback). It publishes the Metal plugin too
 //    (CoreDisplay needs an MTLDevice for the pipe's accelerator), marked NVDisplayPipeMode for the bundle.
 //
 // The accelerator does no GPU work of its own. It only gives IOAcceleratorFamily2 what its start() needs

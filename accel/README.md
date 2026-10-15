@@ -10,19 +10,25 @@ is nvmetal, built with NVK from nvbringup-mesa (branch `main`) and installed on 
 Two personalities (`probe()` picks one):
 
 - **IOResources** (`nvaccel=1`): Metal only, as before. Refused while NVBringup's `NVDisplayPipeArmed` is set.
-- **IOPCIDevice, `NVMetalDisplayPipe`** (S1, display pipe, no Metal plugin): on the GPU's PCI device, only while
-  NVBringup on that device has `NVDisplayPipeArmed = true`. Its IOAccelDisplayPipe binds NVBringup's
-  NVFramebuffer (a client of the same device's NVDisplayNub, at most two levels down) and copies plane 0 of
-  each WindowServer transaction into the scanout by CPU:
+- **IOPCIDevice, `NVMetalDisplayPipe`** (the display pipe): on the GPU's PCI device, only while NVBringup on that
+  device has `NVDisplayPipeArmed = true` (`nvdpipe=1` or `nvdpipe-once`). It publishes the Metal plugin keys too,
+  marked `NVDisplayPipeMode`, because CoreDisplay needs an MTLDevice for the pipe's accelerator, and sets
+  class-code 0x030000 on itself so IOPresentment pairs it with NVAGDCControl. Its IOAccelDisplayPipe binds
+  NVBringup's NVFramebuffer (a client of the same device's NVDisplayNub, at most two levels down) and puts plane 0
+  of each WindowServer transaction on the screen:
   - `validateTransaction`: plane 0 must be a `'BGRA'` IOSurface.
-  - `submitTransaction`: copies the dirty rect (whole surface if empty or invalid), clamped to the smaller of
-    surface and framebuffer, into the framebuffer's system aperture (write-combined). Completion is
-    synchronous: `isTransactionComplete` reports it, then `signalTransactionInterrupt` kicks the family.
+  - `submitTransaction`: NVBringup's `NVPipeCopy` (`src/nv_pipe_copy.h`) copies the surface into one of three
+    scanout buffers with the copy engine and flips window 0 to it at the next vblank. The CPU copy into the
+    framebuffer's write-combined aperture is the fallback, for frames before the display is lit or across a mode
+    change. The transaction completes once the copy is done (`isTransactionComplete`, then
+    `signalTransactionInterrupt` kicks the family); the 20 ms completion hold used against mirror flicker is gone,
+    since the cause was read-only wiring in NVBringup.
   - Setup: `enableAccelerator()` (accel+3192), accel+3528 set (every transaction completes inside submit), the
     config flag accel+3279 for the display-pipe user client, and a publish notification that binds the
     framebuffer once on its own work loop with `found_framebuffer`. The pipe count must grow or the bind fails.
   - Counters, as registry properties of the accelerator: `NVPipeSubmits`, `NVPipeCompletes`, `NVPipeErrors`,
-    `NVPipeLastError`, `NVPipeBound`.
+    `NVPipeLastError`, `NVPipeBound`, `NVPipeActive`, `NVPipeGpuCopies`, `NVPipeCpuCopies`, `NVPipeCopyUs`,
+    `NVPipeCopiedPct`. NVBringup publishes the flips' timing as `NVPipeTiming`.
   - Memory objects: the family makes every resource through `newResource` (and its IOSurface device cache, the
     sysmem and vidmem it wraps through `newSysMemory`/`newVidMemory`, and task mappings through `newMemoryMap`).
     Those return `NVMetalResource`, `NVMetalSysMemory`, `NVMetalVidMemory` and `NVMetalMemoryMap`, which answer
