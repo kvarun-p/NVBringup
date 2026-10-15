@@ -675,11 +675,13 @@ static void test_churn(struct tdev *main)
     // CAN_MAP VRAM is also mapped into BAR1, whose page tables are shared by all connections
     // and kept until unload: one 4 KiB table per 2 MiB of BAR1 window at most may appear.
     uint64_t bar1Pts = (nvmac_info(main->d)->bar1_size >> 21) << 12;
-    CHECK(after >= before && after - before <= bar1Pts && !((after - before) & 0xfff),
+    // Other clients' traffic (kOtherClients) either way on top.
+    const int64_t delta = (int64_t)(after - before);
+    CHECK(delta >= -(int64_t)kOtherClients && delta <= (int64_t)(bar1Pts + kOtherClients) && !(delta & 0xfff),
           "VRAM usage back to where it was after close (%+lld KiB while open, %+lld KiB after; "
-          "up to %llu KiB of shared BAR1 page tables allowed)",
-          (long long)(during - before) >> 10, (long long)(after - before) >> 10,
-          (unsigned long long)bar1Pts >> 10);
+          "up to %llu KiB of shared BAR1 page tables and %llu KiB of other clients' traffic allowed)",
+          (long long)(during - before) >> 10, (long long)delta >> 10, (unsigned long long)bar1Pts >> 10,
+          (unsigned long long)kOtherClients >> 10);
 }
 
 int main(int argc, char **argv)
