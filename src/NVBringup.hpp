@@ -241,6 +241,8 @@ private:
     bool     dispHdmiInfoFrames(uint32_t head, const nv_sink_caps &sink, uint8_t vic, uint8_t aspect,
                                 uint8_t q);
     void     dispHdmiInfoFramesOff(uint32_t head);
+    bool     dispHdmi20Sink(uint32_t displayId, const nv_sink_caps &sink, bool high);   // nvhdmi20: caps, SCDC
+    bool     dispScdcRead(uint32_t displayId, uint8_t offset, uint8_t *out);
     IOReturn dispPower(bool on);                // NV_DISPLAY_POWER_FN: DPMS for NVFramebuffer
     void     dispHpdArm();
     void     dispHpdEvent(const uint8_t *p, uint32_t len);    // NV_VGPU_MSG_EVENT_POST_EVENT, gspLock_ held

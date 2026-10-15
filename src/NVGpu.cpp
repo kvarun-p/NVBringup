@@ -1034,12 +1034,28 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
         else
             LOG("GSP: display: GET_PCLK_LIMIT failed (status 0x%x); assuming 340 MHz", st);
     }
+    // HDMI 2.0 (boot-arg nvhdmi20=1, default off): a sink whose HF-VSDB has SCDC and a TMDS rate above 340 MHz gets
+    // modes up to the SOR's TMDS maximum (see dispHdmi20Sink). The OR figure above is RM's single-link DVI number
+    // (165 MHz); NVKMS doesn't use it for HDMI either (nvkms-dpy.c nvDpyProbeMaxPixelClock, the SOR's caps instead).
+    uint32_t hdmi20Arg = 0, hdmiArg = 1;
+    PE_parse_boot_argn("nvhdmi20", &hdmi20Arg, sizeof(hdmi20Arg));
+    PE_parse_boot_argn("nvhdmi", &hdmiArg, sizeof(hdmiArg));
+    const uint32_t sinkMax = nv_sink_max_tmds_khz(&sink);
+    const bool hdmi20 = hdmi20Arg != 0 && hdmiArg != 0 && sink.hdmi && sink.hf && sink.scdc && sinkMax > 340000;
     uint32_t linkMax = 340000;
     if (orLimit >= 25000 && orLimit < linkMax)      // kHz; anything below VGA's clock is not believed
         linkMax = orLimit;
     if (!sink.hdmi && linkMax > 165000)
         linkMax = 165000;
-    const uint32_t sinkMax = nv_sink_max_tmds_khz(&sink);
+    if (hdmi20) {
+        // The SOR's TMDS maximum: SOR_CLK_CAP TMDS_MAX (0x608, 10 MHz units) on C573, reset value 0x3C = 600 MHz
+        // (clc573.h NVC573_SOR_CLK_CAP_TMDS_MAX_INIT). NVKMS reads it from the caps notifier; this doesn't, so it
+        // assumes the reset value.
+        const uint32_t sorMax = 600000;
+        linkMax = sinkMax < sorMax ? sinkMax : sorMax;
+        LOG("GSP: display: HDMI 2.0: link limit %u kHz (sink %u kHz, SOR %u kHz assumed; OR reported %u kHz)",
+            linkMax, sinkMax, sorMax, orLimit);
+    }
     // The preferred timing if it fits; else the biggest that fits at 50 Hz or more (a 4K TV beyond the port: 1080p60
     // rather than 4K30), then the highest refresh up to 60 Hz, then EDID order.
     const nv_edid_timing *mode = nullptr;
@@ -1089,8 +1105,7 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
     // (OCSC1 and the procamp's CEA range, as NVKMS's EvoSetProcAmpC5/EvoSetOCsc1C5) and the AVI InfoFrame says
     // "default", which for a CTA format is limited. With QS the head stays full and the AVI InfoFrame says so.
     // Boot-arg nvrange: 0 automatic (default), 1 always full, 2 always limited.
-    uint32_t hdmiArg = 1, rangeArg = 0;
-    PE_parse_boot_argn("nvhdmi", &hdmiArg, sizeof(hdmiArg));
+    uint32_t rangeArg = 0;
     PE_parse_boot_argn("nvrange", &rangeArg, sizeof(rangeArg));
     bool hdmi = sink.hdmi && hdmiArg != 0;
     uint8_t aspect = 0;
@@ -1162,6 +1177,13 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
         }
         d.hdmiOn = hdmi;
     }
+    if (hdmi20 && !hdmi && pclkKhz > 340000)
+        FAIL("HDMI 2.0: the mode needs an HDMI signal (SET_HDMI_ENABLE failed)");
+    // HDMI 2.0 above 340 MHz: the sink's caps to RM and the scrambled TMDS clock in the sink's SCDC, before the SOR's
+    // control (the link starts at the core update). At 340 MHz and below the sink's config is cleared, which a
+    // modeset from a scrambled mode needs.
+    if (hdmi20 && hdmi && !dispHdmi20Sink(displayId, sink, pclkKhz > 340000) && pclkKhz > 340000)
+        FAIL("HDMI 2.0: the sink's SCDC write failed");
     const bool limited = rangeArg == 2 || (rangeArg == 0 && hdmi && vic > 1 && !sink.qs);
     const uint8_t aviQ = !sink.qs ? 0 : limited ? 1 : 2;         // AVI Q: default, limited, full
 
@@ -1296,6 +1318,15 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
         LOG("GSP: display: sink: %s", si);
         setProperty("NVDisplaySink", si);
     }
+    if (hdmi20 && hdmi) {
+        // What the sink reports once the link runs: its TMDS config (0x20) and scrambler status (0x21, bit 0).
+        IOSleep(100);
+        uint8_t cfg = 0xff, scr = 0xff;
+        const bool okC = dispScdcRead(displayId, 0x20, &cfg), okS = dispScdcRead(displayId, 0x21, &scr);
+        LOG("GSP: display: HDMI 2.0: %u kHz, SCDC TMDS config %s0x%02x, scrambler status %s0x%02x (%s)", pclkKhz,
+            okC ? "" : "unread ", cfg, okS ? "" : "unread ", scr,
+            okS && (scr & 1) ? "scrambled" : pclkKhz > 340000 ? "NOT scrambled" : "not needed");
+    }
     // InfoFrames once the head and the SOR run (NVKMS nvUpdateInfoFrames after the modeset).
     d.vic = vic;
     d.dpmsOff = d.dpmsBySor = false;
@@ -1340,6 +1371,67 @@ enum { kSfAvi = 0, kSfGeneric = 1, kSfGcp = 3, kSfVsi = 4 };
 static bool sfUsable(uint32_t v)
 {
     return v != 0xffffffff && (v & 0xfff00000) != 0xbad00000;      // a PRI error reads as 0xbadXXXXX
+}
+
+// HDMI 2.0 above 340 MHz (boot-arg nvhdmi20), as NVKMS and nouveau set it up. (1) The sink's caps to RM,
+// NV0073_CTRL_CMD_SPECIFIC_SET_HDMI_SINK_CAPS (0x730293; u32 sub, displayId, caps: GT_340MHZ bit 0,
+// LTE_340MHZ_SCRAMBLING bit 1, SCDC bit 2), as NVKMS's nvSendHdmiCapsToRm (nvkms-hdmi.c:259-299) and nouveau's
+// r535_sor_hdmi_scdc (gsp/rm/r535/disp.c:489). (2) The sink's SCDC TMDS_Config, offset 0x20 of the SCDC slave
+// (I2C 0x54): bit 1 TMDS bit clock ratio 1/40, bit 0 scrambling enable. nouveau's dispnv50 nv50_hdmi_enable writes
+// it from the host with the kernel's DDC adapter before the modeset; NVKMS has no SCDC write at all, so on GSP-RM
+// the RM presumably does it from the caps and the mode. Writing the same value again is harmless, so both are done.
+// The DDC port comes from NV0073_CTRL_CMD_SPECIFIC_GET_I2C_PORTID (0x730211), the write from
+// NV0073_CTRL_CMD_SPECIFIC_DISP_I2C_READ_WRITE (0x7302ac). The slave address is 8-bit (0xa8 write): inferred from
+// the convention of DP2HDMI_DONGLE_I2C_ADDR (0x80, displayport.h), not checked against RM. Returns the write's status.
+bool NVBringup::dispHdmi20Sink(uint32_t displayId, const nv_sink_caps &sink, bool high)
+{
+    GspState *g = gsp_;
+    uint32_t st = 0;
+    uint8_t cp[12] = {};                                  // NV0073_CTRL_SPECIFIC_SET_HDMI_SINK_CAPS_PARAMS
+    put32(cp, 4, displayId);
+    put32(cp, 8, 1u | (sink.lte340 ? 2u : 0) | (sink.scdc ? 4u : 0));
+    if (!gspRmControl(g->hClient, g->hDisp, 0x730293, cp, sizeof(cp), &st))
+        LOG("GSP: display: HDMI 2.0: SET_HDMI_SINK_CAPS failed (status 0x%x)", st);
+    uint8_t pp[16] = {};                                  // NV0073_CTRL_SPECIFIC_GET_I2C_PORTID_PARAMS
+    put32(pp, 4, displayId);
+    if (!gspRmControl(g->hClient, g->hDisp, 0x730211, pp, sizeof(pp), &st)) {
+        LOG("GSP: display: HDMI 2.0: GET_I2C_PORTID failed (status 0x%x)", st);
+        return false;
+    }
+    uint32_t ddc = 0;
+    memcpy(&ddc, pp + 12, 4);                             // ddcPortId; 0 (I2C_PORT_NONE) is no port
+    if (!ddc) {
+        LOG("GSP: display: HDMI 2.0: no DDC port for 0x%x", displayId);
+        return false;
+    }
+    // NV0073_CTRL_SPECIFIC_DISP_I2C_READ_WRITE_PARAMS: u32 sub, i2cPort, i2cSlaveAddress, readWriteFlag, readWriteLen,
+    // readBuffer[128] at 20, writeBuffer[128] at 148. Write mode: [offset 0x20, value] in one transaction.
+    uint8_t io[276] = {};
+    put32(io, 4, ddc);
+    put32(io, 8, 0xa8);
+    put32(io, 12, 0);                                     // NV0073_CTRL_SPECIFIC_DISP_I2C_READ_WRITE_MODE_WRITE
+    put32(io, 16, 2);
+    io[148] = 0x20;                                       // SCDC TMDS_Config
+    io[149] = high ? 0x03 : 0x00;                         // bit 1 ratio 1/40, bit 0 scrambling
+    const bool ok = gspRmControl(g->hClient, g->hDisp, 0x7302ac, io, sizeof(io), &st);
+    LOG("GSP: display: HDMI 2.0: SCDC 0x20 = 0x%02x on DDC port %u: %s (status 0x%x)", io[149], ddc,
+        ok ? "written" : "FAILED", st);
+    return ok;
+}
+
+// The sink's SCDC register at offset (NV0073_CTRL_CMD_SPECIFIC_GET_HDMI_SCDC_DATA, 0x7302a6: u32 sub, displayId,
+// u8 offset, u8 data).
+bool NVBringup::dispScdcRead(uint32_t displayId, uint8_t offset, uint8_t *out)
+{
+    GspState *g = gsp_;
+    uint32_t st = 0;
+    uint8_t sd[12] = {};
+    put32(sd, 4, displayId);
+    sd[8] = offset;
+    if (!gspRmControl(g->hClient, g->hDisp, 0x7302a6, sd, sizeof(sd), &st, true))
+        return false;
+    *out = sd[9];
+    return true;
 }
 
 // AVI (with the VIC and quantization range), SPD, the HDMI vendor-specific InfoFrame for an HDMI 1.4 4K format, and
