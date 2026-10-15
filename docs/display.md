@@ -189,8 +189,10 @@ NVIDIA GPU. Armed with boot-arg `nvdpipe=1`, or for one boot `sudo nvram nvdpipe
 - **NVMetalAccel** (`accel/`, PCI personality) is the accelerator with the `IOAccelDisplayPipe`, and publishes the
   Metal plugin keys so CoreDisplay gets an MTLDevice for it. It sets class-code 0x030000 on itself, because OpenCore
   spoofs the GPU's, and IOPresentment pairs an AGDC with an accelerator by that.
-- **NVMetal** (Mesa, `src/nouveau/air/metal`) is loaded into WindowServer (installed in the system volume with its
-  ICD and libraries embedded, for library validation; AMFI boot-args relaxed, see the README).
+- **NVMetal** (Mesa, `src/nouveau/air/metal`) is loaded into WindowServer from `/Library/GPUBundles` (searched before
+  `/System/Library/Extensions`; WindowServer's sandbox allows it), with its ICD and libraries embedded and ad-hoc
+  signed, because WindowServer enforces library validation; `amfi_get_out_of_my_way=0x1` lets the ad-hoc signature
+  through (see the README).
 - **Per frame:** WindowServer submits a transaction; `submitTransaction` has NVBringup copy the IOSurface into one
   of three scanout buffers with the copy engine (one push, one wait), then flips window 0 to it at the next vblank.
   `NVPipeTiming` on NVBringup (copy, queue, latch and flip-gap means and maxima per 120 flips) and `NVPipeSubmits`,

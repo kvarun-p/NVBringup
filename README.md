@@ -245,12 +245,14 @@ first. `--list-devices` should list only the NVK GPU.
 
 ### 7. Metal acceleration (optional)
 
-Lets Metal apps you choose use the GPU. It changes the system volume, needs SIP partly off and
-is the least tested part: skip it if Vulkan is enough. Needs `NVMetal.bundle` from step 5.
+Lets Metal apps you choose use the GPU. It needs SIP partly off and is the least tested part: skip it if Vulkan
+is enough. Needs `NVMetal.bundle` from step 5.
 
-1. In `config.plist`: `csr-active-config` `03080000` (0x803) under NVRAM → Add →
-   `7C436110-AB2A-4BBB-A880-FE41995C9F82`, and add `nvaccel=1` to the boot-args. Turn FileVault
-   off. Reboot.
+1. In `config.plist`: `csr-active-config` under NVRAM → Add → `7C436110-AB2A-4BBB-A880-FE41995C9F82`, and add
+   `nvaccel=1` to the boot-args. Reboot. The setting so far has been `03080000` (0x803: kext signing for the
+   auxiliary kexts, plus filesystem protection and authenticated root off, which only the older system-volume install
+   below needs). With the bundle in `/Library/GPUBundles`, 0x001 should be enough and FileVault can stay on; that is
+   being tested.
 2. Build and install the accelerator kext (it can't go on the EFI: it links against a family
    in the system kernel collection, so it goes in the auxiliary one):
 
@@ -262,15 +264,20 @@ is the least tested part: skip it if Vulkan is enough. Needs `NVMetal.bundle` fr
    ```
 
    Reboot, then `kmutil showloaded | grep nvmetalaccel` should list it.
-3. Install `NVMetal.bundle` into `/System/Library/Extensions` (it mounts the system volume and
-   blesses a new snapshot, as OpenCore Legacy Patcher does), then reboot:
+3. Install `NVMetal.bundle` into `/Library/GPUBundles`, then reboot. Metal's bundle lookup
+   (`gpu_bundle_find_trusted` in libsystem_sandbox) searches there before `/System/Library/Extensions`, and
+   WindowServer's sandbox may read it (verified 2026-10-15). The script embeds the bundle's libraries and the NVK
+   driver, ad-hoc signed, so the Mesa build directory isn't needed afterwards. `tools/nvctl install bundle` does the
+   same with a backup.
 
    ```bash
    sudo accel/tools/nvmetal_root_install.sh install /path/to/mesa/build/src/nouveau/air/NVMetal.bundle
    ```
 
-   `remove` takes it out again; `revert` boots Apple's last sealed snapshot (undoes every root
-   change). Keep the Mesa build directory: the bundle loads NVK from there.
+   `remove` takes it out again. `--system` installs into `/System/Library/Extensions` instead, the older way: it
+   mounts the system volume and blesses a new snapshot, as OpenCore Legacy Patcher does, and needs 0x803 and
+   FileVault off. `revert` boots Apple's last sealed snapshot, which undoes every system-volume change. Keep
+   `/Library/GPUBundles` root-owned and not writable by others: whatever is there loads into WindowServer.
 4. Let apps in: list their executable names or paths, one per line, in
    `/Library/Preferences/io.github.kvarun-p.nvmetal.allow` (root-owned), or run a program with
    `NVMETAL_ALLOW=1`. Apps that are let in see the GPU as their default Metal device. System

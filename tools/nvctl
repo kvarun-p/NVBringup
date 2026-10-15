@@ -14,7 +14,7 @@ Components (default: the ones already installed, plus efi when an OpenCore EFI w
   efi       build/NVBringup.kext -> <EFI>/OC/Kexts (OpenCore loads it; reboot)
   accel     accel/build/NVMetalAccel.kext -> /Library/Extensions (auxiliary kext collection via kmutil; reboot)
   fb        display/build/NVFramebuffer.kext -> /Library/Extensions (auxiliary kext collection via kmutil; reboot)
-  bundle    the Mesa build's NVMetal.bundle -> /System/Library/Extensions (accel/tools/nvmetal_root_install.sh; reboot)
+  bundle    the Mesa build's NVMetal.bundle -> /Library/GPUBundles (accel/tools/nvmetal_root_install.sh; reboot)
   vdisplay  display/build/nvvdisplay -> ~/Library/Application Support/NVBringup (LaunchAgent; no sudo)
   daemon    the GSP-RM boot daemon (tools/install_daemon.sh)
 
@@ -44,8 +44,10 @@ REBOOT = {"efi", "accel", "fb", "bundle", "daemon"}
 BUNDLE_IDS = {"efi": "io.github.kvarun-p.nvbringup", "accel": "io.github.kvarun-p.nvmetalaccel",
               "fb": "io.github.kvarun-p.nvframebuffer"}
 STATE = "/Library/Application Support/nvctl"     # not .../NVBringup: tools/uninstall_daemon.sh deletes that folder
-RECOVERY = ("recovery: boot with -nvoff (all NVBringup kexts stay out); from macOS Recovery: "
-            "bless --mount /Volumes/<system> --bootefi --last-sealed-snapshot (drops the NVMetal.bundle); "
+RECOVERY = ("recovery: boot with -nvoff (all NVBringup kexts stay out); NVMetal out of WindowServer: "
+            "sudo touch /Library/Preferences/io.github.kvarun-p.nvmetal.disabled, or remove "
+            "/Library/GPUBundles/NVMetal.bundle (from macOS Recovery: under /Volumes/<data>/Library/GPUBundles); "
+            "an older copy in the system volume: bless --mount /Volumes/<system> --bootefi --last-sealed-snapshot; "
             "from another Mac: replace the USB's EFI with EFI-backup-<date>")
 
 
@@ -85,7 +87,7 @@ class Layout:
             return self.efi / "OC/Kexts/NVBringup.kext" if self.efi else None
         return {"accel": self.p("/Library/Extensions/NVMetalAccel.kext"),
                 "fb": self.p("/Library/Extensions/NVFramebuffer.kext"),
-                "bundle": self.p("/System/Library/Extensions/NVMetal.bundle"),
+                "bundle": self.p("/Library/GPUBundles/NVMetal.bundle"),
                 "vdisplay": self.home / "Library/Application Support/NVBringup/nvvdisplay",
                 "daemon": self.p("/Library/Application Support/NVBringup/nvgsp")}[comp]
 
@@ -284,7 +286,7 @@ def install_steps(comps, lay, cfg, repo, manifest, stamp, notes):
             steps.append(Step(c, "install %s" % dst, do_kext, undo_kext))
         elif c == "bundle":
             script = repo / "accel/tools/nvmetal_root_install.sh"
-            steps.append(Step(c, "install NVMetal.bundle (new system snapshot)",
+            steps.append(Step(c, "install NVMetal.bundle into /Library/GPUBundles",
                               lambda r, s=src: r.cmd(["/bin/zsh", script, "install", s], root=True),
                               (lambda r, b=backup: r.cmd(["/bin/zsh", script, "restore", b], root=True)) if had else
                               (lambda r: r.cmd(["/bin/zsh", script, "remove"], root=True))))
@@ -506,7 +508,7 @@ def cmd_rollback(args, lay, cfg, repo, out=print):
             removed.append(c)
             continue
         if c == "bundle":
-            steps.append(Step(c, "restore NVMetal.bundle from %s (new system snapshot)" % backup,
+            steps.append(Step(c, "restore NVMetal.bundle from %s" % backup,
                               lambda r, b=backup: r.cmd(["/bin/zsh", script, "restore", b], root=True)))
         elif c == "daemon":
             backup = bset / dst.name

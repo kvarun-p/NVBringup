@@ -7,7 +7,8 @@
 #   tools/uninstall.sh [-n|--dry-run] [component ...]
 #
 # Components (default: all of them, in this order):
-#   bundle    NVMetal.bundle out of /System/Library/Extensions (nvmetal_root_install.sh remove; a new snapshot)
+#   bundle    NVMetal.bundle out of /Library/GPUBundles (nvmetal_root_install.sh remove), and an older copy out of
+#             /System/Library/Extensions (remove --system: a new snapshot)
 #   accel     NVMetalAccel.kext out of /Library/Extensions
 #   fb        NVFramebuffer.kext out of /Library/Extensions (the display pipe's framebuffer and AGDC provider)
 #   vdisplay  nvvdisplay, the HDMI virtual display helper (display/vdisplay/install.sh -u; no sudo)
@@ -43,6 +44,7 @@ note() { print "  ${Y}$1${N}"; }
 err()  { print "  ${R}$1${N}"; NFAIL+=1; }
 run()  { print "  + ${(j: :)${(q-)@}}"; (( DRY )) || "$@"; }
 
+LIB_BUNDLE=/Library/GPUBundles/NVMetal.bundle
 SYS_BUNDLE=/System/Library/Extensions/NVMetal.bundle
 ACCEL=/Library/Extensions/NVMetalAccel.kext
 ACCEL_ID=io.github.kvarun-p.nvmetalaccel
@@ -62,13 +64,23 @@ fi
 # ---------------------------------------------------------------------------------------------
 if has bundle; then
     step "NVMetal.bundle"
-    if [[ ! -e $SYS_BUNDLE ]]; then
+    if [[ ! -e $LIB_BUNDLE && ! -e $SYS_BUNDLE ]]; then
         ok "not installed"
-    elif run sudo /bin/zsh accel/tools/nvmetal_root_install.sh remove; then
-        REBOOT+="NVMetal.bundle removal (a new system snapshot)"
-    else
-        err "nvmetal_root_install.sh remove failed (it needs csr-active-config 0x803 and FileVault off)"
-        note "alternative: sudo accel/tools/nvmetal_root_install.sh revert (Apple's last sealed snapshot; drops every root change)"
+    fi
+    if [[ -e $LIB_BUNDLE ]]; then
+        if run sudo /bin/zsh accel/tools/nvmetal_root_install.sh remove; then
+            REBOOT+="NVMetal.bundle removal"
+        else
+            err "nvmetal_root_install.sh remove failed"
+        fi
+    fi
+    if [[ -e $SYS_BUNDLE ]]; then
+        if run sudo /bin/zsh accel/tools/nvmetal_root_install.sh remove --system; then
+            REBOOT+="NVMetal.bundle removal from the system volume (a new system snapshot)"
+        else
+            err "nvmetal_root_install.sh remove --system failed (it needs csr-active-config 0x803 and FileVault off)"
+            note "alternative: sudo accel/tools/nvmetal_root_install.sh revert (Apple's last sealed snapshot; drops every root change)"
+        fi
     fi
 fi
 

@@ -4,8 +4,9 @@ An IOAccelerator for the GPU NVBringup drives, so Metal.framework lists the GPU 
 the NVMetal driver bundle (`MetalPluginName`) instead of needing `DYLD_INSERT_LIBRARIES`. It does no GPU
 work itself: it gives IOAcceleratorFamily2 what its `start()` needs, modelled on Apple's paravirt GPU
 driver (as Navi48-MacOS's Navi48Accel does). The bundle side (NVMetal.bundle, `NVMetalDevice : MTLIOAccelDevice`)
-is nvmetal, built with NVK from nvbringup-mesa (branch `main`) and installed on the system volume by
-`tools/nvmetal_root_install.sh`; installation is step 7 of the top-level README.
+is nvmetal, built with NVK from nvbringup-mesa (branch `main`) and installed into `/Library/GPUBundles` by
+`tools/nvmetal_root_install.sh` (`--system`: the system volume, the older way); installation is step 7 of the
+top-level README.
 
 Two personalities (`probe()` picks one):
 
