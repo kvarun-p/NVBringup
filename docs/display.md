@@ -74,6 +74,12 @@ checks that they read sanely first and logs them before and after.
   compresses to 16-235 (OCSC1 and its clamp, procamp CEA range, as NVKMS `EvoSetOCsc1C5`) and the AVI InfoFrame
   says "default". With QS, full range and the AVI InfoFrame says so. `nvrange=1`/`2` forces full/limited.
 - `nvhdmi=0` keeps the DVI-style signal. `NVDisplaySignal` says what was sent.
+- `nvhdmi20=1` (default off, untested on hardware): HDMI 2.0 modes above 340 MHz TMDS. Only for an HDMI sink whose
+  HDMI Forum VSDB has SCDC and a Max_TMDS_Character_Rate above 340 MHz; the link limit is then the sink's rate or the
+  SOR's 600 MHz, whichever is lower (the OR's 165 MHz from GET_PCLK_LIMIT is RM's single-link DVI figure, not used).
+  Before the modeset: the sink's caps to RM (SET_HDMI_SINK_CAPS), then SCDC 0x20 = 0x03 (ratio 1/40 and scrambling)
+  over the sink's DDC port (DISP_I2C_READ_WRITE). After it: SCDC 0x20 and the scrambler status 0x21 are read and logged
+  as `HDMI 2.0:`. A sink that doesn't take it gets no signal, so turn the boot-arg off to go back.
 
 **Display sleep (DPMS):** NVFramebuffer can't be a power driver (`registerPowerDriver` panicked, see below), so
 IOGraphics never sends it `kIOPowerAttribute`, and WindowServer sends no `kConnectionPower` either. Instead a small

@@ -459,6 +459,7 @@ firmware and your Mesa and llama.cpp builds. By hand:
 | `nvdisp=2` | Light a connected HDMI/DVI port at boot and on hot-plug, for `nvvdisplay` (step 9). Keeps the GPU powered |
 | `nvhdmi=0` | With `nvdisp=2`: a DVI-style signal even for an HDMI sink (no HDMI mode, no InfoFrames), as before 2026-10-14 |
 | `nvrange=1` / `nvrange=2` | With `nvdisp=2`: RGB always full range / always limited (16-235). Default automatic: limited only for a CTA video format (e.g. 1080p60) on an HDMI sink that can't be told the range |
+| `nvhdmi20=1` | With `nvdisp=2`: HDMI 2.0 modes above 340 MHz TMDS (4K60 at 594 MHz) for an HDMI sink with SCDC and a higher Max_TMDS_Character_Rate. Untested on hardware: the 4K60 TV is not here. Default off |
 | `nvdpipe=1` | With `nvdisp=2`: the display pipe (step 9): NVDisplayNub from boot for NVFramebuffer, and NVMetalAccel on the GPU's PCI device. `sudo nvram nvdpipe-once=1` does it for one boot (NVBringup deletes the variable) |
 | `nvdpms=0` | With `nvdisp=2`: keep the HDMI signal on while macOS sleeps the display |
 | `nvhpdevent=0` | With `nvdisp=2`: poll the connect state once a second instead of using GSP-RM's hot-plug events (the poll uses GSP-RM's cached state while lit, which misses short unplugs) |
