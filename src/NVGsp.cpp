@@ -50,7 +50,7 @@ IOReturn NVBringup::setFirmware(uint32_t kind, IOMemoryDescriptor *src, uint64_t
 {
     if (kind >= kFwCount || !len || len > (64ull << 20))
         return kIOReturnBadArgument;
-    gspLock();
+    allLock();
     IOReturn r = kIOReturnSuccess;
     IOBufferMemoryDescriptor *buf = nullptr;
     if (!gsp_)
@@ -69,7 +69,7 @@ IOReturn NVBringup::setFirmware(uint32_t kind, IOMemoryDescriptor *src, uint64_t
         gsp_->fw[kind] = buf;
         LOG("GSP: %s received, %llu bytes", kFwNames[kind], (unsigned long long)len);
     }
-    gspUnlock();
+    allUnlock();
     return r;
 }
 
@@ -115,7 +115,7 @@ void NVBringup::freeGsp(bool stopFalcons)
 
 IOReturn NVBringup::bootGsp()
 {
-    gspLock();
+    allLock();
     IOReturn r = kIOReturnError;
     GspState *g = gsp_;
     uint8_t *tmp = nullptr;     // g->msgBuf, kept for the poller
@@ -141,7 +141,7 @@ IOReturn NVBringup::bootGsp()
         why = "GSP has no RISC-V core";
     if (why) {
         LOG("GSP: not booting: %s", why);
-        gspUnlock();
+        allUnlock();
         return kIOReturnNotPermitted;
     }
 
@@ -346,7 +346,7 @@ fail:
     setProperty("NVGspResult", "failed");
 
 out:
-    gspUnlock();
+    allUnlock();
     dispNubSync();      // createRmObjects may have lit the display: its nub is published outside gspLock_
     return r;
 }
@@ -424,7 +424,7 @@ void NVBringup::gspPoll()
     static uint64_t maxUs[4], slow[4], polls;
     uint64_t t[5];
     t[0] = mach_absolute_time();
-    gspLock();
+    dispEnter();
     t[1] = t[2] = t[3] = t[4] = t[0];
     bool again = gsp_ && gsp_->booted;
     if (again && serviceStatusQueue() < 0) {
@@ -440,7 +440,7 @@ void NVBringup::gspPoll()
         idleTick();
         t[4] = mach_absolute_time();
     }
-    gspUnlock();
+    dispExit();
     if (again) {
         for (int i = 0; i < 4; i++) {
             uint64_t ns = 0;
@@ -753,9 +753,9 @@ bool NVBringup::waitGspReply(uint32_t function, uint32_t ms, uint32_t *result,
 IOReturn NVBringup::unloadGsp(const char *why)
 {
     stopGspPoller();                // must not run while we own the queues
-    gspLock();
+    allLock();
     IOReturn r = unloadGspLocked(why);
-    gspUnlock();
+    allUnlock();
     // dispLost took the display away: its nub goes outside gspLock_. Not at restart or power off: terminating
     // NVFramebuffer while the platform halts page-faulted in IOFramebuffer::terminate (2026-10-11 21:57), and
     // nothing will use the display again.
@@ -970,7 +970,7 @@ void NVBringup::resumeGsp(const char *why)
         setProperty("NVGspResult", "down after wake");
         return;
     }
-    gspLock();
+    allLock();
     IOBufferMemoryDescriptor *fw[kFwCount] = {};
     if (gsp_)
         for (uint32_t i = 0; i < kFwCount; i++) {
@@ -985,7 +985,7 @@ void NVBringup::resumeGsp(const char *why)
         else
             OSSafeReleaseNULL(fw[i]);
     }
-    gspUnlock();
+    allUnlock();
 
     readVbios();                    // reruns FWSEC-FRTS
     if (!frtsOk_) {
