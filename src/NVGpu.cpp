@@ -1564,17 +1564,17 @@ IOReturn NVBringup::dispPower(bool on)
         return kIOReturnUnsupported;
     if (!gspLock_)
         return kIOReturnNotReady;
-    IOLockLock(gspLock_);
+    gspLock();
     GspState *g = gsp_;
     if (!g || !g->booted || !g->disp.ready || !g->disp.litId || g->disp.parkedId) {
-        IOLockUnlock(gspLock_);
+        gspUnlock();
         return kIOReturnNotReady;
     }
     GspState::DispHw &d = g->disp;
     IOReturn r = kIOReturnSuccess;
     uint32_t st = 0;
     if (on != d.dpmsOff) {                          // already in that state
-        IOLockUnlock(gspLock_);
+        gspUnlock();
         return kIOReturnSuccess;
     }
     uint8_t mp[20] = {};
@@ -1586,7 +1586,7 @@ IOReturn NVBringup::dispPower(bool on)
         if (!gspRmControl(g->hClient, g->hDisp, 0x730295, mp, sizeof(mp), &st)) {
             LOG("GSP: display: SET_MONITOR_POWER off failed (status 0x%x): the signal stays on", st);
             setProperty("NVDisplayPower", "on (SET_MONITOR_POWER off refused)");
-            IOLockUnlock(gspLock_);
+            gspUnlock();
             return kIOReturnUnsupported;
         }
         d.dpmsBySor = false;
@@ -1611,7 +1611,7 @@ IOReturn NVBringup::dispPower(bool on)
     LOG("GSP: display: power %s (%s)%s", on ? "on" : "off", d.dpmsBySor ? "SOR" : "SET_MONITOR_POWER",
         r ? ": FAILED" : "");
     setProperty("NVDisplayPower", d.dpmsOff ? (d.dpmsBySor ? "off (SOR detached)" : "off") : "on");
-    IOLockUnlock(gspLock_);
+    gspUnlock();
     return r;
 }
 
@@ -2074,13 +2074,13 @@ void NVBringup::dispNubSync()
         return;
     IOLockLock(dispNubLock_);
     for (;;) {
-        IOLockLock(gspLock_);
+        gspLock();
         OSDictionary *want = dispWant_;
         const bool online = dispWantOnline_;
         const uint32_t gen = dispWantGen_;
         if (want)
             want->retain();
-        IOLockUnlock(gspLock_);
+        gspUnlock();
         if (gen == dispNubGen_) {
             OSSafeReleaseNULL(want);
             break;
@@ -2128,9 +2128,9 @@ void NVBringup::dispNubSync()
 void NVBringup::dispNubStop()
 {
     if (gspLock_) {
-        IOLockLock(gspLock_);
+        gspLock();
         dispNubWant(nullptr, false);
-        IOLockUnlock(gspLock_);
+        gspUnlock();
     }
     dispNubSync();
 }
@@ -2143,16 +2143,16 @@ IOReturn NVBringup::displayFlip(GpuConn *c, uint32_t buffer)
 {
     if (buffer > 2)
         return kIOReturnBadArgument;
-    IOLockLock(gspLock_);
+    gspLock();
     GspState *g = gsp_;
     if (!g || !g->booted || c->dead || !g->dispLit || !g->disp.ready) {
-        IOLockUnlock(gspLock_);
+        gspUnlock();
         return kIOReturnNotReady;
     }
     GspState::DispHw &d = g->disp;
     NVDispMem &f = buffer == 2 ? d.fbC : buffer ? d.fbB : d.fb;
     if (!f.pa || !d.sync.map) {
-        IOLockUnlock(gspLock_);
+        gspUnlock();
         return kIOReturnNotReady;
     }
     IOMemoryMap *keep = d.sync.map;
@@ -2169,7 +2169,7 @@ IOReturn NVBringup::displayFlip(GpuConn *c, uint32_t buffer)
     d.front = buffer;
     const uint64_t tLatch0 = mach_absolute_time();
     NV_TRACE(NV_TRACE_FLIP_LATCH, DBG_FUNC_START, buffer, 0, 0, 0);
-    IOLockUnlock(gspLock_);
+    gspUnlock();
     // Latched once the notifier leaves NOT_BEGUN, or once window 0's armed offset is the new buffer: 0x690000 +
     // method is the window channel's assembly state, + 0x800 the armed one (nvkm gv100_disp_wndw_mthd, .prev).
     // Armed is what the next vblank makes active, so then the raster has to pass a whole vblank too: only after
@@ -2182,7 +2182,7 @@ IOReturn NVBringup::displayFlip(GpuConn *c, uint32_t buffer)
     uint32_t prev = ~0u, waited = 0, latchLine = ~0u;
     bool active0 = false, sawBlank = false;
     for (int i = 0; i < 100 && !how; i++) { // a 0xffffffff read (GPU gone) ends it too
-        IOLockLock(gspLock_);
+        gspLock();
         const bool up = gsp_ && gsp_->booted && gsp_->disp.ready;
         if (up && !latched)
             latched = (ntfy[0] >> 30) ? 1 : rd32(0x690a60) == want ? 2 : 0;
@@ -2202,7 +2202,7 @@ IOReturn NVBringup::displayFlip(GpuConn *c, uint32_t buffer)
             if (!how && ++waited > 25)      // the raster doesn't seem to move: take the armed state as is
                 how = 3;
         }
-        IOLockUnlock(gspLock_);
+        gspUnlock();
         if (!up)
             break;
         if (!how)
@@ -2211,7 +2211,7 @@ IOReturn NVBringup::displayFlip(GpuConn *c, uint32_t buffer)
     if (how)
         r = kIOReturnSuccess;
     NV_TRACE(NV_TRACE_FLIP_LATCH, DBG_FUNC_END, how, mach_absolute_time() - tLatch0, latchLine, 0);
-    IOLockLock(gspLock_);
+    gspLock();
     if (gsp_ && gsp_->booted && gsp_->disp.ready) {
         GspState::DispHw &dd = gsp_->disp;
         dd.flipBy[how]++;
@@ -2243,7 +2243,7 @@ IOReturn NVBringup::displayFlip(GpuConn *c, uint32_t buffer)
                  dd.flipBy[1], dd.flipBy[2], dd.flipBy[3], dd.flipBy[0]);
         setProperty("NVDisplayFlips", counts);
     }
-    IOLockUnlock(gspLock_);
+    gspUnlock();
     keep->release();
     return r;
 }
@@ -2297,10 +2297,10 @@ IOReturn NVBringup::cursorImage(const uint32_t *argb, uint32_t width, uint32_t h
 {
     if (!argb || !width || !height || width > kCursMax || height > kCursMax || !gspLock_)
         return kIOReturnBadArgument;
-    IOLockLock(gspLock_);
+    gspLock();
     GspState *g = gsp_;
     if (!g || !g->booted || !g->disp.ready || !g->disp.cursChan || !g->disp.curs.cpu) {
-        IOLockUnlock(gspLock_);
+        gspUnlock();
         return kIOReturnNotReady;
     }
     GspState::DispHw &d = g->disp;
@@ -2310,7 +2310,7 @@ IOReturn NVBringup::cursorImage(const uint32_t *argb, uint32_t width, uint32_t h
     bar1Flush();
     d.cursHave = true;
     cursorEnableLocked();               // once per modeset; later images replace the pixels in place
-    IOLockUnlock(gspLock_);
+    gspUnlock();
     return kIOReturnSuccess;
 }
 
@@ -2532,11 +2532,11 @@ IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy
         return kIOReturnBadArgument;
     if (!gspLock_)                              // stopping
         return kIOReturnNotReady;
-    IOLockLock(gspLock_);
+    gspLock();
     GspState *g = gsp_;
     IOReturn r = kIOReturnNotReady;
     if (!g || !g->booted || !g->utilOk || !g->pd3 || !g->dispLit || !g->disp.ready) {
-        IOLockUnlock(gspLock_);
+        gspUnlock();
         return r;
     }
     GspState::DispHw &d = g->disp;
@@ -2550,7 +2550,7 @@ IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy
                        d.vtotal && d.pclkKhz && d.htotal;
     if (!d.fb.pa || a->dstWidth != d.w || a->dstHeight != d.h || a->dstPitch != d.pitch ||
         a->x1 > d.w || a->y1 > d.h || (uint64_t)d.pitch * (a->y1 - 1) + (uint64_t)a->x1 * 4 > d.fb.size) {
-        IOLockUnlock(gspLock_);
+        gspUnlock();
         return r;
     }
     auto pickFree = [](GspState::DispHw &h, uint64_t now, uint64_t *soonest) -> int {
@@ -2572,11 +2572,11 @@ IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy
     int target = 0;
     if (flips && (target = pickFree(d, mach_absolute_time(), &soonest)) < 0) {
         const uint64_t w0 = mach_absolute_time();
-        IOLockUnlock(gspLock_);
+        gspUnlock();
         for (int i = 0; i < 40 && mach_absolute_time() < soonest; i++)  // at most a frame; 40 ms if the clock is off
             IOSleep(1);
         waitedAbs = mach_absolute_time() - w0;
-        IOLockLock(gspLock_);
+        gspLock();
         g = gsp_;
         // A mode set while unlocked may have changed the geometry or reallocated the buffers: copying with the
         // checks above would write past them. Refused (the caller copies itself); the next frame is checked anew
@@ -2584,7 +2584,7 @@ IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy
             g->disp.w != a->dstWidth || g->disp.h != a->dstHeight || g->disp.pitch != a->dstPitch ||
             !g->disp.fb.pa || g->disp.fb.size < need || g->disp.fbB.size < need || g->disp.fbC.size < need ||
             g->disp.fbD.size < need || pipeFlipOff_) {
-            IOLockUnlock(gspLock_);
+            gspUnlock();
             return r;
         }
         if ((target = pickFree(g->disp, ~0ull, &soonest)) < 0)          // the clock was off: take the oldest
@@ -2597,7 +2597,7 @@ IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy
     const uint32_t x0 = flips ? 0 : a->x0, y0 = flips ? 0 : a->y0;
     const int slot = pipeSrcMap(key, md);
     if (slot < 0) {
-        IOLockUnlock(gspLock_);
+        gspUnlock();
         return kIOReturnNoMemory;
     }
     const uint64_t in = kPipeVa + (uint64_t)slot * kPipeVaSlot + (uint64_t)y0 * a->srcPitch + (uint64_t)x0 * 4;
@@ -2704,7 +2704,7 @@ IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy
         dd.pipeShowAt = 0;
         dd.pipeFreeAt[0] = dd.pipeFreeAt[1] = dd.pipeFreeAt[2] = mach_absolute_time() + dispLinesAbs(2 * dd.vtotal);
     }
-    IOLockUnlock(gspLock_);
+    gspUnlock();
     return ok ? kIOReturnSuccess : kIOReturnTimeout;
 }
 
@@ -3021,7 +3021,7 @@ IOReturn NVBringup::setIntr(uint32_t mode, uint64_t out[4])
     if (!gspLock_ || !waitLock_)
         return kIOReturnNotReady;
     IOReturn r = kIOReturnSuccess;
-    IOLockLock(gspLock_);
+    gspLock();
     if (mode == 1) {
         intrWanted_ = true;
         if (!intrOn_ && gsp_ && gsp_->booted && !intrHwOn()) {
@@ -3041,7 +3041,7 @@ IOReturn NVBringup::setIntr(uint32_t mode, uint64_t out[4])
     out[1] = intrCount_;
     out[2] = intrSpurious_;
     out[3] = intrStorms_;
-    IOLockUnlock(gspLock_);
+    gspUnlock();
     return r;
 }
 
@@ -3585,7 +3585,7 @@ IOReturn NVBringup::gpuOpen(task_t task, GpuConn **out)
 
 IOReturn NVBringup::gpuOpenLocked(task_t task, GpuConn **out)
 {
-    IOLockLock(gspLock_);
+    gspLock();
     GspState *g = gsp_;
     IOReturn r = kIOReturnNoDevice;
     GpuConn *c = nullptr;
@@ -3653,7 +3653,7 @@ fail:
 out:
     if (c && r != kIOReturnSuccess)
         c->dead = true;         // torn down above; freed by gpuRelease
-    IOLockUnlock(gspLock_);
+    gspUnlock();
     if (c && r != kIOReturnSuccess)
         gpuRelease(c);
     return r;
@@ -3702,9 +3702,9 @@ void NVBringup::gpuTeardownAll(const char *why)
 
 void NVBringup::gpuClose(GpuConn *c)
 {
-    IOLockLock(gspLock_);
+    gspLock();
     gpuTeardown(c, "closed");
-    IOLockUnlock(gspLock_);
+    gspUnlock();
     wakeWaiters();                          // waiters see dead
 }
 
@@ -3712,9 +3712,9 @@ void NVBringup::gpuClose(GpuConn *c)
 void NVBringup::gpuRelease(GpuConn *c)
 {
     if (!c->dead) {
-        IOLockLock(gspLock_);
+        gspLock();
         gpuTeardown(c, "released");
-        IOLockUnlock(gspLock_);
+        gspUnlock();
     }
     c->syncs.free();
     if (c->mems)
@@ -4459,7 +4459,7 @@ void NVBringup::boostArmLocked()
 void NVBringup::boostThunk(thread_call_param_t self, thread_call_param_t)
 {
     NVBringup *d = (NVBringup *)self;
-    IOLockLock(d->gspLock_);
+    d->gspLock();
     const bool up = d->gsp_ && d->gsp_->booted;
     // A boost request queued by an EXEC (autoBoostLocked): the RPC goes out here, not on the submitting thread.
     if (d->boostPend_ != ~0u) {
@@ -4487,7 +4487,7 @@ void NVBringup::boostThunk(thread_call_param_t self, thread_call_param_t)
     } else if (!up) {
         d->boostLevel_ = 0;
     }
-    IOLockUnlock(d->gspLock_);
+    d->gspUnlock();
 }
 
 void NVBringup::autoBoostLocked(bool backlog)
@@ -4618,9 +4618,9 @@ IOReturn NVBringup::exec(GpuConn *c, const uint8_t *buf, uint32_t len, uint64_t 
             break;
         if (tries >= 5000)
             return kIOReturnBusy;
-        IOLockUnlock(gspLock_);
+        gspUnlock();
         IOSleep(1);
-        IOLockLock(gspLock_);
+        gspLock();
         if (!gsp_ || !gsp_->booted)
             return kIOReturnNoDevice;
     }
@@ -4853,7 +4853,7 @@ IOReturn NVBringup::gpuCall(GpuConn *c, uint32_t selector, IOExternalMethodArgum
             return r;
     }
 
-    IOLockLock(gspLock_);
+    gspLock();
     GspState *g = gsp_;
     IOReturn r = kIOReturnSuccess;
     if (!g || !g->booted || c->dead) {
@@ -5087,7 +5087,7 @@ IOReturn NVBringup::gpuCall(GpuConn *c, uint32_t selector, IOExternalMethodArgum
         break;
     }
 out:
-    IOLockUnlock(gspLock_);
+    gspUnlock();
     if (b)
         IOFree(b, n);
     return r;

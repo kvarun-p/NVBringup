@@ -50,7 +50,7 @@ IOReturn NVBringup::setFirmware(uint32_t kind, IOMemoryDescriptor *src, uint64_t
 {
     if (kind >= kFwCount || !len || len > (64ull << 20))
         return kIOReturnBadArgument;
-    IOLockLock(gspLock_);
+    gspLock();
     IOReturn r = kIOReturnSuccess;
     IOBufferMemoryDescriptor *buf = nullptr;
     if (!gsp_)
@@ -69,7 +69,7 @@ IOReturn NVBringup::setFirmware(uint32_t kind, IOMemoryDescriptor *src, uint64_t
         gsp_->fw[kind] = buf;
         LOG("GSP: %s received, %llu bytes", kFwNames[kind], (unsigned long long)len);
     }
-    IOLockUnlock(gspLock_);
+    gspUnlock();
     return r;
 }
 
@@ -77,14 +77,14 @@ IOReturn NVBringup::readGspLog(uint32_t index, IOMemoryDescriptor *dst, uint64_t
 {
     if (index >= NV_GSP_LOG_COUNT)
         return kIOReturnBadArgument;
-    IOLockLock(gspLock_);
+    gspLock();
     IOReturn r = kIOReturnNotReady;
     if (gsp_ && gsp_->logs[index].va) {
         uint64_t n = dst->getLength() < gsp_->logs[index].size ? dst->getLength() : gsp_->logs[index].size;
         *len = dst->writeBytes(0, gsp_->logs[index].va, n);
         r = *len == n ? kIOReturnSuccess : kIOReturnIOError;
     }
-    IOLockUnlock(gspLock_);
+    gspUnlock();
     return r;
 }
 
@@ -115,7 +115,7 @@ void NVBringup::freeGsp(bool stopFalcons)
 
 IOReturn NVBringup::bootGsp()
 {
-    IOLockLock(gspLock_);
+    gspLock();
     IOReturn r = kIOReturnError;
     GspState *g = gsp_;
     uint8_t *tmp = nullptr;     // g->msgBuf, kept for the poller
@@ -141,7 +141,7 @@ IOReturn NVBringup::bootGsp()
         why = "GSP has no RISC-V core";
     if (why) {
         LOG("GSP: not booting: %s", why);
-        IOLockUnlock(gspLock_);
+        gspUnlock();
         return kIOReturnNotPermitted;
     }
 
@@ -346,7 +346,7 @@ fail:
     setProperty("NVGspResult", "failed");
 
 out:
-    IOLockUnlock(gspLock_);
+    gspUnlock();
     dispNubSync();      // createRmObjects may have lit the display: its nub is published outside gspLock_
     return r;
 }
@@ -424,7 +424,7 @@ void NVBringup::gspPoll()
     static uint64_t maxUs[4], slow[4], polls;
     uint64_t t[5];
     t[0] = mach_absolute_time();
-    IOLockLock(gspLock_);
+    gspLock();
     t[1] = t[2] = t[3] = t[4] = t[0];
     bool again = gsp_ && gsp_->booted;
     if (again && serviceStatusQueue() < 0) {
@@ -440,7 +440,7 @@ void NVBringup::gspPoll()
         idleTick();
         t[4] = mach_absolute_time();
     }
-    IOLockUnlock(gspLock_);
+    gspUnlock();
     if (again) {
         for (int i = 0; i < 4; i++) {
             uint64_t ns = 0;
@@ -449,6 +449,8 @@ void NVBringup::gspPoll()
                 maxUs[i] = ns / 1000;
             slow[i] += ns > 20000000;
         }
+        if (polls % 10 == 0)
+            lockPublish();      // NVLockStats: once a second
         if (++polls % 100 == 0) {
             char m[192];
             snprintf(m, sizeof(m), "max us / holds over 20 ms: lock+messages %llu/%llu, stats %llu/%llu, hotplug %llu/%llu, "
@@ -751,9 +753,9 @@ bool NVBringup::waitGspReply(uint32_t function, uint32_t ms, uint32_t *result,
 IOReturn NVBringup::unloadGsp(const char *why)
 {
     stopGspPoller();                // must not run while we own the queues
-    IOLockLock(gspLock_);
+    gspLock();
     IOReturn r = unloadGspLocked(why);
-    IOLockUnlock(gspLock_);
+    gspUnlock();
     // dispLost took the display away: its nub goes outside gspLock_. Not at restart or power off: terminating
     // NVFramebuffer while the platform halts page-faulted in IOFramebuffer::terminate (2026-10-11 21:57), and
     // nothing will use the display again.
@@ -968,7 +970,7 @@ void NVBringup::resumeGsp(const char *why)
         setProperty("NVGspResult", "down after wake");
         return;
     }
-    IOLockLock(gspLock_);
+    gspLock();
     IOBufferMemoryDescriptor *fw[kFwCount] = {};
     if (gsp_)
         for (uint32_t i = 0; i < kFwCount; i++) {
@@ -983,7 +985,7 @@ void NVBringup::resumeGsp(const char *why)
         else
             OSSafeReleaseNULL(fw[i]);
     }
-    IOLockUnlock(gspLock_);
+    gspUnlock();
 
     readVbios();                    // reruns FWSEC-FRTS
     if (!frtsOk_) {
