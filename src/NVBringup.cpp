@@ -79,6 +79,7 @@ bool NVBringup::start(IOService *provider)
     setProperty(NV_UAPI_VERSION_KEY, NVMAC_ABI_VERSION, 32);
     setProperty(NV_UAPI_FEATURES_KEY, NVMAC_FEATURES & ~NVMAC_FEATURE_SCANOUT, 32);
     bootGuard();
+    lockInit();
 
     // Display pipe gate (S1): boot-arg nvdpipe=1, or the NVRAM one-shot nvdpipe-once (deleted here, so it
     // applies to this boot only; read even when the boot-arg is set, so it can't outlive the boot). Decided
@@ -180,16 +181,16 @@ void NVBringup::shutdownHw()
     bootBusyRelease("shutdown");
     powerFree();                                    // no idle power-off from here on
     if (gspLock_) {                                 // before BAR0 and the device go away
-        IOLockLock(gspLock_);
+        gspLock();
         intrHwOff();
-        IOLockUnlock(gspLock_);
+        gspUnlock();
     }
     intrRelease();
     if (boostCall_) {
         if (gspLock_) {
-            IOLockLock(gspLock_);
+            gspLock();
             boostStopping_ = true;                  // the sampler doesn't re-arm
-            IOLockUnlock(gspLock_);
+            gspUnlock();
         }
         thread_call_cancel_wait(boostCall_);
         thread_call_free(boostCall_);
@@ -207,11 +208,12 @@ void NVBringup::shutdownHw()
     stopGspPoller();
     dispNubStop();                                  // the nub is ours under the PCI device: it goes first
     if (gspLock_) {
-        IOLockLock(gspLock_);
+        allLock();
         freeGsp(true);      // stops a running GSP before its buffers go away
-        IOLockUnlock(gspLock_);
+        allUnlock();
         IOLockFree(gspLock_);
         gspLock_ = nullptr;
+        lockFree();
     }
     OSSafeReleaseNULL(bar0_);
     OSSafeReleaseNULL(acpi_);

@@ -130,12 +130,12 @@ void NVBringup::idleThunk(thread_call_param_t self, thread_call_param_t)
     IOLockLock(d->powerLock_);
     bool idle = d->pwrMode_ == kModeAuto && d->pwrState_ == kPwrOn;
     if (idle) {                             // still unused? (an open holds powerLock_)
-        IOLockLock(d->gspLock_);
+        d->gspLock();
         GspState *g = d->gsp_;
         idle = g && g->booted;
         for (uint32_t i = 0; idle && i < kMaxConns; i++)
             idle = g->conns[i] == nullptr;
-        IOLockUnlock(d->gspLock_);
+        d->gspUnlock();
     }
     if (idle)
         d->gpuPowerOff("idle");
@@ -330,7 +330,7 @@ IOReturn NVBringup::powerCall(uint32_t selector, IOExternalMethodArguments *a)
         if (pwrMode_ == kModeOff)
             return kIOReturnNoDevice;       // switched off: not listed (opens would fail)
         nvmac_info i;
-        IOLockLock(gspLock_);
+        gspLock();
         bool live = pwrState_ == kPwrOn && gsp_ && gsp_->booted && gsp_->vram && infoCached_;
         if (live)
             fillInfo(&i);
@@ -339,7 +339,7 @@ IOReturn NVBringup::powerCall(uint32_t selector, IOExternalMethodArguments *a)
             i.vram_used = 0;                // nothing allocated while it's off
             i.bar1_used = 0;
         }
-        IOLockUnlock(gspLock_);
+        gspUnlock();
         if (!live && !infoCached_)
             return kIOReturnNotReady;
         memcpy(a->structureOutput, &i, sizeof(i));
@@ -351,9 +351,9 @@ IOReturn NVBringup::powerCall(uint32_t selector, IOExternalMethodArguments *a)
             (a->scalarInputCount == 2 && (a->scalarInput[0] > NVMAC_BOOST_TO_MAX ||
                                           (a->scalarInput[1] > 3600 && a->scalarInput[1] != 0xffffffffull))))
             return kIOReturnBadArgument;
-        IOLockLock(gspLock_);
+        gspLock();
         if (pwrState_ != kPwrOn || !gsp_ || !gsp_->booted) {
-            IOLockUnlock(gspLock_);
+            gspUnlock();
             return kIOReturnNoDevice;       // asking doesn't power the GPU on
         }
         uint32_t st = 0;
@@ -365,7 +365,7 @@ IOReturn NVBringup::powerCall(uint32_t selector, IOExternalMethodArguments *a)
         a->scalarOutput[1] = st;
         a->scalarOutput[2] = boostHeldLocked();
         a->scalarOutput[3] = boostCount_;
-        IOLockUnlock(gspLock_);
+        gspUnlock();
         return kIOReturnSuccess;
     }
     if (selector == NVMAC_PERF_POLICY) {
@@ -376,7 +376,7 @@ IOReturn NVBringup::powerCall(uint32_t selector, IOExternalMethodArguments *a)
                                      in[2] > NVMAC_BOOST_TO_MAX || !in[3] || in[3] > 100 ||
                                      in[4] < 20 || in[4] > 10000)))
             return kIOReturnBadArgument;
-        IOLockLock(gspLock_);
+        gspLock();
         if (a->scalarInputCount) {
             uint32_t st = 0;
             if (in[0] != boostPolicy_ && boostLevel_ && gsp_ && gsp_->booted)
@@ -404,7 +404,7 @@ IOReturn NVBringup::powerCall(uint32_t selector, IOExternalMethodArguments *a)
         out[7] = boostSent_[NVMAC_BOOST_TO_MAX];
         out[8] = boostSent_[NVMAC_BOOST_1LEVEL];
         out[9] = boostSent_[NVMAC_BOOST_CLEAR];
-        IOLockUnlock(gspLock_);
+        gspUnlock();
         return kIOReturnSuccess;
     }
     if (selector == NVMAC_POWER_SET) {
@@ -420,10 +420,10 @@ IOReturn NVBringup::powerCall(uint32_t selector, IOExternalMethodArguments *a)
                 r = kIOReturnNotResponding;
         } else if (mode == kModeOff) {
             bool used = false;
-            IOLockLock(gspLock_);
+            gspLock();
             for (uint32_t i = 0; gsp_ && i < kMaxConns && !used; i++)
                 used = gsp_->conns[i] != nullptr;
-            IOLockUnlock(gspLock_);
+            gspUnlock();
             if (used) {
                 r = kIOReturnBusy;          // a program has the GPU open
             } else {
@@ -446,10 +446,10 @@ IOReturn NVBringup::powerCall(uint32_t selector, IOExternalMethodArguments *a)
     if (a->scalarOutputCount != NVMAC_POWER_STATUS_COUNT)
         return r == kIOReturnSuccess ? kIOReturnBadArgument : r;
     uint32_t conns = 0;
-    IOLockLock(gspLock_);
+    gspLock();
     for (uint32_t i = 0; gsp_ && i < kMaxConns; i++)
         conns += gsp_->conns[i] != nullptr;
-    IOLockUnlock(gspLock_);
+    gspUnlock();
     a->scalarOutput[0] = (uint64_t)pwrState_;
     a->scalarOutput[1] = (uint64_t)pwrMode_;
     a->scalarOutput[2] = idleSec_;

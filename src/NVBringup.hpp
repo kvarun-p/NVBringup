@@ -8,6 +8,7 @@
 #include "nv_uapi.h"
 #include <IOKit/IOFilterInterruptEventSource.h>
 #include <kern/thread_call.h>
+#include <kern/thread.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <IOKit/acpi/IOACPIPlatformDevice.h>
 #include <IOKit/IOTimerEventSource.h>
@@ -185,6 +186,55 @@ private:
     struct GspState;
     GspState *gsp_ = nullptr;
     IOLock   *gspLock_ = nullptr;
+
+    // ---- Locks (NVLocks.cpp) ----------------------------------------------------------------------------------
+    // gspLock_ guards the GPU: the GSP command and status queues (one RPC at a time: the reply is matched by function
+    // number alone, GspState::waitFunction, and events are drained by whichever thread is waiting), contexts, VA
+    // spaces, heaps, the PRAMIN window, the utility channel, the display engine's registers and push buffers. NVIDIA's
+    // RM does the same: the queues are under the GPU lock (_kgspRpcRecvPoll asserts the group lock, and a second
+    // RPC from an event handler is refused, bPollingForRpcResponse).
+    // Boot-arg nvlocksplit=1 (lockSplit_, fixed in start(); off in safe mode) adds dispLock_ in front of it, the way
+    // NVKMS's lock sits in front of the RM's: every display flow (hot-plug tick, DPMS, flips, the pipe's copy, the
+    // cursor image) takes dispLock_, then gspLock_ (dispEnter), and gives gspLock_ up across its sleeps (dispSleep:
+    // relight retries, channel and notifier waits, SCDC settle) so a modeset no longer stalls EXEC for the seconds
+    // it takes. dispLock_ keeps other display flows out meanwhile, so the display state stays consistent.
+    // Order: powerLock_ > dispNubLock_ > dispLock_ > gspLock_ > waitLock_, cursLock_. Boot, unload and free take
+    // both (allLock): gsp_ and gsp_->booted change only then, so dispLock_ alone keeps GspState alive, and nothing
+    // yields during them. dispLock_ is recursive for its owner; gspLock_ is not. Unsplit, dispEnter is gspLock_ and
+    // dispSleep a plain sleep, so the driver behaves as before; the statistics run in both modes.
+public:
+    struct LockStat {
+        uint64_t acquired = 0, contended = 0, waitAbs = 0, maxWaitAbs = 0, maxHoldAbs = 0, slowHolds = 0;
+        const char *maxWaitSite = "", *maxHoldSite = "";
+    };
+    struct LockState {
+        thread_t owner = nullptr;
+        uint32_t depth = 0;
+        uint64_t since = 0;
+        const char *site = "";
+        LockStat st;
+    };
+    enum { kLockGsp = 0, kLockDisp = 1, kLockCount };
+private:
+    bool      lockSplit_ = false;
+    IOLock   *dispLock_ = nullptr;
+    bool      dispYield_ = false;               // dispLock_ owner: a display flow that may give gspLock_ up (dispLock_)
+    LockState lockState_[kLockCount];
+    IOLock   *lockOf(uint32_t id) const { return id == kLockGsp ? gspLock_ : dispLock_; }
+    void      lockTake(uint32_t id, const char *site);
+    void      lockDrop(uint32_t id);
+    void      lockInit();                       // start(): the boot-arg and dispLock_
+    void      lockFree();
+    void      lockPublish();                    // NVLockStats, from gspPoll once a second
+public:
+    void      gspLock(const char *site = __builtin_FUNCTION()) { lockTake(kLockGsp, site); }
+    void      gspUnlock() { lockDrop(kLockGsp); }
+private:
+    void      dispEnter(const char *site = __builtin_FUNCTION());   // display flows: dispLock_ + gspLock_ (split) or gspLock_
+    void      dispExit();
+    void      dispSleep(uint32_t ms);           // IOSleep; split, in a display flow: with gspLock_ given up meanwhile
+    void      allLock(const char *site = __builtin_FUNCTION());     // GSP-RM boot, unload, free: every lock
+    void      allUnlock();
     void freeGsp(bool stopFalcons);
     IONotifier *sleepNotifier_ = nullptr;
     static IOReturn sleepHandler(void *target, void *refCon, UInt32 messageType, IOService *provider,
