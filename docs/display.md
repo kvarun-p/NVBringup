@@ -199,6 +199,42 @@ NVIDIA GPU. Armed with boot-arg `nvdpipe=1`, or for one boot `sudo nvram nvdpipe
   `NVPipeGpuCopies`, `NVPipeCpuCopies` on the accelerator show how it goes. The CPU copy is the fallback for
   frames before the display is lit and across mode changes.
 
+### Zero-copy scanout (`nvzerocopy=1`)
+
+Default off, with `nvdpipe=1` (also ignored in a safe-mode boot). NVMetal in WindowServer renders each display
+surface into a VRAM image and writes it back to the IOSurface (for Intel's display hardware in mirror mode and for
+anyone who reads the surface). With this on, the pipe scans that VRAM image out instead of copying the IOSurface into
+a scanout buffer.
+
+- **Registration** (`NVMAC_SURFACE_SCANOUT`, `src/nv_uapi.h`): after the last write-back of a surface's only image
+  has landed, and before the command buffer counts as submitted (which WindowServer's commit waits for), NVMetal
+  calls the ICD's exported `nvk_macos_register_scanout`, which sends the kext the IOSurface ID, the image's GPU VA,
+  row pitch, size, layout and the surface's seed (`IOSurfaceGetSeed`, which moves on every write lock). The layout is
+  NVK's own: pitch-linear, or block-linear with 2^n GOBs per block (a 1920x1080 BGRA image: pitch 7680, n = 4,
+  checked on this machine with the build tree's ICD). The kext resolves the VA through the connection's bindings to a
+  VRAM address (one binding of VRAM memory; 256-byte aligned, 4 KiB for block-linear) and keeps the entry until the
+  memory is freed or the connection closes. Only WindowServer (uid 88) or root may register; the selector and feature
+  bit exist only with the boot-arg.
+- **Per frame** (`NVDisplayPipe::submitTransaction`): the pipe first asks `NVPipeScanout` (`src/nv_pipe_copy.h`)
+  with the surface's ID and its current lock seed (`IOSurface::getLockSeed`). The kext refuses (and the pipe copies as
+  before) unless the surface is registered at that seed (`nvzerocopy=2`: whatever the seed), is the lit mode's size,
+  and the display is lit with flips on. Otherwise it programs window 0 for the image (storage: block height and
+  layout; pitch; a second DMA object with a kind for block-linear, `kDispHandleFbBl`, built like nouveau's gv100
+  ctxdma; the offset) and flips at the next vblank, with the same queued-flip bookkeeping as the copy path.
+- **Lifetime:** the image's VRAM is held (`DispHw::scanHeld`) while it is scanned out and until the flip that replaces
+  it has been shown (`pipeShowAt`); if NVMetal frees it meanwhile, the block is freed once the replacing flip has
+  been shown (checked at the next flip or allocation, and at a modeset). The transaction completes only when its own flip is
+  shown (about a frame): from then on WindowServer may reuse the previous surface, as with a real pipe. A copy
+  after a zero-copy frame completes 40 ms later for the same reason. That WindowServer never renders into the
+  surface it last presented is its own behaviour on every GPU (inferred; it is not enforced here).
+- **Safety net:** the seed. Surfaces NVMetal did not render (an Intel-rendered mirror master, a video layer), or that
+  anyone wrote after NVMetal's write-back, have another seed or none registered, and are copied.
+- **Not done:** the aperture copy (`fb`) the copy path keeps current for mirror mode is skipped on a zero-copy
+  frame. A mirror that reads the NVIDIA framebuffer's aperture would show a stale picture (inferred not to be the
+  case: hardware mirroring scans the master's IOSurface, which write-back keeps current).
+- **Counters:** `ZeroCopyFlips`, `ZeroCopyFallbacks`, `ZeroCopyLastResult` on NVMetalAccelerator; NVBringup's
+  `NVZeroCopy` (flips and the refusals by reason). `tools/nvframes` prints them.
+
 Found on hardware, each a boot or more:
 
 | Symptom | Cause |
@@ -274,8 +310,8 @@ binary's ad-hoc signature, so a rebuild needs it granted again.
   RM side (ELD, `SET_ELD_AUDIO_CAPS`) and a macOS driver for the GPU's HDA function. No HDMI 2.0 (above 340 MHz),
   no deep colour, no YCbCr output.
 - **One mode,** the preferred one or the best the port carries, and one head. No mode switching or HiDPI modes.
-- **A copy per frame:** the display pipe copies each composited frame into the scanout. Scanning out NVMetal's
-  image directly (zero copy) is the next step.
+- **A copy per frame** unless `nvzerocopy=1` is on and the surface is NVMetal's own ([zero-copy](#zero-copy-scanout-nvzerocopy1);
+  untested on hardware as of 2026-10-16).
 - **Tested on Sonoma only.** The private interfaces the display pipe uses (IOAcceleratorFamily2's vtables, AGDC
   selectors) must be checked again on Sequoia and Tahoe (`make verify` in `accel/` and `display/`).
 - **The GPU stays powered with `nvdisp=2`,** monitor or not.

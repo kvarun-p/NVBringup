@@ -24,6 +24,11 @@ Two personalities (`probe()` picks one):
     change. The transaction completes once the copy is done (`isTransactionComplete`, then
     `signalTransactionInterrupt` kicks the family); the 20 ms completion hold used against mirror flicker is gone,
     since the cause was read-only wiring in NVBringup.
+  - Zero-copy (`nvzerocopy=1`, when NVBringup lists `NV_STACK_F_PIPE_SCANOUT`): before the copy, `scanoutPlane0`
+    asks NVBringup's `NVPipeScanout` to scan out the image NVMetal registered for plane 0's IOSurface. On success
+    nothing is copied and the transaction completes when its flip is shown (a thread call, `holdCompletion`), not
+    at once; a copy right after a zero-copy frame is held 40 ms the same way. Counters `ZeroCopyFlips`,
+    `ZeroCopyFallbacks`, `ZeroCopyLastResult`. See docs/display.md.
   - Setup: `enableAccelerator()` (accel+3192), accel+3528 set (every transaction completes inside submit), the
     config flag accel+3279 for the display-pipe user client, and a publish notification that binds the
     framebuffer once on its own work loop with `found_framebuffer`. The pipe count must grow or the bind fails.
