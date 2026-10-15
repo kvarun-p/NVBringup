@@ -45,7 +45,8 @@ struct nv_sink_caps {
     uint16_t physAddr;                              // its CEC physical address
     bool     hf;                                    // HDMI Forum VSDB (C4-5D-D8): an HDMI 2.x sink
     uint32_t hfMaxTmdsKhz;                          // its Max_TMDS_Character_Rate, 0 not above 340 MHz
-    bool     scdc;
+    bool     scdc;                                  // SCDC_Present: the sink's SCDC (I2C 0x54) takes the TMDS config
+    bool     lte340;                                // Lte_340Mcsc_Scramble: scrambling is wanted at or below 340 MHz too
     bool     vcdb;                                  // video capability data block
     bool     qs, qy;                                // RGB / YCC quantization range selectable through the AVI InfoFrame
     uint8_t  sPT, sIT, sCE;                         // overscan behaviour (0 no data, 1 overscans, 2 underscans, 3 both)

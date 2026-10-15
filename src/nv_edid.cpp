@@ -157,6 +157,7 @@ bool nv_edid_parse(const uint8_t *e, uint32_t len, nv_sink_caps *c)
                     c->hf = true;
                     c->hfMaxTmdsKhz = (uint32_t)p[4] * 5000;
                     c->scdc = (p[5] & 0x80) != 0;
+                    c->lte340 = (p[5] & 0x08) != 0;     // NVT_HDMI_FORUM_VSDB_PAYLOAD: Lte_340mcsc_Scramble
                 }
                 break;
             case 7:                                 // extended tag
