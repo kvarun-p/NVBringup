@@ -989,6 +989,7 @@ bool NVBringup::dispInit()
     d.ready = true;
     dispHpdArm();
     LOG("GSP: display: engine ready (root, core and window channels); watching %u output(s)", d.nCand);
+    dispDiag("engine ready, nothing lit");
     for (uint32_t i = 0; i < d.nCand; i++)
         LOG("GSP: display:   0x%x (protocol %u)", d.candId[i], d.candProto[i]);
     return true;
@@ -1147,6 +1148,11 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
         }
         if (sorIdx == ~0u)
             FAIL("no SOR assigned");
+        auto rd32le = [](const uint8_t *b, uint32_t o) { uint32_t v; memcpy(&v, b + o, 4); return v; };
+        LOG("GSP: display diag (DFP_ASSIGN_SOR 0x%x): %08x %08x %08x %08x %08x %08x | %08x %08x %08x %08x %08x %08x %08x "
+            "%08x %08x %08x", displayId, rd32le(as, 0), rd32le(as, 4), rd32le(as, 8), rd32le(as, 12), rd32le(as, 16),
+            rd32le(as, 20), rd32le(as, 24), rd32le(as, 28), rd32le(as, 32), rd32le(as, 36), rd32le(as, 40),
+            rd32le(as, 44), rd32le(as, 48), rd32le(as, 52), rd32le(as, 56), rd32le(as, 60));
     }
 
     // HDMI or DVI for this modeset (NV0073_CTRL_SPECIFIC_SET_HDMI_ENABLE_PARAMS: u8 subDeviceInstance, u32 displayId,
@@ -1166,7 +1172,11 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
     const uint8_t aviQ = !sink.qs ? 0 : limited ? 1 : 2;         // AVI Q: default, limited, full
 
     // SOR control, head raster, clock, output resource, OLUT (headc57d_*), window ownership; UPDATE.
+    const uint32_t sorAsyBefore = rd32(0x680300 + sorIdx * 0x20);
     dispMthd(false, 0x300 + sorIdx * 0x20, rmProto << 8 | 1u << head);           // SOR_SET_CONTROL: protocol, owner
+    LOG("GSP: display diag (SOR_SET_CONTROL): SOR %u asy 0x%x before the method, 0x%x after it (no UPDATE yet); "
+        "pwr 0x%08x state 0x%08x", sorIdx, sorAsyBefore, rd32(0x680300 + sorIdx * 0x20), rd32(0x61c004 + sorIdx * 0x800),
+        rd32(0x61c030 + sorIdx * 0x800));
     dispMthd(false, 0x2020 + head * 0x400, displayId);                            // HEAD_SET_DISPLAY_ID
     dispMthd(false, 0x204c + head * 0x400, hact | vact << 16);                    // viewport in
     dispMthd(false, 0x2058 + head * 0x400, hact | vact << 16);                    // viewport out
