@@ -303,8 +303,10 @@ monitor connected, so that plugging one in can be noticed. There are two ways to
 
 1. Install the three kexts and the NVMetal bundle from the same build: `tools/nvctl install efi accel fb`
    (read the plan, then `--apply`), and the bundle with `accel/tools/nvmetal_root_install.sh install <bundle>`.
-2. Add `nvdisp=2 nvdpipe=1` to the boot-args (or `sudo nvram nvdpipe-once=1` for one boot) and reboot with the
-   monitor connected. `ioreg -c NVMetalAccelerator -d 1 | grep NVPipe` shows the pipe bound and copying.
+2. Add `nvdisp=2 nvdpipe=1 amfi_get_out_of_my_way=0x1` to the boot-args (or `sudo nvram nvdpipe-once=1` for the
+   pipe for one boot) and reboot with the monitor connected. WindowServer enforces library validation
+   (`CS_REQUIRE_LV`), and the AMFI boot-arg is what lets it load the ad-hoc-signed NVMetal bundle; `amfi=0x80`,
+   which some guides add as well, sets the same flags and isn't needed (tested 2026-10-15). `ioreg -c NVMetalAccelerator -d 1 | grep NVPipe` shows the pipe bound and copying.
 
 **The virtual display** (`nvvdisplay`, no auxiliary kexts):
 
