@@ -232,6 +232,10 @@ a scanout buffer.
 - **Not done:** the aperture copy (`fb`) the copy path keeps current for mirror mode is skipped on a zero-copy
   frame. A mirror that reads the NVIDIA framebuffer's aperture would show a stale picture (inferred not to be the
   case: hardware mirroring scans the master's IOSurface, which write-back keeps current).
+- **Switches:** boot-arg `nvzerocopy` (kext side; `=2` no seed check); `NVMETAL_ZEROCOPY=0` in
+  `/Library/Preferences/io.github.kvarun-p.nvmetal.env` stops NVMetal in WindowServer registering images (the pipe
+  then copies everything), `=1` registers from other processes too. `NVMETAL_ZEROCOPY_DEBUG=1` prints each
+  registration's address, pitch and layout from the ICD.
 - **Counters:** `ZeroCopyFlips`, `ZeroCopyFallbacks`, `ZeroCopyLastResult` on NVMetalAccelerator; NVBringup's
   `NVZeroCopy` (flips and the refusals by reason). `tools/nvframes` prints them.
 
