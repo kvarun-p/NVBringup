@@ -77,7 +77,7 @@ bool NVBringup::start(IOService *provider)
     setProperty(NV_STACK_ABI_KEY, NV_STACK_ABI, 32);
     setProperty(NV_STACK_FEATURES_KEY, NV_STACK_FEATURES, 32);
     setProperty(NV_UAPI_VERSION_KEY, NVMAC_ABI_VERSION, 32);
-    setProperty(NV_UAPI_FEATURES_KEY, NVMAC_FEATURES, 32);
+    setProperty(NV_UAPI_FEATURES_KEY, NVMAC_FEATURES & ~NVMAC_FEATURE_SCANOUT, 32);
     bootGuard();
 
     // Display pipe gate (S1): boot-arg nvdpipe=1, or the NVRAM one-shot nvdpipe-once (deleted here, so it
@@ -104,6 +104,16 @@ bool NVBringup::start(IOService *provider)
             thread_call_enter_delayed(bootBusyCall_, dl);
         }
         setProperty("NVDisplayPipeArmed", kOSBooleanTrue);
+        // Zero-copy scanout (nvzerocopy=1): the pipe scans NVMetal's image of a surface out instead of copying the
+        // surface; 2 also skips the seed check (for diagnosing). Off by default; offered to the accelerator through
+        // NVStackFeatures only when on.
+        uint32_t zc = 0;
+        if (PE_parse_boot_argn("nvzerocopy", &zc, sizeof(zc)) && zc && !safeMode_) {
+            zeroCopy_ = zc > 2 ? 1 : zc;
+            setProperty(NV_STACK_FEATURES_KEY, NV_STACK_FEATURES | NV_STACK_F_PIPE_SCANOUT, 32);
+            setProperty(NV_UAPI_FEATURES_KEY, NVMAC_FEATURES, 32);
+            LOG("zero-copy scanout on (boot-arg nvzerocopy=%u%s)", zeroCopy_, zeroCopy_ == 2 ? ", surface seeds not checked" : "");
+        }
         LOG("display pipe armed (%s): NVFramebuffer and the accelerator take part this boot",
             pipeOnce ? "nvdpipe-once" : "boot-arg nvdpipe=1");
     }

@@ -293,6 +293,17 @@ private:
     volatile bool pipeFlipOff_ = false;
     uint64_t pipeUse_ = 0;
     IOReturn pipeCopy(OSObject *key, IOMemoryDescriptor *md, struct nv_pipe_copy *a);
+    // Zero-copy scanout (nvzerocopy; NVMAC_SURFACE_SCANOUT registers the images, NV_PIPE_SCANOUT_FN scans one out).
+    // All under gspLock_. 0: off, 1: on, 2: on without the seed check.
+    uint32_t zeroCopy_ = 0;
+    IOReturn surfaceScanout(GpuConn *c, const uint64_t *in);
+    IOReturn pipeScanout(struct nv_pipe_scanout *a);
+    void     scanForget(GpuMem *m, GpuConn *c);     // the registrations of a memory object (m) or connection (c)
+    bool     scanHold(GpuMem *m);                   // m's VRAM is held for the display: memFree must not free it
+    void     scanReap(uint64_t now);                // releases the held VRAM whose replacing flip has been shown
+    void     scanReset(bool freeHeld);              // the window is back on the copy buffers (modeset) or gone
+    void     scanWindowCopyMode();                  // window 0 back to the copy buffers' pitch layout and DMA object
+    void     scanRetire(uint64_t showAt);           // the image scanned out until now is replaced at showAt
     uint32_t dispLinesToVblank();               // raster lines until head 0's next vblank starts (0: unknown)
     uint64_t dispLinesAbs(uint32_t lines);      // their duration, in absolute time units
     int      pipeSrcMap(OSObject *key, IOMemoryDescriptor *md);   // the slot holding the source, or -1

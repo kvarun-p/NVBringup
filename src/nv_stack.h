@@ -36,6 +36,7 @@ enum {
     NV_STACK_F_CURSOR       = 1u << 2,      // NV_CURSOR_IMAGE_FN, NV_CURSOR_MOVE_FN
     NV_STACK_F_DISPLAY_NUB  = 1u << 3,      // NVDisplayNub with NVDisplayFB (NVFramebuffer's provider)
     NV_STACK_F_PIPE_FLIP    = 1u << 4,      // pipe frames flipped at vblank (NVPipeFlip)
+    NV_STACK_F_PIPE_SCANOUT = 1u << 5,      // NV_PIPE_SCANOUT_FN (zero-copy scanout); published only with boot-arg nvzerocopy
 };
 #define NV_STACK_FEATURES   (NV_STACK_F_PIPE_COPY | NV_STACK_F_VBLANK_LINES | NV_STACK_F_CURSOR | \
                              NV_STACK_F_DISPLAY_NUB | NV_STACK_F_PIPE_FLIP)

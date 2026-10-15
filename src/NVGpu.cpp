@@ -687,6 +687,7 @@ void NVBringup::probeDisplay()
 // surface and mode, for nvvdisplay) and NVDisplayGen (bumped whenever the lit display comes or goes).
 
 static const uint32_t kDispHandleSync = 0xf0000000, kDispHandleVram = 0xf0000001, kDispHandleFb = 0xf0000002;
+static const uint32_t kDispHandleFbBl = 0xf0000003;     // block-linear scanout surfaces (zero-copy), window 1 only
 
 static inline void dispW32(NVDispMem &m, uint32_t off, uint32_t v)
 {
@@ -860,7 +861,7 @@ bool NVBringup::dispInit()
     // (1024 entries of handle + context), then 24-byte gv100 DMA objects on 16-byte alignment. The VRAM
     // ones cover all of VRAM, so surfaces allocated on later hot-plugs are inside them.
     {
-        const uint32_t instSync = 0x2000, instVram = 0x2020, instFb = 0x2040;
+        const uint32_t instSync = 0x2000, instVram = 0x2020, instFb = 0x2040, instFbBl = 0x2060;
         auto dmaObj = [&](uint32_t off, uint64_t start, uint64_t limit, uint32_t flags) {
             dispW32(d.inst, off + 0x00, flags);
             dispW32(d.inst, off + 0x04, (uint32_t)(start >> 8));
@@ -873,6 +874,8 @@ bool NVBringup::dispInit()
         dmaObj(instVram, 0, vramLimit, 0x45);
         // Scanout (ISO) surfaces take a big-page context DMA (nv50_wndw_ctxdma_new: GF119_DMA_V0_PAGE_LP).
         dmaObj(instFb, 0, vramLimit, 0x05);
+        // Block-linear scanout surfaces: the same with a kind (gv100_dmaobj_new: any non-zero kind sets bit 20).
+        dmaObj(instFbBl, 0, vramLimit, 0x00100005);
         // nvkm_ramht_insert: hash(chid, handle) with linear probing; context = chid << 25 | client | inst << 9.
         bool used[1024] = {};
         auto ramhtInsert = [&](uint32_t chid, uint32_t handle, uint32_t instOff) {
@@ -893,7 +896,7 @@ bool NVBringup::dispInit()
         // chid.user: core 0, window n 1 + n.
         if (!ramhtInsert(0, kDispHandleSync, instSync) || !ramhtInsert(0, kDispHandleVram, instVram) ||
             !ramhtInsert(1, kDispHandleSync, instSync) || !ramhtInsert(1, kDispHandleVram, instVram) ||
-            !ramhtInsert(1, kDispHandleFb, instFb))
+            !ramhtInsert(1, kDispHandleFb, instFb) || !ramhtInsert(1, kDispHandleFbBl, instFbBl))
             FAIL("RAMHT full");
         if (g->hClient & 0x2000)        // the context ORs inst << 9 over the client handle's bit 13
             LOG("GSP: display: warning: client handle 0x%x has bit 13 set, which collides with the DMA object offset",
@@ -1149,6 +1152,7 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
     d.pipeArmed = ~0u;
     d.pipeShowAt = 0;
     d.pipeFreeAt[0] = d.pipeFreeAt[1] = d.pipeFreeAt[2] = 0;
+    scanReset(true);                            // window 0 is set up for the copy buffers below
 
     // SOR: DFP_ASSIGN_SOR for the display, as r535_outp_acquire.
     {
@@ -2354,6 +2358,8 @@ IOReturn NVBringup::callPlatformFunction(const OSSymbol *functionName, bool wait
 {
     if (functionName && functionName->isEqualTo(NV_PIPE_COPY_FN))
         return pipeCopy((OSObject *)param1, (IOMemoryDescriptor *)param2, (nv_pipe_copy *)param3);
+    if (functionName && functionName->isEqualTo(NV_PIPE_SCANOUT_FN))
+        return pipeScanout((nv_pipe_scanout *)param1);
     if (functionName && functionName->isEqualTo(NV_VBLANK_LINES_FN)) {
         if (param1)
             *(uint32_t *)param1 = dispLinesToVblank();
@@ -2540,6 +2546,8 @@ IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy
         return r;
     }
     GspState::DispHw &d = g->disp;
+    if (zeroCopy_)
+        scanReap(mach_absolute_time());
     // Presented with a flip at the vblank (window 0, non-tearing, flips queue in order): the copy goes into a
     // buffer that is neither the one window 0 was last flipped to nor one still on screen or queued (pipeFreeAt).
     // With three buffers one is free unless two flips are already queued, and then this waits for the next one
@@ -2658,6 +2666,7 @@ IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy
     if (ok && flips && (uint32_t)target != dd.pipeArmed) {
         if (dd.pipeArmed == ~0u)                    // window 0 still shows fb, which isn't one of the three
             dd.pipeArmed = 3;
+        scanWindowCopyMode();                                             // after a zero-copy scanout: pitch layout
         dispMthd(true, 0x260, (uint32_t)(f.pa >> 8));                     // window 0, offset 0: the buffer
         dispMthd(true, 0x370, 0);                                         // not interlocked with the core
         dispMthd(true, 0x374, 0);
@@ -2674,6 +2683,7 @@ IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy
         if (dd.pipeArmed < 3)
             dd.pipeFreeAt[dd.pipeArmed] = showAt;
         dd.pipeShowAt = showAt;
+        scanRetire(showAt);                         // a scanned-out image is out of scanout from then on
         char tm[160];
         if (pipeTiming(dd, t0, t1, showAt, tm, sizeof(tm)))
             setProperty("NVPipeTiming", tm);
@@ -2696,10 +2706,12 @@ IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy
         }
     }
     if (ok && !flips && dd.pipeArmed != ~0u) {         // flips switched off: window 0 back to fb, which has the frame
+        scanWindowCopyMode();
         dispMthd(true, 0x260, (uint32_t)(dd.fb.pa >> 8));
         dispMthd(true, 0x370, 0);
         dispMthd(true, 0x374, 0);
         dispMthd(true, 0x200, 1);
+        scanRetire(mach_absolute_time() + dispLinesAbs(2 * dd.vtotal));
         dd.pipeArmed = ~0u;
         dd.pipeShowAt = 0;
         dd.pipeFreeAt[0] = dd.pipeFreeAt[1] = dd.pipeFreeAt[2] = mach_absolute_time() + dispLinesAbs(2 * dd.vtotal);
@@ -2748,6 +2760,7 @@ void NVBringup::dispLost()
     NVDispMem *surfaces[] = { &d.fb, &d.fbB, &d.fbC, &d.fbD, &d.curs };
     for (NVDispMem *m : surfaces)
         *m = NVDispMem();
+    scanReset(false);                               // the VRAM heap goes with GSP-RM
     d.cursChan = d.cursOn = d.cursHave = false;     // the channel goes with the client
     d.hdmiOn = d.rangeLimited = d.dpmsOff = d.dpmsBySor = false;   // GSP-RM and the display engine start over
     d.hpdEvent = d.hpdBurst = 0;                    // the event object goes with the client
@@ -3905,6 +3918,8 @@ fail:
 void NVBringup::memFree(GpuConn *c, GpuMem *m, bool unbind)
 {
     GspState *g = gsp_;
+    if (zeroCopy_)
+        scanForget(m, nullptr);
     if (unbind && c->pd3 && !c->dead)
         unbindRange(c, USER_VA_START, USER_VA_END - USER_VA_START, m);
 #if NV_BAR1_REDIRECT
@@ -3930,7 +3945,7 @@ void NVBringup::memFree(GpuConn *c, GpuMem *m, bool unbind)
         else
             bar1Unmap(m->bar1Va, m->bar1Size);
     }
-    if (m->vram && !m->borrowed)
+    if (m->vram && !m->borrowed && !(zeroCopy_ && scanHold(m)))     // held: freed once the display has left it
         nv_vram_free(g->vram, m->vram);
     m->sys.free();
     if (m->userMd) {                    // unwire the caller's pages (after the DMA mapping is gone)
@@ -4118,6 +4133,256 @@ IOReturn NVBringup::vmBind(GpuConn *c, const uint8_t *buf, uint32_t len)
     if (mapped)
         tlbFlush(c->pd3);
     return r;
+}
+
+// ---- Zero-copy scanout (nv_pipe_copy.h, NVMAC_SURFACE_SCANOUT) ---------------------------------------------------
+//
+// NVMetal in WindowServer renders each display surface into a VRAM image and writes it back to the IOSurface; it
+// registers the image here after each write-back. When the display pipe is handed that surface with the seed
+// registered, window 0 is pointed at the image (its layout programmed from the registration) instead of a copy.
+// The image must stay put while it is scanned out and until the flip that replaces it has been shown: the VRAM is
+// held (scanHeld) and, if its owner frees it meanwhile, freed only then. Not re-rendering it meanwhile is
+// WindowServer's part (the transaction completes at showAt, see NVDisplayPipe in accel/).
+
+static const uint32_t kScanLayoutOn = 0x10000;      // DispHw::scanLayout: set when window 0 is set up for an image
+
+IOReturn NVBringup::surfaceScanout(GpuConn *c, const uint64_t *in)
+{
+    GspState *g = gsp_;
+    if (!zeroCopy_)
+        return kIOReturnUnsupported;
+    if (!in[0] || in[0] >> 32 || in[3] >> 32 == 0 || (in[3] & 0xffffffffu) == 0 || in[4] >> 16 || in[5] >> 32)
+        return kIOReturnBadArgument;
+    GspState::ScanEnt *cur = nullptr, *spare = nullptr;
+    for (GspState::ScanEnt &e : g->scan) {
+        if (e.id == (uint32_t)in[0])
+            cur = &e;
+        else if (!e.id && !spare)
+            spare = &e;
+    }
+    if (!in[1]) {                                   // forget
+        if (cur)
+            cur[0] = GspState::ScanEnt();
+        return kIOReturnSuccess;
+    }
+    const uint32_t pitch = (uint32_t)in[2], w = (uint32_t)in[3], h = (uint32_t)(in[3] >> 32);
+    const uint32_t layout = (uint32_t)in[4], kind = layout & 0xff, n = layout >> 8;
+    if (in[2] >> 32 || (pitch & 63) || pitch < w * 4 || pitch > 0x1fffu * 64 || w > 16384 || h > 16384 ||
+        (kind > 1) || (kind == 0 && n) || (kind == 1 && n > 5))
+        return kIOReturnBadArgument;
+    const uint64_t rows = kind ? ((uint64_t)h + (8u << n) - 1) & ~(uint64_t)((8u << n) - 1) : h;
+    const uint64_t bytes = (uint64_t)pitch * rows, va = in[1];
+    const uint32_t at = firstBindAfter(c, va);
+    if (at >= c->nBinds)
+        return kIOReturnBadArgument;
+    const Binding &b = c->binds[at];
+    GpuMem *m = b.mem;
+    if (b.va > va || va + bytes < va || va + bytes > b.va + b.size || !m || !(m->flags & NVMAC_MEM_VRAM) ||
+        m->borrowed || !m->vram)
+        return kIOReturnBadArgument;
+    const uint64_t pa = m->vram + b.memOff + (va - b.va);
+    if ((pa & (kind ? 0xfffull : 0xffull)) || pa + bytes > g->vram->limit + 1)
+        return kIOReturnBadArgument;
+    GspState::ScanEnt *e = cur ? cur : spare;
+    if (!e)                                         // full: the oldest goes (they are re-registered every frame)
+        e = &g->scan[(g->disp.scanFlips + in[5]) % (sizeof(g->scan) / sizeof(g->scan[0]))];
+    e->id = (uint32_t)in[0];
+    e->conn = c;
+    e->mem = m;
+    e->pa = pa;
+    e->vram = m->vram;
+    e->pitch = pitch;
+    e->w = w;
+    e->h = h;
+    e->layout = layout;
+    e->seed = (uint32_t)in[5];
+    static uint32_t logged;
+    if (logged++ < 6)
+        LOG("GSP: zero-copy: surface %u: %ux%u pitch %u %s%u at VRAM 0x%llx, seed %u", e->id, w, h, pitch,
+            kind ? "block-linear 2^" : "pitch ", kind ? n : 0, (unsigned long long)pa, e->seed);
+    return kIOReturnSuccess;
+}
+
+void NVBringup::scanForget(GpuMem *m, GpuConn *c)
+{
+    GspState *g = gsp_;
+    for (uint32_t i = 0; g && i < sizeof(g->scan) / sizeof(g->scan[0]); i++)
+        if (g->scan[i].id && ((m && g->scan[i].mem == m) || (c && g->scan[i].conn == c)))
+            g->scan[i] = GspState::ScanEnt();
+}
+
+// m is being freed: its VRAM stays allocated while the display scans it out or has yet to leave it.
+bool NVBringup::scanHold(GpuMem *m)
+{
+    GspState *g = gsp_;
+    if (!g)
+        return false;
+    for (GspState::DispHw::ScanHeld &h : g->disp.scanHeld)
+        if (h.used && h.vram == m->vram) {
+            h.zombie = true;
+            return true;
+        }
+    return false;
+}
+
+void NVBringup::scanReap(uint64_t now)
+{
+    GspState *g = gsp_;
+    if (!g)
+        return;
+    for (GspState::DispHw::ScanHeld &h : g->disp.scanHeld)
+        if (h.used && h.releaseAt && now >= h.releaseAt) {
+            if (h.zombie)
+                nv_vram_free(g->vram, h.vram);
+            h = GspState::DispHw::ScanHeld();
+        }
+}
+
+// The window shows the copy buffers again (modeset), or the VRAM is going away (freeHeld false).
+void NVBringup::scanReset(bool freeHeld)
+{
+    GspState *g = gsp_;
+    if (!g)
+        return;
+    GspState::DispHw &d = g->disp;
+    for (GspState::DispHw::ScanHeld &h : d.scanHeld) {
+        if (h.used && h.zombie && freeHeld)
+            nv_vram_free(g->vram, h.vram);
+        h = GspState::DispHw::ScanHeld();
+    }
+    d.scanCur = -1;
+    d.scanLayout = 0;
+}
+
+// Window 0 back to the copy buffers' storage (pitch, the pitch DMA object); methods only, the caller's UPDATE applies them.
+void NVBringup::scanWindowCopyMode()
+{
+    GspState::DispHw &d = gsp_->disp;
+    if (!d.scanLayout)
+        return;
+    dispMthd(true, 0x228, 0u | 1u << 4);           // storage: pitch layout
+    dispMthd(true, 0x230, d.pitch >> 6);           // planar storage 0: the buffers' pitch
+    dispMthd(true, 0x240, kDispHandleFb);          // context DMA ISO 0
+    d.scanLayout = 0;
+}
+
+// The image scanned out until now is replaced by a flip shown at showAt.
+void NVBringup::scanRetire(uint64_t showAt)
+{
+    GspState::DispHw &d = gsp_->disp;
+    if (d.scanCur >= 0) {
+        d.scanHeld[d.scanCur].releaseAt = showAt ? showAt : 1;
+        d.scanCur = -1;
+    }
+}
+
+IOReturn NVBringup::pipeScanout(nv_pipe_scanout *a)
+{
+    if (!a || a->version != NV_PIPE_SCANOUT_VERSION)
+        return kIOReturnBadArgument;
+    a->result = NV_PIPE_SCANOUT_NOT_READY;
+    a->regSeed = 0;
+    a->showAt = 0;
+    if (!zeroCopy_ || !gspLock_)
+        return kIOReturnUnsupported;
+    IOLockLock(gspLock_);
+    GspState *g = gsp_;
+    if (!g || !g->booted || !g->dispLit || !g->disp.ready || pipeFlipOff_ || !g->disp.vtotal || !g->disp.pclkKhz ||
+        !g->disp.htotal) {
+        IOLockUnlock(gspLock_);
+        return kIOReturnUnsupported;
+    }
+    GspState::DispHw &d = g->disp;
+    GspState::ScanEnt *e = nullptr;
+    for (GspState::ScanEnt &x : g->scan)
+        if (x.id && x.id == a->surfaceId)
+            e = &x;
+    if (e && (!e->conn || e->conn->dead || g->conns[e->conn->id] != e->conn)) {
+        *e = GspState::ScanEnt();
+        e = nullptr;
+    }
+    uint32_t why = NV_PIPE_SCANOUT_OK;
+    int slot = -1;
+    if (!e) {
+        why = NV_PIPE_SCANOUT_NOT_REGISTERED;
+    } else {
+        a->regSeed = e->seed;
+        if (zeroCopy_ == 1 && e->seed != a->seed)
+            why = NV_PIPE_SCANOUT_STALE;
+        else if (a->dstWidth != d.w || a->dstHeight != d.h || a->dstPitch != d.pitch || a->width != d.w ||
+                 a->height != d.h || e->w != d.w || e->h != d.h || e->pitch < d.w * 4)
+            why = NV_PIPE_SCANOUT_GEOMETRY;
+    }
+    if (why == NV_PIPE_SCANOUT_OK) {
+        scanReap(mach_absolute_time());
+        // The block's slot: the one holding it already (the same image again), else a free one.
+        for (int i = 0; i < 4; i++)
+            if (d.scanHeld[i].used && d.scanHeld[i].vram == e->vram)
+                slot = i;
+        for (int i = 0; i < 4 && slot < 0; i++)
+            if (!d.scanHeld[i].used)
+                slot = i;
+        if (slot < 0)
+            why = NV_PIPE_SCANOUT_BUSY;
+    }
+    if (why != NV_PIPE_SCANOUT_OK) {
+        a->result = why;
+        d.scanRefused[why]++;
+        IOLockUnlock(gspLock_);
+        static uint32_t logged;
+        if (logged++ < 8 || (why != NV_PIPE_SCANOUT_NOT_REGISTERED && logged % 600 == 0))
+            LOG("GSP: zero-copy: surface %u refused (%u: %s): seed %u, registered %u", a->surfaceId, why,
+                why == NV_PIPE_SCANOUT_NOT_REGISTERED ? "not registered" : why == NV_PIPE_SCANOUT_STALE ? "stale seed"
+                : why == NV_PIPE_SCANOUT_GEOMETRY ? "geometry" : "busy", a->seed, a->regSeed);
+        return kIOReturnUnsupported;
+    }
+
+    // Window 0: the image (wndwc37e_image_set), as nouveau programs a tiled framebuffer: storage (block height and
+    // layout), pitch in 64-byte units (a block-linear row's width in GOBs), the DMA object with a kind, the offset.
+    const uint32_t kind = e->layout & 0xff, n = e->layout >> 8, want = e->layout | kScanLayoutOn;
+    if (d.scanLayout != want) {
+        dispMthd(true, 0x228, kind ? n : 0u | 1u << 4);            // storage: block height, layout (0 block-linear)
+        dispMthd(true, 0x240, kind ? kDispHandleFbBl : kDispHandleFb);
+        d.scanLayout = want;
+    }
+    dispMthd(true, 0x230, e->pitch >> 6);
+    dispMthd(true, 0x260, (uint32_t)(e->pa >> 8));                  // offset 0: the image
+    dispMthd(true, 0x370, 0);                                       // not interlocked with the core
+    dispMthd(true, 0x374, 0);
+    dispMthd(true, 0x200, 1);                                       // UPDATE: latched at the next vblank
+    uint32_t lines = dispLinesToVblank();
+    if (!lines)
+        lines = d.vtotal;
+    uint64_t showAt = mach_absolute_time() + dispLinesAbs(lines + 2);
+    const uint64_t frame = dispLinesAbs(d.vtotal);
+    if (d.pipeShowAt && showAt < d.pipeShowAt + frame)
+        showAt = d.pipeShowAt + frame;
+    if (d.scanCur != slot)
+        scanRetire(showAt);                                         // the image shown before goes at showAt
+    d.scanHeld[slot].used = true;
+    d.scanHeld[slot].vram = e->vram;
+    d.scanHeld[slot].releaseAt = 0;                                 // held until a later flip replaces it
+    d.scanHeld[slot].zombie = false;
+    d.scanCur = slot;
+    if (d.pipeArmed < 3)                                            // the copy buffer shown before is free then
+        d.pipeFreeAt[d.pipeArmed] = showAt;
+    d.pipeArmed = 3;                                                // window 0 shows no copy buffer
+    d.pipeShowAt = showAt;
+    d.scanFlips++;
+    a->result = NV_PIPE_SCANOUT_OK;
+    a->showAt = showAt;
+    if (d.scanFlips == 1 || d.scanFlips % 120 == 0) {
+        char m[160];
+        snprintf(m, sizeof(m), "%llu flips; refused: not ready %llu, not registered %llu, stale %llu, geometry %llu, busy %llu",
+                 (unsigned long long)d.scanFlips, (unsigned long long)d.scanRefused[NV_PIPE_SCANOUT_NOT_READY],
+                 (unsigned long long)d.scanRefused[NV_PIPE_SCANOUT_NOT_REGISTERED],
+                 (unsigned long long)d.scanRefused[NV_PIPE_SCANOUT_STALE],
+                 (unsigned long long)d.scanRefused[NV_PIPE_SCANOUT_GEOMETRY],
+                 (unsigned long long)d.scanRefused[NV_PIPE_SCANOUT_BUSY]);
+        setProperty("NVZeroCopy", m);
+    }
+    IOLockUnlock(gspLock_);
+    return kIOReturnSuccess;
 }
 
 // ---- Contexts -----------------------------------------------------------------------------
@@ -4781,7 +5046,7 @@ void NVBringup::fillInfo(nvmac_info *i)
     GspState *g = gsp_;
     *i = {};
     i->version = NVMAC_ABI_VERSION;
-    i->features = NVMAC_FEATURES;
+    i->features = zeroCopy_ ? NVMAC_FEATURES : NVMAC_FEATURES & ~NVMAC_FEATURE_SCANOUT;
     i->device_id = pci_->configRead16(kIOPCIConfigDeviceID);
     i->chipset = (uint16_t)chipset_;
     i->pci_bus = pci_->getBusNumber();
@@ -5055,6 +5320,10 @@ IOReturn NVBringup::gpuCall(GpuConn *c, uint32_t selector, IOExternalMethodArgum
         a->scalarOutput[4] = g->dispPitch;
         break;
     }
+    case NVMAC_SURFACE_SCANOUT:
+        r = a->scalarInputCount == 6 && !a->scalarOutputCount ? surfaceScanout(c, a->scalarInput)
+                                                               : kIOReturnBadArgument;
+        break;
     case NVMAC_MAP_SYNC_PAGE: {
         if (a->scalarOutputCount != 2) {
             r = kIOReturnBadArgument;

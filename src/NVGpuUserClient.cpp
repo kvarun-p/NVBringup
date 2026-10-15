@@ -77,5 +77,8 @@ IOReturn NVGpuUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
         return kIOReturnNotOpen;
     if (selector >= NVMAC_SELECTOR_COUNT)
         return kIOReturnBadArgument;
+    // Zero-copy scanout registrations are WindowServer's (or root's, for tests): the display shows what they name.
+    if (selector == NVMAC_SURFACE_SCANOUT && kauth_getuid() != 0 && !callerIsWindowServer())
+        return kIOReturnNotPermitted;
     return drv_->gpuCall(conn_, selector, a);
 }

@@ -96,6 +96,16 @@ enum nvmac_selector {
     NVMAC_DISPLAY_FLIP,     // scalar in: buffer (0-2). Scans that buffer out from the next vblank and
                             //   returns once the display engine has switched to it (so the one shown before is
                             //   out of scanout and free to write), or kIOReturnTimeout after 100 ms.
+    NVMAC_SURFACE_SCANOUT,  // scalars in: IOSurface ID, GPU VA of its image (0: forget the surface), row pitch in
+                            //   bytes, width | height << 32, layout (NVMAC_SCANOUT_*), IOSurface seed. Zero-copy
+                            //   scanout (boot-arg nvzerocopy): WindowServer's NVMetal says that the image at VA
+                            //   (B8G8R8A8, in VRAM bound in this connection, one binding) holds the IOSurface's
+                            //   contents as of that seed. When the display pipe is handed that IOSurface at the
+                            //   same seed it scans the image out in place of copying the surface. Call it again
+                            //   (same ID) after each write-back with the new seed; it replaces the entry. The
+                            //   entry goes when the memory is freed or the connection closes, and VRAM the display
+                            //   scans out is held until a later flip has replaced it. kIOReturnUnsupported without
+                            //   the boot-arg. Only if nvmac_info.features has NVMAC_FEATURE_SCANOUT.
     NVMAC_SELECTOR_COUNT
 };
 
@@ -128,9 +138,15 @@ enum {
     NVMAC_FEATURE_DISPLAY_MEM  = 1u << 2,   // NVMAC_DISPLAY_MEM, buffers 0-2
     NVMAC_FEATURE_DISPLAY_FLIP = 1u << 3,   // NVMAC_DISPLAY_FLIP
     NVMAC_FEATURE_PERF         = 1u << 4,   // control client NVMAC_PERF, NVMAC_PERF_POLICY
+    NVMAC_FEATURE_SCANOUT      = 1u << 5,   // NVMAC_SURFACE_SCANOUT
 };
 #define NVMAC_FEATURES (NVMAC_FEATURE_IMPORT | NVMAC_FEATURE_DISPLAY_MAP | NVMAC_FEATURE_DISPLAY_MEM | \
-                        NVMAC_FEATURE_DISPLAY_FLIP | NVMAC_FEATURE_PERF)
+                        NVMAC_FEATURE_DISPLAY_FLIP | NVMAC_FEATURE_PERF | NVMAC_FEATURE_SCANOUT)
+// NVMAC_SURFACE_SCANOUT layout: pitch-linear, or block-linear (GOBs of 64 bytes x 8 rows, blocks one GOB wide and
+// 2^n GOBs high, n at most 5; NVK's tiling of a colour image has x_log2 0). The row pitch is a multiple of 64 bytes
+// either way; the image's rows are rounded up to a whole block.
+#define NVMAC_SCANOUT_PITCH         0u
+#define NVMAC_SCANOUT_BLOCKLINEAR(n) (1u | (uint32_t)(n) << 8)
 #define NVMAC_IMPORT_MAX    (1ull << 30)    // bytes per import
 
 struct nvmac_info {

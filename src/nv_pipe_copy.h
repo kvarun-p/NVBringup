@@ -39,3 +39,36 @@ struct nv_pipe_copy {
     uint32_t dstWidth, dstHeight, dstPitch;   // the framebuffer the caller copies for: refused unless it is the lit one
     uint32_t gpuUs;                     // out: submit to completion, in microseconds
 };
+
+// Zero-copy scanout (boot-arg nvzerocopy; NVStackFeatures has NV_STACK_F_PIPE_SCANOUT only then). Instead of
+// NVPipeCopy, the display pipe asks NVBringup to scan out the image NVMetal rendered the IOSurface from
+// (NVMAC_SURFACE_SCANOUT in nv_uapi.h):
+//
+//   gpu->callPlatformFunction(sym(NV_PIPE_SCANOUT_FN), false, &args, nullptr, nullptr, nullptr)
+//
+// kIOReturnSuccess: window 0 now scans the image out (from args.showAt on). Anything else, with args.result saying
+// why: nothing was changed, and the caller copies the surface (NVPipeCopy) as before. The surface and its image must
+// stay as they are until the transaction completes, which the caller holds back until args.showAt (the flip before
+// it is out of scanout from then on); NVBringup keeps the image's VRAM allocated until a later flip has replaced it.
+#define NV_PIPE_SCANOUT_FN        "NVPipeScanout"
+#define NV_PIPE_SCANOUT_VERSION   1
+
+enum {
+    NV_PIPE_SCANOUT_OK           = 0,
+    NV_PIPE_SCANOUT_NOT_READY    = 1,   // display not lit, GSP-RM down, flips off, feature off
+    NV_PIPE_SCANOUT_NOT_REGISTERED = 2, // NVMetal registered no image for this surface
+    NV_PIPE_SCANOUT_STALE        = 3,   // the surface's seed is not the one registered: someone wrote it since
+    NV_PIPE_SCANOUT_GEOMETRY     = 4,   // not the lit mode's size, or a layout the window can't scan
+    NV_PIPE_SCANOUT_BUSY         = 5,   // too many scanned-out images still held
+};
+
+struct nv_pipe_scanout {
+    uint32_t version;                   // NV_PIPE_SCANOUT_VERSION
+    uint32_t surfaceId;                 // IOSurface::getSurfaceID
+    uint32_t seed;                      // IOSurface::getUnlockSeed now
+    uint32_t width, height;             // plane 0 of the surface
+    uint32_t dstWidth, dstHeight, dstPitch;   // the framebuffer the caller presents for: refused unless it is the lit one
+    uint32_t result;                    // out: NV_PIPE_SCANOUT_*
+    uint32_t regSeed;                   // out: the seed registered (0: none), for the log
+    uint64_t showAt;                    // out: mach_absolute_time at which the flip is shown
+};

@@ -222,6 +222,14 @@ struct NVBringup::GspState {
         uint64_t pipeShowAt = 0;
         uint64_t pipeFreeAt[3] = {};
         uint64_t pipeFlips = 0, pipeWaits = 0, pipeWaitUs = 0;   // NVPipeFlips: flips, frames that waited, total wait
+        // Zero-copy scanout (pipeScanout): window 0 scans a client's image in place of fbB-fbD. scanLayout is what
+        // its storage and DMA object are set up for: 0 the copy buffers (pitch, kDispHandleFb), else the image's
+        // NVMAC_SCANOUT_* word. scanHeld are the VRAM blocks the display scans or is about to leave (scanCur: the
+        // newest); a block freed by its owner meanwhile is a zombie, freed once its replacing flip has been shown.
+        uint32_t scanLayout = 0;
+        int32_t  scanCur = -1;
+        struct ScanHeld { uint64_t vram = 0, releaseAt = 0; bool used = false, zombie = false; } scanHeld[4];
+        uint64_t scanFlips = 0, scanRefused[6] = {};    // NVZeroCopy: flips, refusals by NV_PIPE_SCANOUT_* reason
         // Per-frame pipe timeline (NVPipeTiming, published with NVPipeFlips): copy = submit to copy engines done,
         // queue = done to UPDATE written, lead = UPDATE to the estimated latch, gap = flip to flip. Sum and max in
         // us over the flips since the last publish, plus the count of copies that missed the 4 ms spin.
@@ -265,6 +273,14 @@ struct NVBringup::GspState {
         uint32_t proto = 0, w = 0, h = 0, pitch = 0, pclkKhz = 0, htotal = 0, vtotal = 0;
         uint32_t hsyncStart = 0, hsyncWidth = 0, vsyncStart = 0, vsyncWidth = 0, syncFlags = 0;
     } disp;
+    // NVMAC_SURFACE_SCANOUT: images NVMetal registered for IOSurfaces (nvzerocopy). Under gspLock_.
+    struct ScanEnt {
+        uint32_t id = 0;                // IOSurface ID, 0: free
+        GpuConn *conn = nullptr;
+        GpuMem  *mem = nullptr;
+        uint64_t pa = 0, vram = 0;      // the image's VRAM address and its memory object's base
+        uint32_t pitch = 0, w = 0, h = 0, layout = 0, seed = 0;
+    } scan[32];
     bool     dispLit = false;          // a modeset scans out: the GPU stays powered
     uint64_t dispFbBar1 = 0, dispFbSize = 0;   // the scanout surface: BAR1 offset and size
     uint32_t dispW = 0, dispH = 0, dispPitch = 0;
