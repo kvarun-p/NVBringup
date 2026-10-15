@@ -23,6 +23,7 @@
 #include "nv_uapi.h"
 #include "nv_pipe_copy.h"
 #include "nv_stack.h"
+#include "nv_trace.h"
 #include "NVGpuUserClient.hpp"
 
 #include <IOKit/IODeviceTreeSupport.h>
@@ -2069,6 +2070,8 @@ IOReturn NVBringup::displayFlip(GpuConn *c, uint32_t buffer)
     dispMthd(true, 0x374, 0);
     dispMthd(true, 0x200, 1);                                                     // UPDATE
     d.front = buffer;
+    const uint64_t tLatch0 = mach_absolute_time();
+    NV_TRACE(NV_TRACE_FLIP_LATCH, DBG_FUNC_START, buffer, 0, 0, 0);
     IOLockUnlock(gspLock_);
     // Latched once the notifier leaves NOT_BEGUN, or once window 0's armed offset is the new buffer: 0x690000 +
     // method is the window channel's assembly state, + 0x800 the armed one (nvkm gv100_disp_wndw_mthd, .prev).
@@ -2110,6 +2113,7 @@ IOReturn NVBringup::displayFlip(GpuConn *c, uint32_t buffer)
     }
     if (how)
         r = kIOReturnSuccess;
+    NV_TRACE(NV_TRACE_FLIP_LATCH, DBG_FUNC_END, how, mach_absolute_time() - tLatch0, latchLine, 0);
     IOLockLock(gspLock_);
     if (gsp_ && gsp_->booted && gsp_->disp.ready) {
         GspState::DispHw &dd = gsp_->disp;
@@ -2534,6 +2538,8 @@ IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy
     uint32_t both[sizeof(push) / 4 + sizeof(push2) / 4];
     memcpy(both, push, sizeof(push));
     memcpy(both + sizeof(push) / 4, push2, sizeof(push2));
+    const uint32_t copyId = payload & 0xffffff;
+    NV_TRACE(NV_TRACE_PIPE_COPY, DBG_FUNC_START, copyId, slot, flips ? target : 3, a->y1 - y0);
     const uint64_t t0 = mach_absolute_time();
     bool ok = flips ? submitAndWait(c, both, sizeof(both) / 4, payload2, 100, false, kPipeSpinUs)
                     : submitAndWait(c, push, sizeof(push) / 4, payload, 100, false, kPipeSpinUs);
@@ -2549,6 +2555,7 @@ IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy
     uint64_t ns = 0;
     absolutetime_to_nanoseconds(t1 - t0, &ns);
     a->gpuUs = (uint32_t)(ns / 1000);
+    NV_TRACE(NV_TRACE_PIPE_COPY, DBG_FUNC_END, copyId, ok, a->gpuUs, flips);
     if (!ok)                                    // what the slot held is suspect: map it again next time
         pipeSrcDrop((uint32_t)slot, true);
     if (ok && flips && (uint32_t)target != dd.pipeArmed) {
@@ -2576,6 +2583,7 @@ IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy
         dd.pipeArmed = (uint32_t)target;
         dd.front = (uint32_t)target;
         dd.pipeFlips++;
+        NV_TRACE(NV_TRACE_PIPE_FLIP, DBG_FUNC_NONE, dd.pipeFlips, target, lines, waitedAbs);
         if (waitedAbs) {
             uint64_t wns = 0;
             absolutetime_to_nanoseconds(waitedAbs, &wns);
@@ -4578,6 +4586,7 @@ IOReturn NVBringup::exec(GpuConn *c, const uint8_t *buf, uint32_t len, uint64_t 
     praminRestore();
     wr32(NV_VF_DOORBELL, x->token);
     *seqOut = seq;
+    NV_TRACE(NV_TRACE_EXEC, DBG_FUNC_NONE, h.ctx, seq, h.n_push, h.n_wait);
     autoBoostLocked(backlog);                                // after the doorbell: work isn't held up
     return kIOReturnSuccess;
 }
