@@ -748,5 +748,7 @@ public:
 	IOMemoryDescriptor *getMemoryDescriptor() const;
 	uint64_t getAllocSize() const;
 	uint32_t getBytesPerRow() const;
+	uint32_t getSurfaceID() const;
+	uint32_t getLockSeed() const;
 };
 

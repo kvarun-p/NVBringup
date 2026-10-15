@@ -88,6 +88,10 @@ PLAIN = [
         # the sizes IOAccelResource2's calculateIOSurfaceDeviceCacheVRAMBytes reports (paravirt, S2)
         'uint64_t getAllocSize() const;',
         'uint32_t getBytesPerRow() const;',
+        # zero-copy scanout: the surface NVMetal registered an image for, at the seed it registered (both return the
+        # 32-bit value in eax; getLockSeed reads shared+12, bumped by write locks like IOSurfaceGetSeed)
+        'uint32_t getSurfaceID() const;',
+        'uint32_t getLockSeed() const;',
     ]),
 ]
 # Return types of the slots we call or override (checked against the paravirt driver's disassembly).
