@@ -595,11 +595,13 @@ static void test_kill(struct tdev *main, const char *self)
         usleep(100000);
         nvmac_refresh_info(main->d);
         after = nvmac_info(main->d)->vram_used;
-        if (after == before)
+        if (after <= before)
             break;
     }
     CHECK(during >= before + (64 << 20), "child held its VRAM (%+lld MiB)", (long long)(during - before) >> 20);
-    CHECK(after == before, "all of it freed after SIGKILL (%+lld KiB left)", (long long)(after - before) >> 10);
+    // vram_used is the whole GPU's: with WindowServer on NVMetal it also moves by what other processes free or
+    // allocate meanwhile, so only more than before counts as a leak.
+    CHECK(after <= before, "all of it freed after SIGKILL (%+lld KiB left)", (long long)(after - before) >> 10);
     uint32_t c2, s2;
     TRY(nvmac_ctx_create(main->d, NVMAC_ENGINE_COMPUTE | NVMAC_ENGINE_3D | NVMAC_ENGINE_COPY, &c2, &s2));
     CHECK(copy_roundtrip(main, c2, s2, 64 << 10, 1) == 0, "GPU still works");
