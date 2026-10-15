@@ -989,7 +989,6 @@ bool NVBringup::dispInit()
     d.ready = true;
     dispHpdArm();
     LOG("GSP: display: engine ready (root, core and window channels); watching %u output(s)", d.nCand);
-    dispDiag("engine ready, nothing lit");
     for (uint32_t i = 0; i < d.nCand; i++)
         LOG("GSP: display:   0x%x (protocol %u)", d.candId[i], d.candProto[i]);
     return true;
@@ -1148,11 +1147,6 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
         }
         if (sorIdx == ~0u)
             FAIL("no SOR assigned");
-        auto rd32le = [](const uint8_t *b, uint32_t o) { uint32_t v; memcpy(&v, b + o, 4); return v; };
-        LOG("GSP: display diag (DFP_ASSIGN_SOR 0x%x): %08x %08x %08x %08x %08x %08x | %08x %08x %08x %08x %08x %08x %08x "
-            "%08x %08x %08x", displayId, rd32le(as, 0), rd32le(as, 4), rd32le(as, 8), rd32le(as, 12), rd32le(as, 16),
-            rd32le(as, 20), rd32le(as, 24), rd32le(as, 28), rd32le(as, 32), rd32le(as, 36), rd32le(as, 40),
-            rd32le(as, 44), rd32le(as, 48), rd32le(as, 52), rd32le(as, 56), rd32le(as, 60));
     }
 
     // HDMI or DVI for this modeset (NV0073_CTRL_SPECIFIC_SET_HDMI_ENABLE_PARAMS: u8 subDeviceInstance, u32 displayId,
@@ -1172,11 +1166,7 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
     const uint8_t aviQ = !sink.qs ? 0 : limited ? 1 : 2;         // AVI Q: default, limited, full
 
     // SOR control, head raster, clock, output resource, OLUT (headc57d_*), window ownership; UPDATE.
-    const uint32_t sorAsyBefore = rd32(0x680300 + sorIdx * 0x20);
     dispMthd(false, 0x300 + sorIdx * 0x20, rmProto << 8 | 1u << head);           // SOR_SET_CONTROL: protocol, owner
-    LOG("GSP: display diag (SOR_SET_CONTROL): SOR %u asy 0x%x before the method, 0x%x after it (no UPDATE yet); "
-        "pwr 0x%08x state 0x%08x", sorIdx, sorAsyBefore, rd32(0x680300 + sorIdx * 0x20), rd32(0x61c004 + sorIdx * 0x800),
-        rd32(0x61c030 + sorIdx * 0x800));
     dispMthd(false, 0x2020 + head * 0x400, displayId);                            // HEAD_SET_DISPLAY_ID
     dispMthd(false, 0x204c + head * 0x400, hact | vact << 16);                    // viewport in
     dispMthd(false, 0x2058 + head * 0x400, hact | vact << 16);                    // viewport out
@@ -1230,15 +1220,6 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
     }
     if (rd32(0x688300 + sorIdx * 0x20) != (rmProto << 8 | 1u << head))
         FAIL("the SOR did not take its owner");
-    {
-        // Diagnostics (relight gives no signal, 2026-10-15): the SOR's control in the core's assembly and armed
-        // state after the update, against what was written, with the channel's position and exception state.
-        const uint32_t want = rmProto << 8 | 1u << head, asy = rd32(0x680300 + sorIdx * 0x20),
-                       arm = rd32(0x688300 + sorIdx * 0x20);
-        LOG("GSP: display diag (core update): SOR %u control wrote 0x%x, asy 0x%x arm 0x%x; core PUT 0x%x GET 0x%x; "
-            "exception stat 0x%08x code 0x%08x", sorIdx, want, asy, arm, rd32(0x680000), rd32(0x680004),
-            rd32(0x611020), rd32(0x611028));
-    }
 
     // Window 0: the surface (wndwc37e_image_set, blend_set), interlocked with the core.
     dispMthd(true, 0x308, 1u | 0u << 4);                                          // present: interval 1
@@ -1434,25 +1415,6 @@ void NVBringup::dispHdmiInfoFramesOff(uint32_t head)
     }
 }
 
-// Diagnostics for the relight that gives no signal: the SOR's and head 0's registers (nouveau gv100_sor_state,
-// gv100_head_state, nv50_sor_power: assembly at 0x680000, armed at +0x8000) and what GSP-RM says head 0 shows.
-// Read only. Logged after each light, unplug and replug, so a relight can be compared with the boot modeset.
-void NVBringup::dispDiag(const char *when)
-{
-    GspState *g = gsp_;
-    GspState::DispHw &d = g->disp;
-    const uint32_t sor = d.sorIdx != ~0u ? d.sorIdx : 0, soff = sor * 0x800, coff = sor * 0x20;
-    uint8_t ac[NV0073_ACTIVE_SIZE] = {};
-    uint32_t st = 0, active = ~0u;
-    put32(ac, NV0073_ACTIVE_head, 0);
-    if (gspRmControl(g->hClient, g->hDisp, NV0073_CTRL_CMD_SYSTEM_GET_ACTIVE_, ac, sizeof(ac), &st, true))
-        memcpy(&active, ac + NV0073_ACTIVE_displayId, 4);
-    LOG("GSP: display diag (%s): SOR %u ctrl asy 0x%08x arm 0x%08x, pwr 0x%08x, state 0x%08x, clk 0x%08x; head 0 arm "
-        "ctl 0x%08x pclk %u raster 0x%08x pos 0x%08x; RM head 0 shows 0x%x", when, sor, rd32(0x680300 + coff),
-        rd32(0x688300 + coff), rd32(0x61c004 + soff), rd32(0x61c030 + soff), rd32(0x612300 + soff), rd32(0x68a004),
-        rd32(0x68a00c), rd32(0x68a064), rd32(0x616330), active);
-}
-
 // The lit display went away: window 0 and the SOR detached (wndwc37e_image_clr; SOR_SET_CONTROL owner none),
 // so the head scans out nothing. The surface stays allocated.
 void NVBringup::dispBlank()
@@ -1479,8 +1441,7 @@ void NVBringup::dispBlank()
         dispMthd(false, 0x300 + d.sorIdx * 0x20, d.proto << 8);
     // HEAD_SET_DISPLAY_ID 0: no display on the head any more, which is how GSP-RM learns the display is off
     // (NVKMS nvkms-evo.c "Tell RM that there is no DisplayID is associated with this head anymore", nouveau
-    // dispnv50 display_id(head, 0)). Without it GSP-RM kept head 0 -> 0x400 and the relight's SOR attach
-    // never took (SOR control read 0 after the update, no signal; 2026-10-15).
+    // dispnv50 display_id(head, 0)). Without it GSP-RM still reported head 0 -> 0x400 after the detach.
     dispMthd(false, 0x2020, 0);
     dispCoreUpdate(1);
     dispHdmiInfoFramesOff(0);
@@ -1490,7 +1451,6 @@ void NVBringup::dispBlank()
     d.sorIdx = ~0u;
     g->dispLit = false;
     setProperty("NVDisplayModeset", "unplugged");
-    dispDiag("detached");
 }
 
 // NV_DISPLAY_POWER_FN, DPMS: macOS put the display to sleep (on false) or woke it. Off is NVKMS's for a TMDS output
@@ -1732,7 +1692,6 @@ void NVBringup::dispHotplugTick()
         // Unplugged: offline for macOS, the hardware left running (see parkedId)
         d.parkedId = d.litId;
         LOG("GSP: display: 0x%x unplugged: kept lit, offline", d.litId);
-        dispDiag("unplug (kept)");
         dispPublish();
         return;
     }
@@ -1750,7 +1709,6 @@ void NVBringup::dispHotplugTick()
         if (same) {
             d.parkedId = 0;
             LOG("GSP: display: 0x%x reconnected (same EDID): back online without a modeset", want);
-            dispDiag("replug (kept)");
             dispPublish();
             return;
         }
@@ -1781,9 +1739,6 @@ void NVBringup::dispHotplugTick()
             return;
         }
         cursorEnableLocked();
-        dispDiag(wasLit ? "relight" : "light (hot-plug)");
-        if (wasLit)
-            dispDump();
     }
     dispPublish();
 }
