@@ -18,6 +18,12 @@
 //   bit 2 (4)  The Linux quirk (drivers/pci/quirks.c quirk_nvidia_hda, not in our reference tree): many laptop
 //              firmwares hide function 1 by clearing bit 25 of function 0's config register 0x488. Set here if
 //              clear; macOS enumerated the bus long before, so it only helps whatever enumerates next (logged).
+//   bit 3 (8)  Snoop on function 1, as Linux does for every NVIDIA HDA controller before using it (hda_intel.c
+//              azx_init_pci, AZX_SNOOP_TYPE_NVIDIA, v6.12): config 0x4e low nibble = 0xf (TRANSREG ENABLE_COHBITS),
+//              0x4d bit 0 (ISTRM_COH), 0x4c bit 0 (OSTRM_COH). Without it the controller's CORB/RIRB and stream DMA
+//              may miss the CPU caches (inferred: AppleHDA's codec setup asserted, IOHDACodecDevice line 146,
+//              2026-10-16, while the probe's immediate commands, which use no DMA, worked). Done at start, before
+//              AppleHDAController attaches. The three bytes are logged before and after whenever nvhdmiaudio is set.
 //
 // Turing only (C57x display, deviceEntry 0 / head 0 as everywhere in this display code).
 
@@ -170,6 +176,17 @@ void NVBringup::hdaCheckFunction()
         LOG("HDMI audio: 0x488 bit 25 set (now 0x%08x, header type 0x%02x): function 1 shows up only when the bus "
             "is enumerated again (not by macOS while running)", pci_->configRead32(0x488),
             pci_->configRead8(kIOPCIConfigHeaderType));
+    }
+    if (f1) {
+        const uint8_t t0 = f1->configRead8(0x4e), i0 = f1->configRead8(0x4d), o0 = f1->configRead8(0x4c);
+        if (arg & 8) {
+            f1->configWrite8(0x4e, (uint8_t)((t0 & ~0x0f) | 0x0f));
+            f1->configWrite8(0x4d, (uint8_t)(i0 | 1));
+            f1->configWrite8(0x4c, (uint8_t)(o0 | 1));
+        }
+        LOG("HDMI audio: function 1 snoop: 0x4e 0x%02x 0x4d 0x%02x 0x4c 0x%02x%s (now 0x%02x 0x%02x 0x%02x)", t0, i0,
+            o0, arg & 8 ? ", set as Linux does" : ", left (bit 3 sets it)", f1->configRead8(0x4e),
+            f1->configRead8(0x4d), f1->configRead8(0x4c));
     }
     OSSafeReleaseNULL(f1);
 }

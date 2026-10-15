@@ -327,6 +327,14 @@ reconnect with the same EDID, and at a hot-plug it sends GSP-RM the unmuting gen
 unmute and the ELD built from the EDID (`nv_eld_build`) through `DFP_SET_ELD_AUDIO_CAPS` with PD=1 ELDV=1, as
 NVKMS's `nvHdmiDpEnableDisableAudio` does. Before a modeset the ELD goes invalid, at an unplug or detach it is
 cleared. Bit 1 (2): reads the ELD back through the GPU's HDA function (PCI function 1) when no driver owns it.
-Bit 2 (4): sets bit 25 of function 0's config register 0x488 if function 1 is absent (Linux quirk). The audio
-InfoFrame, ACR and the stream belong to the HDA driver, not to this kext. Results: ioreg `NVHdaFunction`,
-`NVDisplayAudio` on the NVBringup service and the `HDMI audio:` log lines.
+Bit 2 (4): sets bit 25 of function 0's config register 0x488 if function 1 is absent (Linux quirk). Bit 3 (8):
+turns on function 1's snoop bits (config 0x4e, 0x4d, 0x4c) at start, as Linux does for NVIDIA HDA controllers;
+the three bytes are logged either way. The audio InfoFrame, ACR and the stream belong to the HDA driver, not to
+this kext. Results: ioreg `NVHdaFunction`, `NVDisplayAudio` on the NVBringup service and the `HDMI audio:` lines of
+ioreg `NVLog` (`nvgsp status` shows only the `GSP:` lines).
+
+On this TU117 laptop (2026-10-16): with `nvhdmiaudio=3` the codec (vendor 0x10de0094) reports the TV on pin 4 with
+a valid ELD identical to the one sent. macOS needs DeviceProperties for AppleHDAController to take function 1:
+`hda-gfx` = `onboard-2` on the GPU and on `PciRoot(0x0)/Pci(0x1,0x0)/Pci(0x0,0x1)`, which also gets `layout-id`
+7 (the Intel pair keeps `onboard-1`). With those alone AppleHDA asserted in IOHDACodecDevice and no output
+appeared; bit 3 is the next thing tried.
