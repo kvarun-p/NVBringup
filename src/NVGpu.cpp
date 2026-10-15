@@ -1208,6 +1208,15 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
         dispMthd(false, 0x1000 + i * 0x80, i >> 1);
     if (!dispCoreUpdate(0))
         FAIL("core update (head, SOR, window owner) did not complete");
+    {
+        // Diagnostics (relight gives no signal, 2026-10-15): the SOR's control in the core's assembly and armed
+        // state after the update, against what was written, with the channel's position and exception state.
+        const uint32_t want = rmProto << 8 | 1u << head, asy = rd32(0x680300 + sorIdx * 0x20),
+                       arm = rd32(0x688300 + sorIdx * 0x20);
+        LOG("GSP: display diag (core update): SOR %u control wrote 0x%x, asy 0x%x arm 0x%x; core PUT 0x%x GET 0x%x; "
+            "exception stat 0x%08x code 0x%08x", sorIdx, want, asy, arm, rd32(0x680000), rd32(0x680004),
+            rd32(0x611020), rd32(0x611028));
+    }
 
     // Window 0: the surface (wndwc37e_image_set, blend_set), interlocked with the core.
     dispMthd(true, 0x308, 1u | 0u << 4);                                          // present: interval 1
@@ -1701,8 +1710,11 @@ void NVBringup::dispHotplugTick()
         // The kept display is back: the same sink needs nothing, another one on the port a full relight
         uint8_t *edid = (uint8_t *)IOMallocZero(kNvEdidMax);
         uint32_t edidLen = 0;
-        const bool same = edid && dispReadEdid(want, edid, &edidLen) && edidLen == d.edidLen &&
-                          !memcmp(edid, d.edid, edidLen);
+        nv_sink_caps sc;
+        // Compared over the EDID's own length (base block and extensions): GSP-RM's buffer is longer (384 bytes
+        // for this 256-byte one), d.edidLen is the parsed length.
+        const bool same = edid && dispReadEdid(want, edid, &edidLen) && nv_edid_parse(edid, edidLen, &sc) &&
+                          sc.len == d.edidLen && !memcmp(edid, d.edid, sc.len);
         if (edid)
             IOFree(edid, kNvEdidMax);
         if (same) {
@@ -1740,6 +1752,8 @@ void NVBringup::dispHotplugTick()
         }
         cursorEnableLocked();
         dispDiag(wasLit ? "relight" : "light (hot-plug)");
+        if (wasLit)
+            dispDump();
     }
     dispPublish();
 }
