@@ -239,6 +239,10 @@ struct NVBringup::GspState {
         bool     wanted = false, ready = false;
         uint32_t nCand = 0, candId[4] = {}, candProto[4] = {};   // the TMDS outputs (HDMI/DVI)
         uint32_t litId = 0, sorIdx = ~0u;
+        // Unplugged but kept lit (boot-arg nvunplug, default 1): macOS sees the display go offline, the head and the
+        // SOR keep running, and a replug of the same sink (same EDID) only brings it back online. A relight after a
+        // detach gave no signal on the TV (2026-10-15), cause unknown (dispDiag logs the state for that).
+        uint32_t parkedId = 0;
         uint32_t pendId = 0, pendCount = 0, tick = 0;            // hot-plug debounce
         // Hot-plug events (dispHpdArm): GSP-RM posts NV2080_NOTIFIERS_HOTPLUG; the poll then samples at 300 ms
         // until the change settles, and every 5 s otherwise. Without the event object, once a second as before.

@@ -1403,6 +1403,25 @@ void NVBringup::dispHdmiInfoFramesOff(uint32_t head)
     }
 }
 
+// Diagnostics for the relight that gives no signal: the SOR's and head 0's registers (nouveau gv100_sor_state,
+// gv100_head_state, nv50_sor_power: assembly at 0x680000, armed at +0x8000) and what GSP-RM says head 0 shows.
+// Read only. Logged after each light, unplug and replug, so a relight can be compared with the boot modeset.
+void NVBringup::dispDiag(const char *when)
+{
+    GspState *g = gsp_;
+    GspState::DispHw &d = g->disp;
+    const uint32_t sor = d.sorIdx != ~0u ? d.sorIdx : 0, soff = sor * 0x800, coff = sor * 0x20;
+    uint8_t ac[NV0073_ACTIVE_SIZE] = {};
+    uint32_t st = 0, active = ~0u;
+    put32(ac, NV0073_ACTIVE_head, 0);
+    if (gspRmControl(g->hClient, g->hDisp, NV0073_CTRL_CMD_SYSTEM_GET_ACTIVE_, ac, sizeof(ac), &st, true))
+        memcpy(&active, ac + NV0073_ACTIVE_displayId, 4);
+    LOG("GSP: display diag (%s): SOR %u ctrl asy 0x%08x arm 0x%08x, pwr 0x%08x, state 0x%08x, clk 0x%08x; head 0 arm "
+        "ctl 0x%08x pclk %u raster 0x%08x pos 0x%08x; RM head 0 shows 0x%x", when, sor, rd32(0x680300 + coff),
+        rd32(0x688300 + coff), rd32(0x61c004 + soff), rd32(0x61c030 + soff), rd32(0x612300 + soff), rd32(0x68a004),
+        rd32(0x68a00c), rd32(0x68a064), rd32(0x616330), active);
+}
+
 // The lit display went away: window 0 and the SOR detached (wndwc37e_image_clr; SOR_SET_CONTROL owner none),
 // so the head scans out nothing. The surface stays allocated.
 void NVBringup::dispBlank()
@@ -1429,10 +1448,11 @@ void NVBringup::dispBlank()
     dispHdmiInfoFramesOff(0);
     d.dpmsOff = d.dpmsBySor = false;
     LOG("GSP: display: 0x%x unplugged: window 0 and SOR %u detached", d.litId, d.sorIdx);
-    d.litId = 0;
+    d.litId = d.parkedId = 0;
     d.sorIdx = ~0u;
     g->dispLit = false;
     setProperty("NVDisplayModeset", "unplugged");
+    dispDiag("detached");
 }
 
 // NV_DISPLAY_POWER_FN, DPMS: macOS put the display to sleep (on false) or woke it. Off is NVKMS's for a TMDS output
@@ -1645,6 +1665,7 @@ void NVBringup::dispHotplugTick()
     uint32_t want = 0, wantProto = 0;
     if (d.litId && (conn & d.litId)) {
         want = d.litId;
+        wantProto = d.proto;
     } else {
         for (uint32_t i = 0; i < d.nCand && !want; i++)
             if (conn & d.candId[i]) {
@@ -1654,7 +1675,8 @@ void NVBringup::dispHotplugTick()
     }
     if (!(conn & d.failId))
         d.failId = 0;
-    if (want == d.litId || (want && want == d.failId)) {
+    // Nothing to do: the lit display still there, a failed one, or the kept one still away.
+    if ((want == d.litId && !d.parkedId) || (want && want == d.failId) || (d.parkedId && !want)) {
         d.pendCount = 0;
         return;
     }
@@ -1665,6 +1687,33 @@ void NVBringup::dispHotplugTick()
         return;
     }
     d.pendCount = 0;
+    uint32_t keep = 1;
+    PE_parse_boot_argn("nvunplug", &keep, sizeof(keep));
+    if (!want && keep && d.litId && !d.parkedId) {
+        // Unplugged: offline for macOS, the hardware left running (see parkedId)
+        d.parkedId = d.litId;
+        LOG("GSP: display: 0x%x unplugged: kept lit, offline", d.litId);
+        dispDiag("unplug (kept)");
+        dispPublish();
+        return;
+    }
+    if (d.parkedId && want == d.litId) {
+        // The kept display is back: the same sink needs nothing, another one on the port a full relight
+        uint8_t *edid = (uint8_t *)IOMallocZero(kNvEdidMax);
+        uint32_t edidLen = 0;
+        const bool same = edid && dispReadEdid(want, edid, &edidLen) && edidLen == d.edidLen &&
+                          !memcmp(edid, d.edid, edidLen);
+        if (edid)
+            IOFree(edid, kNvEdidMax);
+        if (same) {
+            d.parkedId = 0;
+            LOG("GSP: display: 0x%x reconnected (same EDID): back online without a modeset", want);
+            dispDiag("replug (kept)");
+            dispPublish();
+            return;
+        }
+        LOG("GSP: display: 0x%x reconnected with a different EDID: relighting", want);
+    }
     const bool wasLit = d.litId != 0;
     if (wasLit)
         dispBlank();
@@ -1690,6 +1739,7 @@ void NVBringup::dispHotplugTick()
             return;
         }
         cursorEnableLocked();
+        dispDiag(wasLit ? "relight" : "light (hot-plug)");
     }
     dispPublish();
 }
@@ -1744,7 +1794,7 @@ void NVBringup::dispPublish()
         }
     }
     setProperty("NVDisplayFB", dict);
-    dispNubWant(dict, d.litId != 0);
+    dispNubWant(dict, d.litId != 0 && !d.parkedId);
     dict->release();
 }
 
@@ -2598,7 +2648,7 @@ void NVBringup::dispLost()
     d.hdmiOn = d.rangeLimited = d.dpmsOff = d.dpmsBySor = false;   // GSP-RM and the display engine start over
     d.hpdEvent = d.hpdBurst = 0;                    // the event object goes with the client
     d.ready = false;
-    d.litId = 0;
+    d.litId = d.parkedId = 0;
     g->dispLit = false;
     dispPublish();
     setProperty("NVDisplayModeset", "GSP-RM unloaded");
