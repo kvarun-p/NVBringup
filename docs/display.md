@@ -344,5 +344,9 @@ TU117, so they are not it.
 `hdmiaudio/` builds NVHDAPatch.kext, a Lilu plugin (OpenCore Kernel → Add after Lilu) that rewrites the table's
 10de:0e1b record to 10de:10fa (boot-arg `nvhdadid` for another ID) when AppleHDAController loads; `-nvhdaoff` turns
 it off. With `hdax=1` the controller should then attach. Building it needs a Lilu source tree and acidanthera's
-MacKernelSDK (see its Makefile). What AppleHDA needs from the graphics side afterwards (an IODisplay below a node with
-the same `hda-gfx` and `connector-type` 0x800) is not done yet.
+MacKernelSDK (see its Makefile). Verified 2026-10-16: with it, AppleHDAController, IOHDACodecDevice and AppleHDAHDMI_DPDriver attach to function 1.
+The output itself needs the graphics side: AppleHDAController finds the IODisplay below a node with its `hda-gfx`,
+reads that node's `connector-type` (0x800 HDMI) and `port-number`, and on IOFramebuffer notifications its
+`av-signal-type` (8, HDMI). With `nvhdmiaudio` bit 0, NVFramebuffer publishes those: `hda-gfx` copied from the GPU's
+PCI device, `connector-type` 0x800, `port-number` 0 at start, and `av-signal-type` 8 while online with a sink whose
+EDID announces audio (0 otherwise), set before the connect interrupt.
