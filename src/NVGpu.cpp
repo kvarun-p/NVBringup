@@ -874,8 +874,10 @@ bool NVBringup::dispInit()
         dmaObj(instVram, 0, vramLimit, 0x45);
         // Scanout (ISO) surfaces take a big-page context DMA (nv50_wndw_ctxdma_new: GF119_DMA_V0_PAGE_LP).
         dmaObj(instFb, 0, vramLimit, 0x05);
-        // Block-linear scanout surfaces: the same with a kind (gv100_dmaobj_new: any non-zero kind sets bit 20).
-        dmaObj(instFbBl, 0, vramLimit, 0x00100005);
+        // Block-linear scanout surfaces (zero-copy only): the same with a kind (gv100_dmaobj_new: any non-zero kind
+        // sets bit 20).
+        if (zeroCopy_)
+            dmaObj(instFbBl, 0, vramLimit, 0x00100005);
         // nvkm_ramht_insert: hash(chid, handle) with linear probing; context = chid << 25 | client | inst << 9.
         bool used[1024] = {};
         auto ramhtInsert = [&](uint32_t chid, uint32_t handle, uint32_t instOff) {
@@ -896,7 +898,7 @@ bool NVBringup::dispInit()
         // chid.user: core 0, window n 1 + n.
         if (!ramhtInsert(0, kDispHandleSync, instSync) || !ramhtInsert(0, kDispHandleVram, instVram) ||
             !ramhtInsert(1, kDispHandleSync, instSync) || !ramhtInsert(1, kDispHandleVram, instVram) ||
-            !ramhtInsert(1, kDispHandleFb, instFb) || !ramhtInsert(1, kDispHandleFbBl, instFbBl))
+            !ramhtInsert(1, kDispHandleFb, instFb) || (zeroCopy_ && !ramhtInsert(1, kDispHandleFbBl, instFbBl)))
             FAIL("RAMHT full");
         if (g->hClient & 0x2000)        // the context ORs inst << 9 over the client handle's bit 13
             LOG("GSP: display: warning: client handle 0x%x has bit 13 set, which collides with the DMA object offset",
