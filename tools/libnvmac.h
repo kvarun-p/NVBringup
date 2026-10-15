@@ -37,6 +37,9 @@ int nvmac_display_mem(nvmac_dev *d, uint32_t buffer, uint32_t *mem, uint64_t *si
 // Scans out that buffer from the next vblank; returns once the switch has happened (the other buffer is then
 // free to write), kIOReturnTimeout after 100 ms.
 int nvmac_display_flip(nvmac_dev *d, uint32_t buffer);
+// Zero-copy scanout (nv_uapi.h NVMAC_SURFACE_SCANOUT): va 0 forgets the surface. kIOReturnUnsupported without nvzerocopy.
+int nvmac_surface_scanout(nvmac_dev *d, uint32_t surface_id, uint64_t va, uint32_t pitch, uint32_t width,
+                          uint32_t height, uint32_t layout, uint32_t seed);
 int nvmac_mem_unmap(nvmac_dev *d, uint32_t mem);
 
 int nvmac_vm_bind(nvmac_dev *d, const struct nvmac_bind_op *ops, uint32_t count);
