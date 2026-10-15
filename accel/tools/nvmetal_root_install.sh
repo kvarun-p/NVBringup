@@ -193,6 +193,8 @@ if (( SYSTEM )); then
     print "If anything goes wrong: sudo $0 revert (from Recovery: bless --mount /Volumes/<system> --bootefi --last-sealed-snapshot)"
 else
     print "Reboot (or log out and sudo killall -HUP WindowServer) so WindowServer loads it."
-    [[ -e /System/Library/Extensions/NVMetal.bundle ]] && [[ $cmd != remove ]] &&
+    # An if, not &&: as the script's last command a false test would be its exit status (nvctl saw exit 1).
+    if [[ -e /System/Library/Extensions/NVMetal.bundle && $cmd != remove ]]; then
         print "Note: an older copy is still in /System/Library/Extensions; /Library/GPUBundles is used first. sudo $0 revert drops it."
+    fi
 fi
