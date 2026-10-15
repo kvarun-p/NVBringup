@@ -265,6 +265,7 @@ struct NVBringup::GspState {
         bool     edidValid = false;     // edid is a lit display's (dispSetMode)
         // HDMI (dispHdmiInfoFrames): the lit display's signal
         bool     hdmiOn = false;        // SET_HDMI_ENABLE true at the last modeset, InfoFrames sent
+        bool     audioOn = false;       // nvhdmiaudio: a valid ELD (PD=1 ELDV=1) is with GSP-RM
         bool     rangeLimited = false;  // the head compresses RGB to 16-235 (OCSC1, procamp CEA range)
         uint8_t  vic = 0;               // the CTA-861 video format sent in the AVI InfoFrame
         // DPMS (dispPower): macOS put the display to sleep

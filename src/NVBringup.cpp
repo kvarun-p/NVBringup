@@ -88,6 +88,7 @@ bool NVBringup::start(IOService *provider)
     const bool pipeOnce = nvramOneShot("nvdpipe-once");
     uint32_t pipe = 0;
     dispPipeArmed_ = (PE_parse_boot_argn("nvdpipe", &pipe, sizeof(pipe)) && pipe) || pipeOnce;
+    hdaCheckFunction();                     // nvhdmiaudio: is the GPU's HDA function (1) there
     if (dispPipeArmed_ && safeMode_) {
         LOG("safe mode (boot-attempt guard): display pipe gate ignored this boot");
         dispPipeArmed_ = false;

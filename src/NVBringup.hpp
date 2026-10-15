@@ -293,6 +293,15 @@ private:
     void     dispHdmiInfoFramesOff(uint32_t head);
     bool     dispHdmi20Sink(uint32_t displayId, const nv_sink_caps &sink, bool high);   // nvhdmi20: caps, SCDC
     bool     dispScdcRead(uint32_t displayId, uint8_t offset, uint8_t *out);
+    // HDMI audio (NVHdmiAudio.cpp, boot-arg nvhdmiaudio): ELD and mute state to GSP-RM, function 1 checks
+    uint32_t hdmiAudioArg();
+    bool     dispEldSend(uint32_t displayId, const uint8_t *eld, uint32_t maxFreq, bool pd, bool eldv);
+    void     dispHdmiAudio(uint32_t displayId, const nv_sink_caps *sink);   // sink nullptr: off; gspLock_ held
+    void     dispHdmiAudioPreModeset(uint32_t displayId);
+    IOPCIDevice *hdaFunction();                 // the HDA function (1) next to pci_, retained
+    void     hdaCheckFunction();
+    void     hdaProbe();                        // gspLock_ not held
+    bool     hdaProbeWant_ = false;             // dispHdmiAudio asks for a probe; dispNubSync runs it
     IOReturn dispPower(bool on);                // NV_DISPLAY_POWER_FN: DPMS for NVFramebuffer
     void     dispHpdArm();
     void     dispHpdEvent(const uint8_t *p, uint32_t len);    // NV_VGPU_MSG_EVENT_POST_EVENT, gspLock_ held
