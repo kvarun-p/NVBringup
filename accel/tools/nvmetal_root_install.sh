@@ -12,9 +12,10 @@
 #   sudo nvmetal_root_install.sh remove [--system]                              take it out again
 #   sudo nvmetal_root_install.sh revert                                         boot Apple's last sealed snapshot
 #                                                    (drops every system-volume change, a --system bundle included)
-# Then reboot (WindowServer loads the bundle at start). --system needs csr-active-config 0x803 (unrestricted
-# filesystem + unauthenticated root) and FileVault off; the default needs neither. If both copies exist, the one in
-# /Library/GPUBundles is used.
+# Then reboot (WindowServer loads the bundle at start). /Library/GPUBundles is SIP-protected (rootless.conf class
+# KernelExtensionManagement), so the default needs filesystem protection off (csr-active-config 0x2; 0x003 with the
+# kext bit, verified 2026-10-15 with authenticated root on). --system also needs authenticated root off (0x803) and
+# FileVault off. If both copies exist, the one in /Library/GPUBundles is used.
 # Keep /Library/GPUBundles root-owned and not group- or world-writable: the trust check in that lookup passes any
 # path, so whoever can write there can put code into WindowServer.
 # Quick off switch without a reboot: sudo touch /Library/Preferences/io.github.kvarun-p.nvmetal.disabled
@@ -90,6 +91,8 @@ if (( SYSTEM )); then
     trap 'umount $MNT 2>/dev/null || true' EXIT
     [[ -d $MNT/System/Library/Extensions ]] || die "$vol mounted at $MNT has no System/Library/Extensions"
 else
+    csrutil status | grep -q "Filesystem Protections: disabled" ||
+        die "SIP filesystem protection is on: /Library/GPUBundles is SIP-protected (csr-active-config needs 0x2; 0x003 with the kext bit)"
     # /Library/GPUBundles ships with macOS, root:wheel 755; made if missing, and refused if others can write it.
     [[ -d /Library/GPUBundles ]] || { mkdir -p /Library/GPUBundles; chown root:wheel /Library/GPUBundles; chmod 755 /Library/GPUBundles }
     [[ $(stat -f '%Su %Lp' /Library/GPUBundles) == "root 755" ]] ||

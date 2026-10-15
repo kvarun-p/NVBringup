@@ -110,7 +110,7 @@ on any of them; FWSEC and GSP-RM only run with the boot-arg `nvexperimental=1`. 
 |---|---|
 | Computer | Intel x86-64 Mac or hackintosh with an NVIDIA Turing GPU |
 | macOS | Sonoma 14 (developed on 14.8.9). Other versions are untested |
-| Boot loader | OpenCore, to load the kext (Kernel → Add). SIP stays enabled, except for the optional Metal step: `csr-active-config` `0x803` (kext signing, filesystem protection and authenticated root off) and FileVault off |
+| Boot loader | OpenCore, to load the kext (Kernel → Add). SIP stays enabled, except for the optional Metal step: `csr-active-config` `0x003` (kext signing and filesystem protection off; authenticated root and FileVault can stay on), plus `amfi_get_out_of_my_way=0x1` for the display pipe |
 | GPU visibility | The GPU must be powered and on the PCI bus. No SSDT that powers it off (the ACPI patches many hackintosh EFIs ship to disable the discrete GPU), no `-wegnoegpu`, no `disable-gpu` property |
 | Firmware | NVIDIA GSP firmware r570.144 from linux-firmware (not included; step 1). The kext is built for exactly this version |
 | Build tools | Xcode or the Command Line Tools (macOS SDK 14 or newer) |
@@ -249,10 +249,10 @@ Lets Metal apps you choose use the GPU. It needs SIP partly off and is the least
 is enough. Needs `NVMetal.bundle` from step 5.
 
 1. In `config.plist`: `csr-active-config` under NVRAM → Add → `7C436110-AB2A-4BBB-A880-FE41995C9F82`, and add
-   `nvaccel=1` to the boot-args. Reboot. The setting so far has been `03080000` (0x803: kext signing for the
-   auxiliary kexts, plus filesystem protection and authenticated root off, which only the older system-volume install
-   below needs). With the bundle in `/Library/GPUBundles`, 0x001 should be enough and FileVault can stay on; that is
-   being tested.
+   `nvaccel=1` to the boot-args. Reboot. Use `03000000` (0x003): kext signing off for the auxiliary kexts, and
+   filesystem protection off because `/Library/GPUBundles` is SIP-protected (installing or updating the bundle needs
+   it). Authenticated root stays on and FileVault can stay on (verified 2026-10-15). Only the older `--system`
+   install below needs `03080000` (0x803) and FileVault off. Once the bundle no longer changes, 0x001 would do.
 2. Build and install the accelerator kext (it can't go on the EFI: it links against a family
    in the system kernel collection, so it goes in the auxiliary one):
 
