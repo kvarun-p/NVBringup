@@ -1453,6 +1453,11 @@ void NVBringup::dispBlank()
     }
     if (d.sorIdx != ~0u)
         dispMthd(false, 0x300 + d.sorIdx * 0x20, 0);                              // SOR_SET_CONTROL: no owner
+    // HEAD_SET_DISPLAY_ID 0: no display on the head any more, which is how GSP-RM learns the display is off
+    // (NVKMS nvkms-evo.c "Tell RM that there is no DisplayID is associated with this head anymore", nouveau
+    // dispnv50 display_id(head, 0)). Without it GSP-RM kept head 0 -> 0x400 and the relight's SOR attach
+    // never took (SOR control read 0 after the update, no signal; 2026-10-15).
+    dispMthd(false, 0x2020, 0);
     dispCoreUpdate(1);
     dispHdmiInfoFramesOff(0);
     d.dpmsOff = d.dpmsBySor = false;
