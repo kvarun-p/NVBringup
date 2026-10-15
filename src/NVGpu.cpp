@@ -1170,6 +1170,7 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
             FAIL("no SOR assigned");
     }
 
+    dispHdmiAudioPreModeset(displayId);                     // nvhdmiaudio: the ELD invalid during the modeset
     // HDMI or DVI for this modeset (NV0073_CTRL_SPECIFIC_SET_HDMI_ENABLE_PARAMS: u8 subDeviceInstance, u32 displayId,
     // u8 enable): after the SOR assignment, before the modeset, as NVKMS's nvDpyUpdateHdmiPreModesetEvo. Told for
     // every HDMI sink, and once more to turn it off after one.
@@ -1338,7 +1339,9 @@ bool NVBringup::dispSetMode(uint32_t displayId, uint32_t rmProto, const uint8_t 
     d.dpmsOff = d.dpmsBySor = false;
     {
         char hs[128];
-        if (hdmi && dispHdmiInfoFrames(head, sink, vic, aspect, aviQ))
+        const bool frames = hdmi && dispHdmiInfoFrames(head, sink, vic, aspect, aviQ);
+        dispHdmiAudio(displayId, frames ? &sink : nullptr);    // nvhdmiaudio: ELD and unmute after the InfoFrames
+        if (frames)
             snprintf(hs, sizeof(hs), "HDMI, AVI VIC %u Q %u, range %s, SPD", vic, aviQ, limited ? "limited" : "full");
         else if (hdmi)
             snprintf(hs, sizeof(hs), "HDMI without InfoFrames (SF registers unusable), range %s",
@@ -1542,6 +1545,7 @@ void NVBringup::dispBlank()
     // dispnv50 display_id(head, 0)). Without it GSP-RM still reported head 0 -> 0x400 after the detach.
     dispMthd(false, 0x2020, 0);
     dispCoreUpdate(1);
+    dispHdmiAudio(d.litId, nullptr);
     dispHdmiInfoFramesOff(0);
     d.dpmsOff = d.dpmsBySor = false;
     LOG("GSP: display: 0x%x unplugged: window 0 and SOR %u detached", d.litId, d.sorIdx);
@@ -1790,6 +1794,7 @@ void NVBringup::dispHotplugTick()
         // Unplugged: offline for macOS, the hardware left running (see parkedId)
         d.parkedId = d.litId;
         LOG("GSP: display: 0x%x unplugged: kept lit, offline", d.litId);
+        dispHdmiAudio(d.litId, nullptr);                    // the sink is gone for the HDA codec too
         dispPublish();
         return;
     }
@@ -1807,6 +1812,8 @@ void NVBringup::dispHotplugTick()
         if (same) {
             d.parkedId = 0;
             LOG("GSP: display: 0x%x reconnected (same EDID): back online without a modeset", want);
+            if (d.hdmiOn)
+                dispHdmiAudio(want, &sc);
             dispPublish();
             return;
         }
@@ -2121,6 +2128,12 @@ void NVBringup::dispNubSync()
         OSSafeReleaseNULL(want);
     }
     IOLockUnlock(dispNubLock_);
+    IOLockLock(gspLock_);
+    const bool probe = hdaProbeWant_;
+    hdaProbeWant_ = false;
+    IOLockUnlock(gspLock_);
+    if (probe)
+        hdaProbe();                                         // nvhdmiaudio bit 1: the ELD read back from function 1
 }
 
 // shutdownHw (stop, or didTerminate when the PCI device goes). The nub is a client of the PCI device, not of
@@ -2750,6 +2763,7 @@ void NVBringup::dispLost()
         *m = NVDispMem();
     d.cursChan = d.cursOn = d.cursHave = false;     // the channel goes with the client
     d.hdmiOn = d.rangeLimited = d.dpmsOff = d.dpmsBySor = false;   // GSP-RM and the display engine start over
+    d.audioOn = false;
     d.hpdEvent = d.hpdBurst = 0;                    // the event object goes with the client
     d.ready = false;
     d.litId = d.parkedId = 0;
