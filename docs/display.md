@@ -350,3 +350,7 @@ reads that node's `connector-type` (0x800 HDMI) and `port-number`, and on IOFram
 `av-signal-type` (8, HDMI). With `nvhdmiaudio` bit 0, NVFramebuffer publishes those: `hda-gfx` copied from the GPU's
 PCI device, `connector-type` 0x800, `port-number` 0 at start, and `av-signal-type` 8 while online with a sink whose
 EDID announces audio (0 otherwise), set before the connect interrupt.
+It also publishes `audio-codec-info` 0x00040100 (codec 0, byte 1 = 1, pin widget 4): without it the controller
+looks its own PCI ID up in a second table (25 rows, no 10de:10fa) and never tells AppleHDAHDMI_DPDriver about the
+display. Verified 2026-10-16: with all of the above the TV appears under Sound → Output (AppleHDAEngineOutputDP,
+`audio-selector` "dpB0" written back on NVFramebuffer).
