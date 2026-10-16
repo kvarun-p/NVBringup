@@ -183,7 +183,7 @@ make test       # VBIOS/firmware parser self-test
    control, hide it from macOS's graphics stack. Add a DeviceProperties entry for the GPU's PCI
    path (for example `PciRoot(0x0)/Pci(0x1,0x0)/Pci(0x0,0x0)`) with `class-code` =
    `<00 00 FF 00>` (data). NVBringup reads the real class from config space and still attaches.
-6. Test from a USB copy of your EFI first, and keep a backup.
+6. Test from a USB copy of your EFI first.
 
 Reboot, then check that the kext found the chip and that FWSEC ran:
 
@@ -422,6 +422,7 @@ tools/nvcheck                    # the pre-install gate: builds, make verify/che
 tools/nvctl status               # what is built, installed and loaded, and whether they match
 tools/nvctl install              # the plan: every command, nothing changed
 tools/nvctl install --apply      # nvcheck, then backup, copy and record as one transaction
+tools/nvctl install efi --efi-backup --apply   # also copy the whole EFI to EFI-backup-<date> on the stick
 tools/nvctl rollback             # the plan to undo the last transaction (--apply to run it)
 ```
 

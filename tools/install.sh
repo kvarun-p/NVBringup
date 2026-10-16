@@ -159,25 +159,14 @@ if has efi; then
     elif [[ -d $EFI/OC/Kexts/NVBringup.kext ]] && same_bundle build/NVBringup.kext $EFI/OC/Kexts/NVBringup.kext; then
         ok "$EFI/OC/Kexts/NVBringup.kext is current"
     else
-        bak=${EFI:h}/EFI-backup-$(date +%F)
-        if [[ -e $bak ]]; then
-            note "today's backup $bak exists; keeping it"
+        run rm -rf $EFI/OC/Kexts/NVBringup.kext
+        run cp -RX build/NVBringup.kext $EFI/OC/Kexts/
+        run find $EFI/OC/Kexts/NVBringup.kext -name '._*' -delete   # FAT: AppleDouble files break the signature
+        if (( DRY )) || codesign -v $EFI/OC/Kexts/NVBringup.kext 2>/dev/null; then
+            ok "copied"
+            REBOOT+="NVBringup.kext on the EFI"
         else
-            run cp -RX $EFI $bak && { (( DRY )) || diff -rq $EFI $bak >/dev/null; } ||
-                { err "backup of the EFI failed; nothing changed"; bak=; }
-        fi
-        if [[ -n $bak ]]; then
-            run rm -rf $EFI/OC/Kexts/NVBringup.kext
-            run cp -RX build/NVBringup.kext $EFI/OC/Kexts/
-            run find $EFI/OC/Kexts/NVBringup.kext -name '._*' -delete   # FAT: AppleDouble files break the signature
-            if (( DRY )) || codesign -v $EFI/OC/Kexts/NVBringup.kext 2>/dev/null; then
-                ok "copied; backup in $bak"
-                REBOOT+="NVBringup.kext on the EFI"
-            else
-                err "the copied kext's signature doesn't verify; restore from $bak"
-            fi
-            others=(${EFI:h}/EFI-backup-*(N/))
-            (( ${#others} > 1 )) && note "${#others} EFI backups on ${EFI:h}; delete old ones you don't need"
+            err "the copied kext's signature doesn't verify; copy build/NVBringup.kext again"
         fi
         if ! grep -q '<string>NVBringup.kext</string>' $EFI/OC/config.plist 2>/dev/null; then
             TODO+="config.plist → Kernel → Add: BundlePath NVBringup.kext, ExecutablePath Contents/MacOS/NVBringup, PlistPath Contents/Info.plist, Arch x86_64, MinKernel 23.0.0, Enabled true (README step 3)"

@@ -47,8 +47,7 @@ STATE = "/Library/Application Support/nvctl"     # not .../NVBringup: tools/unin
 RECOVERY = ("recovery: boot with -nvoff (all NVBringup kexts stay out); NVMetal out of WindowServer: "
             "sudo touch /Library/Preferences/io.github.kvarun-p.nvmetal.disabled, or remove "
             "/Library/GPUBundles/NVMetal.bundle (from macOS Recovery: under /Volumes/<data>/Library/GPUBundles); "
-            "an older copy in the system volume: bless --mount /Volumes/<system> --bootefi --last-sealed-snapshot; "
-            "from another Mac: replace the USB's EFI with EFI-backup-<date>")
+            "an older copy in the system volume: bless --mount /Volumes/<system> --bootefi --last-sealed-snapshot")
 
 
 # ---- where things live --------------------------------------------------------------------------------------------
@@ -222,7 +221,7 @@ def stack_after(comps, lay, repo, manifest, gpu):
     return (gpu or {}).get("NVStackABI", 0) or 0
 
 
-def install_steps(comps, lay, cfg, repo, manifest, stamp, notes):
+def install_steps(comps, lay, cfg, repo, manifest, stamp, notes, efi_backup=False):
     """The steps of an install, and the manifest records they produce."""
     steps, records = [], {}
     bset = lay.backups / stamp
@@ -248,9 +247,9 @@ def install_steps(comps, lay, cfg, repo, manifest, stamp, notes):
         had = dst.exists()
         root = c != "vdisplay" and not (c == "efi" and os.access(dst.parent, os.W_OK))
 
-        if c == "efi":
-            # the whole EFI next to it on the stick, once a day (what tools/install.sh does): the copy that boots the
-            # Mac from another machine's hands if this one doesn't
+        if c == "efi" and efi_backup:
+            # --efi-backup: the whole EFI next to it on the stick, once a day: the copy that boots the Mac from
+            # another machine's hands if this one doesn't
             efi_bak = lay.efi.parent / ("EFI-backup-" + stamp[:4] + "-" + stamp[4:6] + "-" + stamp[6:8])
             if not efi_bak.exists():
                 steps.append(Step(c, "back up the whole EFI to %s" % efi_bak,
@@ -405,7 +404,7 @@ def cmd_install(args, lay, cfg, repo, out=print):
     gpu = nvlib.ioreg_class("NVBringup") if not lay.fake else (args.fake_gpu or {})
     stamp = args.stamp or datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     notes = []
-    steps, records = install_steps(comps, lay, cfg, repo, manifest, stamp, notes)
+    steps, records = install_steps(comps, lay, cfg, repo, manifest, stamp, notes, args.efi_backup)
     abi = stack_abi_of(repo)
     aux = [c for c in records if c in ("accel", "fb")]
     after = stack_after(list(records), lay, repo, manifest, gpu)
@@ -699,6 +698,7 @@ def main(argv=None, out=print):
     p.add_argument("--check-tier", type=int, default=2, choices=(1, 2, 3), help="nvcheck tier for the gate (default 2)")
     p.add_argument("--skip-check", action="store_true", help="plan without running nvcheck")
     p.add_argument("--force", action="store_true", help="install although the stack ABI won't match")
+    p.add_argument("--efi-backup", action="store_true", help="also copy the whole EFI to EFI-backup-<date> next to it")
     p.add_argument("--nvcheck", help=argparse.SUPPRESS)
     p = sub.add_parser("uninstall", help="plan or apply removing the manifest's kexts")
     p.add_argument("components", nargs="*", choices=COMPONENTS + [[]], metavar="COMPONENT")

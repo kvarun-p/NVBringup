@@ -107,12 +107,20 @@ class TestInstall(FakeSystem):
         bset = self.root / nvctl.STATE.lstrip("/") / "backups/20261014-100000"
         self.assertEqual((bset / "accel/NVMetalAccel.kext/Contents/MacOS/NVMetalAccel").read_text(), "accel v1")
         self.assertEqual((bset / "efi/NVBringup.kext/Contents/MacOS/NVBringup").read_text(), "nvbringup v1")
-        self.assertTrue((self.efi.parent / "EFI-backup-2026-10-14/OC/config.plist").exists())
         m = self.manifest()
         self.assertEqual(sorted(m["components"]), ["accel", "efi", "fb"])
         self.assertEqual(m["components"]["accel"]["stack_abi"], 1)
         self.assertEqual(m["transactions"][-1]["action"], "install")
         self.assertIsNone(m["transactions"][-1]["before"]["accel"])
+
+    def test_efi_backup_only_with_the_flag(self):
+        self.assertEqual(self.install("efi"), 0, "\n".join(self.log))
+        self.assertFalse((self.efi.parent / "EFI-backup-2026-10-14").exists())
+        (self.repo / "build/NVBringup.kext/Contents/MacOS/NVBringup").write_text("nvbringup v3")
+        self.assertEqual(self.nvctl("install", "efi", "--nvcheck", str(self.gate), "--stamp", "20261014-110000",
+                                    "--efi-backup", "--apply"), 0, "\n".join(self.log))
+        self.assertEqual((self.efi.parent / "EFI-backup-2026-10-14/OC/Kexts/NVBringup.kext/Contents/MacOS/NVBringup")
+                         .read_text(), "nvbringup v2")
 
     def test_second_install_is_a_no_op(self):
         self.assertEqual(self.install(), 0)
