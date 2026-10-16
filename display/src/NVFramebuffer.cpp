@@ -100,8 +100,9 @@ class NVFramebuffer : public IOFramebuffer {
     // IODisplay (scratchpad/hda-attach-2026-10-16/REPORT.md, disassembly of 14.8.9's AppleHDAController 540.3):
     // gfxMatchedHandler walks up from the IODisplay to the node whose hda-gfx is the controller's and reads its
     // connector-type (0x400 DP, 0x800 HDMI) and port-number; framebufferEventHandler, on the IOFramebuffer
-    // notifications, reads av-signal-type (kIOFBAVSignalTypeHDMI) and, for non-NVIDIA controllers only,
-    // audio-codec-info. hda-gfx is copied from the GPU's PCI device (OpenCore DeviceProperties).
+    // notifications, reads av-signal-type (kIOFBAVSignalTypeHDMI) and audio-codec-info. Without audio-codec-info it
+    // looks the controller's PCI ID up in its own table, which lacks 10de:10fa, and gives up before telling the codec
+    // driver about the display. hda-gfx is copied from the GPU's PCI device (OpenCore DeviceProperties).
     bool hdmiAudio_ = false;
     uint32_t avSignal_ = ~0u;           // av-signal-type as last published
     void publishAudioStatic();
@@ -365,6 +366,10 @@ void NVFramebuffer::publishAudioStatic()
     const uint32_t hdmi = 0x800;                        // connector-type, as AppleIntelFramebuffer publishes it
     setProperty("connector-type", (void *)&hdmi, sizeof(hdmi));
     setProperty("port-number", 0ull, 32);
+    // audio-codec-info: byte 0 codec address (0), byte 1 always 1 in the controller's table, byte 2 the pin widget
+    // (TU117's codec 0x10de0094 has HDMI pins 4-7; the sink shows up on pin 4). Bytes 1 and 2 must be nonzero.
+    const uint32_t codecInfo = 0x00040100;
+    setProperty("audio-codec-info", (void *)&codecInfo, sizeof(codecInfo));
     publishAudio();
 }
 
@@ -411,7 +416,7 @@ bool NVFramebuffer::start(IOService *provider)
     if (!cursorBuf_ && !(PE_parse_boot_argn("nvswcursor", &sw, sizeof(sw)) && sw))
         cursorBuf_ = (uint32_t *)IOMallocZero(kCursorBufPx * 4);
     applyNub();                     // no connect interrupt: IOGraphics hasn't registered for it yet
-    publishAudioStatic();           // nvhdmiaudio: hda-gfx, connector-type, av-signal-type
+    publishAudioStatic();           // nvhdmiaudio: hda-gfx, connector-type, audio-codec-info, av-signal-type
     if (!IOFramebuffer::start(provider)) {
         nub_ = nullptr;
         LOG("IOFramebuffer::start failed");
