@@ -2686,15 +2686,9 @@ IOReturn NVBringup::pipeCopy(OSObject *key, IOMemoryDescriptor *md, nv_pipe_copy
         dispMthd(true, 0x370, 0);                                         // not interlocked with the core
         dispMthd(true, 0x374, 0);
         dispMthd(true, 0x200, 1);                                         // UPDATE: latched at the next vblank
-        uint32_t lines = dispLinesToVblank();
-        if (!lines)
-            lines = dd.vtotal;
-        // Shown at the next vblank (two lines' margin), or a frame after the flip before it if that one is still
-        // queued; the buffer before is on screen until then.
-        uint64_t showAt = mach_absolute_time() + dispLinesAbs(lines + 2);
-        const uint64_t frame = dispLinesAbs(dd.vtotal);
-        if (dd.pipeShowAt && showAt < dd.pipeShowAt + frame)
-            showAt = dd.pipeShowAt + frame;
+        // The buffer before is on screen until then.
+        const uint32_t lines = dispLinesToVblank();     // for the trace
+        const uint64_t showAt = dispShowAt((uint32_t)(f.pa >> 8));
         if (dd.pipeArmed < 3)
             dd.pipeFreeAt[dd.pipeArmed] = showAt;
         dd.pipeShowAt = showAt;
@@ -2747,6 +2741,40 @@ uint32_t NVBringup::dispLinesToVblank()
         return 0;
     const uint32_t n = (g->disp.vbS + 1 + vt - line) % vt;
     return n ? n : vt;
+}
+
+// After a window 0 UPDATE (methods already pushed) to the image at offset want (address >> 8): when the flip is on
+// screen. The display engine latches the window's armed state at a vblank (displayFlip), so the flip shows at the
+// first vblank after the UPDATE is armed. Predicting it from the raster line at UPDATE time alone was a frame early
+// whenever the UPDATE reached the armed state only after that vblank: the pipe then completed the transaction
+// while the image before was still scanned out, WindowServer started redrawing it, and a black band (its clear)
+// flashed near the top of the screen. So wait for the armed state (window 0's armed offset, 0x690a60; a few us),
+// count from there, and take the vblank after if it was armed within a few lines of one or wasn't seen armed.
+// Also a frame after the flip before it if that one is still queued.
+uint64_t NVBringup::dispShowAt(uint32_t want)
+{
+    GspState::DispHw &d = gsp_->disp;
+    uint64_t until = 0;
+    clock_interval_to_deadline(500, kMicrosecondScale, &until);
+    bool armed = false;
+    do {
+        const uint32_t v = rd32(0x690a60);
+        if (v == 0xffffffffu)
+            break;
+        armed = v == want;
+    } while (!armed && mach_absolute_time() < until);
+    uint32_t lines = dispLinesToVblank();
+    if (!lines)
+        lines = d.vtotal;
+    const uint64_t frame = dispLinesAbs(d.vtotal);
+    uint64_t showAt = mach_absolute_time() + dispLinesAbs(lines + 2);
+    if (!armed || lines < 8) {
+        showAt += frame;
+        (armed ? d.flipsLate : d.flipsUnarmed)++;
+    }
+    if (d.pipeShowAt && showAt < d.pipeShowAt + frame)
+        showAt = d.pipeShowAt + frame;
+    return showAt;
 }
 
 uint64_t NVBringup::dispLinesAbs(uint32_t lines)
@@ -4366,13 +4394,7 @@ IOReturn NVBringup::pipeScanout(nv_pipe_scanout *a)
     dispMthd(true, 0x370, 0);                                       // not interlocked with the core
     dispMthd(true, 0x374, 0);
     dispMthd(true, 0x200, 1);                                       // UPDATE: latched at the next vblank
-    uint32_t lines = dispLinesToVblank();
-    if (!lines)
-        lines = d.vtotal;
-    uint64_t showAt = mach_absolute_time() + dispLinesAbs(lines + 2);
-    const uint64_t frame = dispLinesAbs(d.vtotal);
-    if (d.pipeShowAt && showAt < d.pipeShowAt + frame)
-        showAt = d.pipeShowAt + frame;
+    const uint64_t showAt = dispShowAt((uint32_t)(e->pa >> 8));
     if (d.scanCur != slot)
         scanRetire(showAt);                                         // the image shown before goes at showAt
     d.scanHeld[slot].used = true;
@@ -4388,13 +4410,15 @@ IOReturn NVBringup::pipeScanout(nv_pipe_scanout *a)
     a->result = NV_PIPE_SCANOUT_OK;
     a->showAt = showAt;
     if (d.scanFlips == 1 || d.scanFlips % 120 == 0) {
-        char m[160];
-        snprintf(m, sizeof(m), "%llu flips; refused: not ready %llu, not registered %llu, stale %llu, geometry %llu, busy %llu",
+        char m[224];
+        snprintf(m, sizeof(m), "%llu flips; refused: not ready %llu, not registered %llu, stale %llu, geometry %llu, busy %llu; "
+                 "pipe flips armed late %llu, not seen armed %llu",
                  (unsigned long long)d.scanFlips, (unsigned long long)d.scanRefused[NV_PIPE_SCANOUT_NOT_READY],
                  (unsigned long long)d.scanRefused[NV_PIPE_SCANOUT_NOT_REGISTERED],
                  (unsigned long long)d.scanRefused[NV_PIPE_SCANOUT_STALE],
                  (unsigned long long)d.scanRefused[NV_PIPE_SCANOUT_GEOMETRY],
-                 (unsigned long long)d.scanRefused[NV_PIPE_SCANOUT_BUSY]);
+                 (unsigned long long)d.scanRefused[NV_PIPE_SCANOUT_BUSY],
+                 (unsigned long long)d.flipsLate, (unsigned long long)d.flipsUnarmed);
         setProperty("NVZeroCopy", m);
     }
     dispExit();

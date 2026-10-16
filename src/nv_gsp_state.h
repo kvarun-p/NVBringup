@@ -230,6 +230,7 @@ struct NVBringup::GspState {
         int32_t  scanCur = -1;
         struct ScanHeld { uint64_t vram = 0, releaseAt = 0; bool used = false, zombie = false; } scanHeld[4];
         uint64_t scanFlips = 0, scanRefused[6] = {};    // NVZeroCopy: flips, refusals by NV_PIPE_SCANOUT_* reason
+        uint64_t flipsLate = 0, flipsUnarmed = 0;       // pipe flips armed close to the vblank / not seen armed
         // Per-frame pipe timeline (NVPipeTiming, published with NVPipeFlips): copy = submit to copy engines done,
         // queue = done to UPDATE written, lead = UPDATE to the estimated latch, gap = flip to flip. Sum and max in
         // us over the flips since the last publish, plus the count of copies that missed the 4 ms spin.

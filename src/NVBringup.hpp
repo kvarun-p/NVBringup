@@ -365,6 +365,7 @@ private:
     void     scanRetire(uint64_t showAt);           // the image scanned out until now is replaced at showAt
     uint32_t dispLinesToVblank();               // raster lines until head 0's next vblank starts (0: unknown)
     uint64_t dispLinesAbs(uint32_t lines);      // their duration, in absolute time units
+    uint64_t dispShowAt(uint32_t want);         // after a window 0 UPDATE to offset want: when it is on screen
     int      pipeSrcMap(OSObject *key, IOMemoryDescriptor *md);   // the slot holding the source, or -1
     void     pipeSrcDrop(uint32_t i, bool unmap);
     void     pipeSrcFlush(bool unmap);
