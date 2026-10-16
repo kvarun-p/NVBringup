@@ -199,6 +199,46 @@ NVIDIA GPU. Armed with boot-arg `nvdpipe=1`, or for one boot `sudo nvram nvdpipe
   `NVPipeGpuCopies`, `NVPipeCpuCopies` on the accelerator show how it goes. The CPU copy is the fallback for
   frames before the display is lit and across mode changes.
 
+### Zero-copy scanout (`nvzerocopy=1`)
+
+Default off, with `nvdpipe=1` (also ignored in a safe-mode boot). NVMetal in WindowServer renders each display
+surface into a VRAM image and writes it back to the IOSurface (for Intel's display hardware in mirror mode and for
+anyone who reads the surface). With this on, the pipe scans that VRAM image out instead of copying the IOSurface into
+a scanout buffer.
+
+- **Registration** (`NVMAC_SURFACE_SCANOUT`, `src/nv_uapi.h`): after the last write-back of a surface's only image
+  has landed, and before the command buffer counts as submitted (which WindowServer's commit waits for), NVMetal
+  calls the ICD's exported `nvk_macos_register_scanout`, which sends the kext the IOSurface ID, the image's GPU VA,
+  row pitch, size, layout and the surface's seed (`IOSurfaceGetSeed`, which moves on every write lock). The layout is
+  NVK's own: pitch-linear, or block-linear with 2^n GOBs per block (a 1920x1080 BGRA image: pitch 7680, n = 4,
+  checked on this machine with the build tree's ICD). The kext resolves the VA through the connection's bindings to a
+  VRAM address (one binding of VRAM memory; 256-byte aligned, 4 KiB for block-linear) and keeps the entry until the
+  memory is freed or the connection closes. Only WindowServer (uid 88) or root may register; the selector and feature
+  bit exist only with the boot-arg.
+- **Per frame** (`NVDisplayPipe::submitTransaction`): the pipe first asks `NVPipeScanout` (`src/nv_pipe_copy.h`)
+  with the surface's ID and its current lock seed (`IOSurface::getLockSeed`). The kext refuses (and the pipe copies as
+  before) unless the surface is registered at that seed (`nvzerocopy=2`: whatever the seed), is the lit mode's size,
+  and the display is lit with flips on. Otherwise it programs window 0 for the image (storage: block height and
+  layout; pitch; a second DMA object with a kind for block-linear, `kDispHandleFbBl`, built like nouveau's gv100
+  ctxdma; the offset) and flips at the next vblank, with the same queued-flip bookkeeping as the copy path.
+- **Lifetime:** the image's VRAM is held (`DispHw::scanHeld`) while it is scanned out and until the flip that replaces
+  it has been shown (`pipeShowAt`); if NVMetal frees it meanwhile, the block is freed once the replacing flip has
+  been shown (checked at the next flip or allocation, and at a modeset). The transaction completes only when its own flip is
+  shown (about a frame): from then on WindowServer may reuse the previous surface, as with a real pipe. A copy
+  after a zero-copy frame completes 40 ms later for the same reason. That WindowServer never renders into the
+  surface it last presented is its own behaviour on every GPU (inferred; it is not enforced here).
+- **Safety net:** the seed. Surfaces NVMetal did not render (an Intel-rendered mirror master, a video layer), or that
+  anyone wrote after NVMetal's write-back, have another seed or none registered, and are copied.
+- **Not done:** the aperture copy (`fb`) the copy path keeps current for mirror mode is skipped on a zero-copy
+  frame. A mirror that reads the NVIDIA framebuffer's aperture would show a stale picture (inferred not to be the
+  case: hardware mirroring scans the master's IOSurface, which write-back keeps current).
+- **Switches:** boot-arg `nvzerocopy` (kext side; `=2` no seed check); `NVMETAL_ZEROCOPY=0` in
+  `/Library/Preferences/io.github.kvarun-p.nvmetal.env` stops NVMetal in WindowServer registering images (the pipe
+  then copies everything), `=1` registers from other processes too. `NVMETAL_ZEROCOPY_DEBUG=1` prints each
+  registration's address, pitch and layout from the ICD.
+- **Counters:** `ZeroCopyFlips`, `ZeroCopyFallbacks`, `ZeroCopyLastResult` on NVMetalAccelerator; NVBringup's
+  `NVZeroCopy` (flips and the refusals by reason). `tools/nvframes` prints them.
+
 Found on hardware, each a boot or more:
 
 | Symptom | Cause |
@@ -274,8 +314,43 @@ binary's ad-hoc signature, so a rebuild needs it granted again.
   RM side (ELD, `SET_ELD_AUDIO_CAPS`) and a macOS driver for the GPU's HDA function. No HDMI 2.0 (above 340 MHz),
   no deep colour, no YCbCr output.
 - **One mode,** the preferred one or the best the port carries, and one head. No mode switching or HiDPI modes.
-- **A copy per frame:** the display pipe copies each composited frame into the scanout. Scanning out NVMetal's
-  image directly (zero copy) is the next step.
+- **A copy per frame** unless `nvzerocopy=1` is on and the surface is NVMetal's own ([zero-copy](#zero-copy-scanout-nvzerocopy1);
+  untested on hardware as of 2026-10-16).
 - **Tested on Sonoma only.** The private interfaces the display pipe uses (IOAcceleratorFamily2's vtables, AGDC
   selectors) must be checked again on Sequoia and Tahoe (`make verify` in `accel/` and `display/`).
 - **The GPU stays powered with `nvdisp=2`,** monitor or not.
+
+## HDMI audio (boot-arg `nvhdmiaudio`, default off)
+
+`src/NVHdmiAudio.cpp` is the GPU's half of HDMI audio on the HDMI port. Bit 0 (1): after an HDMI modeset, at a
+reconnect with the same EDID, and at a hot-plug it sends GSP-RM the unmuting general control packet, the stream
+unmute and the ELD built from the EDID (`nv_eld_build`) through `DFP_SET_ELD_AUDIO_CAPS` with PD=1 ELDV=1, as
+NVKMS's `nvHdmiDpEnableDisableAudio` does. Before a modeset the ELD goes invalid, at an unplug or detach it is
+cleared. Bit 1 (2): reads the ELD back through the GPU's HDA function (PCI function 1) when no driver owns it.
+Bit 2 (4): sets bit 25 of function 0's config register 0x488 if function 1 is absent (Linux quirk). Bit 3 (8):
+turns on function 1's snoop bits (config 0x4e, 0x4d, 0x4c) at start, as Linux does for NVIDIA HDA controllers;
+the three bytes are logged either way. The audio InfoFrame, ACR and the stream belong to the HDA driver, not to
+this kext. Results: ioreg `NVHdaFunction`, `NVDisplayAudio` on the NVBringup service and the `HDMI audio:` lines of
+ioreg `NVLog` (`nvgsp status` shows only the `GSP:` lines).
+
+On this TU117 laptop (2026-10-16): with `nvhdmiaudio=3` the codec (vendor 0x10de0094) reports the TV on pin 4 with
+a valid ELD identical to the one sent. macOS needs DeviceProperties for AppleHDAController to take function 1:
+`hda-gfx` = `onboard-2` on the GPU and on `PciRoot(0x0)/Pci(0x1,0x0)/Pci(0x0,0x1)`, which also gets `layout-id`
+7 (the Intel pair keeps `onboard-1`). That alone attaches nothing: AppleHDAController::probe accepts only the PCI
+IDs in its own table (16 NVIDIA ones, up to GK10x; not 10de:10fa) and, for a provider not named HDEF/HDAU, only with
+the boot-arg `hdax=1` (scratchpad/hda-attach-2026-10-16/REPORT.md). Bit 3's snoop bytes read 0 and ignore writes on
+TU117, so they are not it.
+
+`hdmiaudio/` builds NVHDAPatch.kext, a Lilu plugin (OpenCore Kernel → Add after Lilu) that rewrites the table's
+10de:0e1b record to 10de:10fa (boot-arg `nvhdadid` for another ID) when AppleHDAController loads; `-nvhdaoff` turns
+it off. With `hdax=1` the controller should then attach. Building it needs a Lilu source tree and acidanthera's
+MacKernelSDK (see its Makefile). Verified 2026-10-16: with it, AppleHDAController, IOHDACodecDevice and AppleHDAHDMI_DPDriver attach to function 1.
+The output itself needs the graphics side: AppleHDAController finds the IODisplay below a node with its `hda-gfx`,
+reads that node's `connector-type` (0x800 HDMI) and `port-number`, and on IOFramebuffer notifications its
+`av-signal-type` (8, HDMI). With `nvhdmiaudio` bit 0, NVFramebuffer publishes those: `hda-gfx` copied from the GPU's
+PCI device, `connector-type` 0x800, `port-number` 0 at start, and `av-signal-type` 8 while online with a sink whose
+EDID announces audio (0 otherwise), set before the connect interrupt.
+It also publishes `audio-codec-info` 0x00040100 (codec 0, byte 1 = 1, pin widget 4): without it the controller
+looks its own PCI ID up in a second table (25 rows, no 10de:10fa) and never tells AppleHDAHDMI_DPDriver about the
+display. Verified 2026-10-16: with all of the above the TV appears under Sound → Output (AppleHDAEngineOutputDP,
+`audio-selector` "dpB0" written back on NVFramebuffer).

@@ -69,8 +69,12 @@ public:
 };
 
 // The S1 display pipe: a plane-0 copy into NVBringup's scanout (the copy engine, else the CPU), done in submit.
-// Every transaction completes at once. (A completion hold, NVPipeHoldMs, was added for the black flashes in
+// Every copied transaction completes at once. (A completion hold, NVPipeHoldMs, was added for the black flashes in
 // mirror mode and removed again: their cause was NVBringup wiring the surface read-only, 8960221.)
+// Zero-copy (boot-arg nvzerocopy=1, NVStackFeatures says so): a surface NVMetal registered an image for is scanned
+// out in place, with no copy. The surface is in use until a later flip has replaced it, so that transaction
+// completes only when its own flip is shown (completion holds, thread call as in 5861eb7): WindowServer reuses
+// the surface behind it from then on. A copy after a zero-copy frame is held the same way, for two frames.
 // Init is the family's own (not overridden).
 class NVDisplayPipe : public IOAccelDisplayPipe {
     OSDeclareDefaultStructors(NVDisplayPipe)
@@ -85,8 +89,22 @@ private:
     uint64_t done_[kDoneRing] = {};         // transaction id + 1 of recently copied transactions; 0 = empty
     uint32_t doneNext_ = 0;
     IOReturn copyPlane0(IOAccelDisplayPipeTransaction2 *txn);
+    bool scanoutPlane0(IOAccelDisplayPipeTransaction2 *txn, uint64_t *showAt);
     void markDone(uint32_t id);
     bool isDone(uint32_t id);
+    // Transactions whose completion waits for a deadline (pendLock_), and the thread call that completes them.
+    static const uint32_t kPend = 8;
+    struct Pending { uint32_t id; uint64_t due; bool used; } pend_[kPend] = {};
+    IOSimpleLock *pendLock_ = nullptr;
+    thread_call_t pendCall_ = nullptr;
+    uint64_t pendArmed_ = 0;                // the deadline pendCall_ is armed for, 0: not armed (pendLock_)
+    bool pendStop_ = false;                 // free: no more fires (pendLock_)
+    int pendBusy_ = 0;                      // pendFire calls past their entry check (pendLock_)
+    bool lastZeroCopy_ = false;             // the previous frame was scanned out in place
+    bool holdCompletion(uint32_t id, uint64_t due);     // false: couldn't, complete now
+    static void pendFire(thread_call_param_t self, thread_call_param_t);
+public:
+    void free() override;
 };
 
 class NVMetalAccelerator : public IOGraphicsAccelerator2 {
@@ -830,12 +848,30 @@ n_ret NVDisplayPipe::submitTransaction(IOAccelDisplayPipeTransaction2 *txn)
 {
     const uint32_t id = txn->getTransactionID();
     gSubmits++;
-    IOReturn r = copyPlane0(txn);
+    uint64_t showAt = 0;
+    IOReturn r = kIOReturnSuccess;
+    bool held = false;
+    if (scanoutPlane0(txn, &showAt)) {
+        // Complete when the flip is shown (and a little after): the surface before it is out of scanout then
+        uint64_t margin = 0;
+        nanoseconds_to_absolutetime(1000000, &margin);
+        held = holdCompletion(id, showAt + margin);
+        lastZeroCopy_ = true;
+    } else {
+        r = copyPlane0(txn);
+        if (lastZeroCopy_ && r == kIOReturnSuccess) {   // the copy's flip replaces the scanned-out image: ~2 frames
+            uint64_t due = 0;
+            clock_interval_to_deadline(40, kMillisecondScale, &due);
+            held = holdCompletion(id, due);
+        }
+        lastZeroCopy_ = false;
+    }
     if (r == kIOReturnSuccess)
         gCompletes++;
     else
         noteError(r);
-    markDone(id);
+    if (!held)
+        markDone(id);
     publishU("NVPipeSubmits", gSubmits);
     publishU("NVPipeCompletes", gCompletes);
     signalTransactionInterrupt(nullptr);    // kicks completion: the next poll of 278 finds this one done
@@ -851,6 +887,103 @@ void NVDisplayPipe::markDone(uint32_t id)
 {
     uint32_t slot = __atomic_fetch_add(&doneNext_, 1, __ATOMIC_RELAXED) % kDoneRing;
     __atomic_store_n(&done_[slot], (uint64_t)id + 1, __ATOMIC_RELEASE);
+}
+
+bool NVDisplayPipe::holdCompletion(uint32_t id, uint64_t due)
+{
+    if (!pendLock_) {
+        IOSimpleLock *l = IOSimpleLockAlloc();
+        if (l && !OSCompareAndSwapPtr(nullptr, l, &pendLock_))
+            IOSimpleLockFree(l);
+    }
+    if (!pendCall_) {
+        thread_call_t c = thread_call_allocate_with_options(pendFire, this, THREAD_CALL_PRIORITY_HIGH, 0);
+        if (c && !OSCompareAndSwapPtr(nullptr, c, &pendCall_))
+            thread_call_free(c);
+    }
+    if (!pendLock_ || !pendCall_)
+        return false;
+    bool held = false, arm = false;
+    IOSimpleLockLock(pendLock_);
+    for (uint32_t i = 0; i < kPend && !held; i++)
+        if (!pend_[i].used) {
+            pend_[i] = { id, due, true };
+            held = true;
+        }
+    // Armed already for an earlier deadline: that fire reschedules for this one. (Arming again would move the
+    // call later each frame, and at 60 Hz it would never fire.) Deadlines come in order, so the armed one is the
+    // earliest unless it has gone, which the fire then notices.
+    if (held && (!pendArmed_ || due < pendArmed_)) {
+        pendArmed_ = due;
+        arm = true;
+    }
+    IOSimpleLockUnlock(pendLock_);
+    if (arm)
+        thread_call_enter_delayed(pendCall_, due);
+    return held;
+}
+
+void NVDisplayPipe::pendFire(thread_call_param_t self, thread_call_param_t)
+{
+    NVDisplayPipe *p = (NVDisplayPipe *)self;
+    const uint64_t now = mach_absolute_time();
+    uint64_t next = 0;
+    bool any = false;
+    IOSimpleLockLock(p->pendLock_);
+    if (p->pendStop_) {
+        IOSimpleLockUnlock(p->pendLock_);
+        return;
+    }
+    p->pendBusy_++;
+    for (uint32_t i = 0; i < kPend; i++) {
+        if (!p->pend_[i].used)
+            continue;
+        if (p->pend_[i].due <= now) {
+            p->markDone(p->pend_[i].id);
+            p->pend_[i].used = false;
+            any = true;
+        } else if (!next || p->pend_[i].due < next) {
+            next = p->pend_[i].due;
+        }
+    }
+    p->pendArmed_ = next;
+    IOSimpleLockUnlock(p->pendLock_);
+    if (next)
+        thread_call_enter_delayed(p->pendCall_, next);
+    if (any)
+        p->signalTransactionInterrupt(nullptr);         // the family polls 278 and finds them done
+    IOSimpleLockLock(p->pendLock_);
+    p->pendBusy_--;
+    IOSimpleLockUnlock(p->pendLock_);                   // the last touch: free may go on once this is 0
+}
+
+void NVDisplayPipe::free()
+{
+    // No thread_call_cancel_wait: it is private KPI, and with it the kext didn't link into the auxiliary
+    // collection at all (2026-10-12). Stop new fires, cancel a pending one, wait out one already running.
+    if (pendCall_ && pendLock_) {
+        IOSimpleLockLock(pendLock_);
+        pendStop_ = true;
+        IOSimpleLockUnlock(pendLock_);
+        thread_call_cancel(pendCall_);
+        for (;;) {
+            IOSimpleLockLock(pendLock_);
+            const bool busy = pendBusy_ != 0;
+            IOSimpleLockUnlock(pendLock_);
+            if (!busy)
+                break;
+            IOSleep(1);
+        }
+    }
+    if (pendCall_) {
+        thread_call_free(pendCall_);
+        pendCall_ = nullptr;
+    }
+    if (pendLock_) {
+        IOSimpleLockFree(pendLock_);
+        pendLock_ = nullptr;
+    }
+    IOAccelDisplayPipe::free();
 }
 
 bool NVDisplayPipe::isDone(uint32_t id)
@@ -923,6 +1056,67 @@ static bool gpuCopy(IOFramebuffer *fb, IOSurface *s, IOMemoryDescriptor *src, ui
     }
     *us = a.gpuUs;
     return true;
+}
+
+// Zero-copy (boot-arg nvzerocopy=1 on NVBringup, which then lists NV_STACK_F_PIPE_SCANOUT): NVBringup scans out the
+// image NVMetal registered for plane 0's IOSurface, if the surface is still at the registered seed (nv_pipe_copy.h).
+// True: window 0 shows it from *showAt on and nothing was copied. False: the caller copies. Counters on the accelerator:
+// ZeroCopyFlips, ZeroCopyFallbacks, ZeroCopyLastResult (NV_PIPE_SCANOUT_*; 0 when not asked).
+static uint64_t gZeroCopy, gZeroCopyMiss;
+
+bool NVDisplayPipe::scanoutPlane0(IOAccelDisplayPipeTransaction2 *txn, uint64_t *showAt)
+{
+    static int mode = -1;       // -1: not decided yet, 0: off, 1: NVBringup offers it
+    static const OSSymbol *fn;
+    IOFramebuffer *fb = getFramebuffer();
+    IOSurface *s = txn->getPlaneIOSurface(0, 0);
+    if (mode == 0 || !fb || !s)
+        return false;
+    IOService *gpu = gpuOf(fb);
+    if (!gpu)
+        return false;
+    if (mode < 0) {
+        OSNumber *f = OSDynamicCast(OSNumber, gpu->getProperty(NV_STACK_FEATURES_KEY));
+        mode = f && (f->unsigned32BitValue() & NV_STACK_F_PIPE_SCANOUT) ? 1 : 0;
+        fn = mode ? OSSymbol::withCStringNoCopy(NV_PIPE_SCANOUT_FN) : nullptr;      // kept for the kext's lifetime
+        if (mode)
+            LOG("display pipe: zero-copy scanout offered by NVBringup (nvzerocopy)");
+        if (!fn)
+            mode = 0;
+        if (!mode)
+            return false;
+    }
+    int dmode = 0, depth = 0;
+    IOPixelInformation info;
+    bzero(&info, sizeof(info));
+    if (fb->getCurrentDisplayMode(&dmode, &depth) != kIOReturnSuccess ||
+        fb->getPixelInformation(dmode, depth, kIOFBSystemAperture, &info) != kIOReturnSuccess ||
+        info.bitsPerPixel != 32)
+        return false;
+    nv_pipe_scanout a = {};
+    a.version = NV_PIPE_SCANOUT_VERSION;
+    a.surfaceId = s->getSurfaceID();
+    a.seed = s->getLockSeed();
+    a.width = s->getPlaneWidth(0);
+    a.height = s->getPlaneHeight(0);
+    a.dstWidth = info.activeWidth;
+    a.dstHeight = info.activeHeight;
+    a.dstPitch = info.bytesPerRow;
+    IOReturn r = gpu->callPlatformFunction(fn, false, &a, nullptr, nullptr, nullptr);
+    if (r == kIOReturnSuccess && a.result == NV_PIPE_SCANOUT_OK) {
+        publishU("ZeroCopyFlips", ++gZeroCopy);
+        *showAt = a.showAt;
+        return true;
+    }
+    gZeroCopyMiss++;
+    if (gZeroCopyMiss <= 4)
+        LOG("display pipe: zero-copy refused for surface %u (result %u, seed %u, registered %u, call %#x): copying",
+            a.surfaceId, a.result, a.seed, a.regSeed, r);
+    if (gZeroCopyMiss <= 4 || gZeroCopyMiss % 300 == 0) {
+        publishU("ZeroCopyFallbacks", gZeroCopyMiss);
+        publishU("ZeroCopyLastResult", a.result);
+    }
+    return false;
 }
 
 // Copies plane 0's dirty rect (or the whole surface when the rect is empty or invalid) from the transaction's

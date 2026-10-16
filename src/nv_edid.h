@@ -54,9 +54,21 @@ struct nv_sink_caps {
     uint8_t  vics[48];                              // the SVDs in EDID order, without the native bit
     uint8_t  nativeVic;                             // the first SVD marked native, 0 none
     uint8_t  nSad;                                  // short audio descriptors
+    uint8_t  sads[15 * 3];                          // the first 15 of them, 3 bytes each (what an ELD holds)
+    uint8_t  speaker;                               // speaker allocation data block, byte 1 (0: none)
+    bool     supportsAI;                            // HDMI VSDB Supports_AI (byte 6 bit 7): ACP, ISRC1/2 packets
+    uint8_t  audioLatency;                          // HDMI VSDB Audio_Latency (with Latency_Fields_Present), 0 none
+    uint8_t  vendorProduct[4];                      // EDID bytes 8-11: manufacturer and product codes, as stored
 };
 
 bool nv_edid_parse(const uint8_t *e, uint32_t len, nv_sink_caps *c);
+
+// The ELD (EDID-like data, HDA 015a / CTA-861 audio) GSP-RM hands the GPU's HDA codec for an HDMI sink, as NVKMS's
+// FillELDBuffer (nvkms-hdmi.c) builds it: version 2, the CTA revision, monitor name, SADs, speaker allocation,
+// Supports_AI and the audio latency, port ID = displayId. out is the 96-byte NV0073 ELD buffer; *maxFreq the highest
+// sample rate as NV0073_CTRL_DFP_ELD_AUDIO_CAPS_MAX_FREQ_SUPPORTED (1 32 kHz .. 7 192 kHz). Returns the baseline ELD
+// length in bytes (4 + baseline block), 0 if the sink has no audio (no SAD and no basic audio): no ELD then.
+uint32_t nv_eld_build(const nv_sink_caps *c, uint32_t displayId, uint8_t out[96], uint32_t *maxFreq);
 
 // The highest TMDS clock the sink says it takes (kHz): the HDMI Forum VSDB, then the HDMI VSDB, then the range
 // limits; with none of them 165 MHz (HDMI 1.x and single-link DVI without a Max_TMDS_Clock).

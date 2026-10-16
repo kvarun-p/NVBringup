@@ -95,6 +95,7 @@ bool nv_edid_parse(const uint8_t *e, uint32_t len, nv_sink_caps *c)
     if (want > kNvEdidMax)
         want = kNvEdidMax;
     c->len = want < len ? want : len - len % 128;
+    memcpy(c->vendorProduct, e + 8, 4);
     for (uint32_t d = 54; d + 18 <= 126; d += 18) {
         const uint8_t *t = e + d;
         if (t[0] || t[1] || t[2])
@@ -131,7 +132,16 @@ bool nv_edid_parse(const uint8_t *e, uint32_t len, nv_sink_caps *c)
                 break;                              // a block running past the end: stop, keep what was read
             switch (tag) {
             case 1:                                 // audio: 3-byte SADs
-                c->nSad = (uint8_t)(c->nSad + n / 3);
+                for (uint32_t i = 0; i + 3 <= n; i += 3) {
+                    if (c->nSad < sizeof(c->sads) / 3)
+                        memcpy(c->sads + c->nSad * 3, p + i, 3);
+                    if (c->nSad < 255)
+                        c->nSad++;
+                }
+                break;
+            case 4:                                 // speaker allocation (the first one)
+                if (n >= 1 && !c->speaker)
+                    c->speaker = p[0];
                 break;
             case 2:                                 // video: SVDs
                 for (uint32_t i = 0; i < n && c->nVic < sizeof(c->vics); i++) {
@@ -151,8 +161,13 @@ bool nv_edid_parse(const uint8_t *e, uint32_t len, nv_sink_caps *c)
                 if (n >= 5 && p[0] == 0x03 && p[1] == 0x0c && p[2] == 0x00) {
                     c->hdmi = true;
                     c->physAddr = (uint16_t)(p[3] << 8 | p[4]);
+                    if (n >= 6)
+                        c->supportsAI = (p[5] & 0x80) != 0;
                     if (n >= 7)
                         c->hdmiMaxTmdsKhz = (uint32_t)p[6] * 5000;
+                    // Latency_Fields_Present (byte 8 bit 7): video latency at byte 9, audio latency at byte 10
+                    if (n >= 10 && (p[7] & 0x80))
+                        c->audioLatency = p[9];
                 } else if (n >= 7 && p[0] == 0xd8 && p[1] == 0x5d && p[2] == 0xc4) {
                     c->hf = true;
                     c->hfMaxTmdsKhz = (uint32_t)p[4] * 5000;
@@ -358,4 +373,54 @@ uint32_t nv_hdmi_vsi_infoframe(uint8_t out[31], uint8_t hdmiVic)
     out[8] = hdmiVic;                               // PB5: HDMI_VIC
     checksum(out, 9);
     return 31;
+}
+
+// NVKMS FillELDBuffer and GetMaxSampleRateExtBlock (nvkms-hdmi.c), from the parsed caps: header block (ELD_Ver 2,
+// baseline length in dwords), baseline block at 4 (CEA_EDID_Ver, MNL, SAD_Count, Conn_Type HDMI 0, S_AI,
+// Aud_Synch_Delay, speaker allocation, port ID, manufacturer/product, monitor name, SADs). NVKMS takes the CTA
+// block with the highest sample rate; here every block's SADs are merged (sinks have one CTA block).
+uint32_t nv_eld_build(const nv_sink_caps *c, uint32_t displayId, uint8_t out[96], uint32_t *maxFreq)
+{
+    memset(out, 0, 96);
+    *maxFreq = 0;
+    if (!c->cta)
+        return 0;
+    const uint32_t nSad = c->nSad < 15 ? c->nSad : 15;
+    uint8_t rates = 0;                              // SAD byte 2, bits 6:0: 32, 44.1, 48, 88.2, 96, 176.4, 192 kHz
+    for (uint32_t i = 0; i < nSad; i++)
+        rates |= c->sads[i * 3 + 1] & 0x7f;
+    for (uint32_t i = 7; i >= 1 && !*maxFreq; i--)
+        if (rates & 1u << (i - 1))
+            *maxFreq = i;
+    if (!*maxFreq && c->basicAudio)
+        *maxFreq = 3;                               // basic audio: 2-channel LPCM up to 48 kHz
+    if (!*maxFreq)
+        return 0;
+    out[0] = 2 << 3;                                // ELD_Ver 2
+    out[4] = (uint8_t)(c->ctaRev << 5);             // CEA_EDID_Ver
+    out[5] = (uint8_t)(nSad << 4 | (c->supportsAI ? 2 : 0));   // Conn_Type 0 (HDMI), HDCP 0
+    out[6] = c->audioLatency;                       // Aud_Synch_Delay
+    out[7] = c->speaker;
+    out[8] = displayId & 0xff;                      // port ID: the displayId, as NVKMS ("DD/RM/Audio all agree")
+    out[9] = (displayId >> 8) & 0xff;
+    out[10] = (displayId >> 16) & 0xff;
+    out[11] = (displayId >> 24) & 0xff;
+    memcpy(out + 16, c->vendorProduct, 4);          // manufacturer and product codes
+    uint32_t mnl = 0;
+    if (c->name[0]) {
+        // The name as the EDID holds it: 0x0a-terminated, 0x20-padded to 13 bytes (NVKMS puts these back too)
+        mnl = 13;
+        uint32_t i = 0;
+        for (; i < 13 && c->name[i]; i++)
+            out[20 + i] = (uint8_t)c->name[i];
+        if (i < 13)
+            out[20 + i++] = 0x0a;
+        for (; i < 13; i++)
+            out[20 + i] = 0x20;
+        out[4] |= (uint8_t)mnl;
+    }
+    memcpy(out + 20 + mnl, c->sads, nSad * 3);
+    const uint32_t baseline = (16 + mnl + nSad * 3 + 3) / 4;
+    out[2] = (uint8_t)baseline;
+    return 4 + baseline * 4;
 }

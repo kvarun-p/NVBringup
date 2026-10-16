@@ -207,6 +207,13 @@ int nvmac_display_flip(nvmac_dev *d, uint32_t buffer)
     return scalar(d, NVMAC_DISPLAY_FLIP, &in, 1, NULL, 0);
 }
 
+int nvmac_surface_scanout(nvmac_dev *d, uint32_t surface_id, uint64_t va, uint32_t pitch, uint32_t width,
+                          uint32_t height, uint32_t layout, uint32_t seed)
+{
+    uint64_t in[6] = { surface_id, va, pitch, (uint64_t)height << 32 | width, layout, seed };
+    return scalar(d, NVMAC_SURFACE_SCANOUT, in, 6, NULL, 0);
+}
+
 int nvmac_mem_unmap(nvmac_dev *d, uint32_t mem)
 {
     uint64_t in = mem;

@@ -77,8 +77,9 @@ bool NVBringup::start(IOService *provider)
     setProperty(NV_STACK_ABI_KEY, NV_STACK_ABI, 32);
     setProperty(NV_STACK_FEATURES_KEY, NV_STACK_FEATURES, 32);
     setProperty(NV_UAPI_VERSION_KEY, NVMAC_ABI_VERSION, 32);
-    setProperty(NV_UAPI_FEATURES_KEY, NVMAC_FEATURES, 32);
+    setProperty(NV_UAPI_FEATURES_KEY, NVMAC_FEATURES & ~NVMAC_FEATURE_SCANOUT, 32);
     bootGuard();
+    lockInit();
 
     // Display pipe gate (S1): boot-arg nvdpipe=1, or the NVRAM one-shot nvdpipe-once (deleted here, so it
     // applies to this boot only; read even when the boot-arg is set, so it can't outlive the boot). Decided
@@ -87,6 +88,7 @@ bool NVBringup::start(IOService *provider)
     const bool pipeOnce = nvramOneShot("nvdpipe-once");
     uint32_t pipe = 0;
     dispPipeArmed_ = (PE_parse_boot_argn("nvdpipe", &pipe, sizeof(pipe)) && pipe) || pipeOnce;
+    hdaCheckFunction();                     // nvhdmiaudio: is the GPU's HDA function (1) there
     if (dispPipeArmed_ && safeMode_) {
         LOG("safe mode (boot-attempt guard): display pipe gate ignored this boot");
         dispPipeArmed_ = false;
@@ -104,6 +106,16 @@ bool NVBringup::start(IOService *provider)
             thread_call_enter_delayed(bootBusyCall_, dl);
         }
         setProperty("NVDisplayPipeArmed", kOSBooleanTrue);
+        // Zero-copy scanout (nvzerocopy=1): the pipe scans NVMetal's image of a surface out instead of copying the
+        // surface; 2 also skips the seed check (for diagnosing). Off by default; offered to the accelerator through
+        // NVStackFeatures only when on.
+        uint32_t zc = 0;
+        if (PE_parse_boot_argn("nvzerocopy", &zc, sizeof(zc)) && zc && !safeMode_) {
+            zeroCopy_ = zc > 2 ? 1 : zc;
+            setProperty(NV_STACK_FEATURES_KEY, NV_STACK_FEATURES | NV_STACK_F_PIPE_SCANOUT, 32);
+            setProperty(NV_UAPI_FEATURES_KEY, NVMAC_FEATURES, 32);
+            LOG("zero-copy scanout on (boot-arg nvzerocopy=%u%s)", zeroCopy_, zeroCopy_ == 2 ? ", surface seeds not checked" : "");
+        }
         LOG("display pipe armed (%s): NVFramebuffer and the accelerator take part this boot",
             pipeOnce ? "nvdpipe-once" : "boot-arg nvdpipe=1");
     }
@@ -170,16 +182,16 @@ void NVBringup::shutdownHw()
     bootBusyRelease("shutdown");
     powerFree();                                    // no idle power-off from here on
     if (gspLock_) {                                 // before BAR0 and the device go away
-        IOLockLock(gspLock_);
+        gspLock();
         intrHwOff();
-        IOLockUnlock(gspLock_);
+        gspUnlock();
     }
     intrRelease();
     if (boostCall_) {
         if (gspLock_) {
-            IOLockLock(gspLock_);
+            gspLock();
             boostStopping_ = true;                  // the sampler doesn't re-arm
-            IOLockUnlock(gspLock_);
+            gspUnlock();
         }
         thread_call_cancel_wait(boostCall_);
         thread_call_free(boostCall_);
@@ -197,11 +209,12 @@ void NVBringup::shutdownHw()
     stopGspPoller();
     dispNubStop();                                  // the nub is ours under the PCI device: it goes first
     if (gspLock_) {
-        IOLockLock(gspLock_);
+        allLock();
         freeGsp(true);      // stops a running GSP before its buffers go away
-        IOLockUnlock(gspLock_);
+        allUnlock();
         IOLockFree(gspLock_);
         gspLock_ = nullptr;
+        lockFree();
     }
     OSSafeReleaseNULL(bar0_);
     OSSafeReleaseNULL(acpi_);

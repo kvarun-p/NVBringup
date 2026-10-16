@@ -96,6 +96,19 @@ class NVFramebuffer : public IOFramebuffer {
     IONotifier *wranglerNote_ = nullptr;
     static bool wranglerPublished(void *target, void *ref, IOService *wrangler, IONotifier *note);
 
+    // HDMI audio (NVBringup's boot-arg nvhdmiaudio, bit 0): what AppleHDAController reads from the framebuffer above an
+    // IODisplay (scratchpad/hda-attach-2026-10-16/REPORT.md, disassembly of 14.8.9's AppleHDAController 540.3):
+    // gfxMatchedHandler walks up from the IODisplay to the node whose hda-gfx is the controller's and reads its
+    // connector-type (0x400 DP, 0x800 HDMI) and port-number; framebufferEventHandler, on the IOFramebuffer
+    // notifications, reads av-signal-type (kIOFBAVSignalTypeHDMI) and audio-codec-info. Without audio-codec-info it
+    // looks the controller's PCI ID up in its own table, which lacks 10de:10fa, and gives up before telling the codec
+    // driver about the display. hda-gfx is copied from the GPU's PCI device (OpenCore DeviceProperties).
+    bool hdmiAudio_ = false;
+    uint32_t avSignal_ = ~0u;           // av-signal-type as last published
+    void publishAudioStatic();
+    void publishAudio();
+    bool edidHasAudio() const;
+
     bool readDisplay(OSDictionary *d);
     void displayPower(bool on, const char *why, uintptr_t value);
     bool applyNub();
@@ -247,6 +260,8 @@ bool NVFramebuffer::applyNub()
         }
     }
     OSSafeReleaseNULL(o);
+    if (changed)
+        publishAudio();
     IOLockUnlock(applyLock_);
     return changed;
 }
@@ -317,6 +332,62 @@ IOService *NVFramebuffer::probe(IOService *provider, SInt32 *score)
     return IOFramebuffer::probe(provider, score);
 }
 
+// A CTA-861 extension of the EDID announcing audio: basic audio (byte 3 bit 6) or an audio data block (tag 1).
+bool NVFramebuffer::edidHasAudio() const
+{
+    for (uint32_t b = 128; haveEdid_ && b + 128 <= edidLen_; b += 128) {
+        const uint8_t *x = edid_ + b;
+        if (x[0] != 0x02)
+            continue;
+        if (x[3] & 0x40)
+            return true;
+        for (uint32_t i = 4; i < x[2] && i < 127; i += 1 + (x[i] & 0x1f))
+            if ((x[i] >> 5) == 1)
+                return true;
+    }
+    return false;
+}
+
+// Once, at start: the properties that tie this framebuffer to the GPU's HDA function.
+void NVFramebuffer::publishAudioStatic()
+{
+    uint32_t arg = 0;
+    hdmiAudio_ = PE_parse_boot_argn("nvhdmiaudio", &arg, sizeof(arg)) && (arg & 1);
+    if (!hdmiAudio_)
+        return;
+    IOService *pci = nub_ ? nub_->getProvider() : nullptr;
+    OSObject *gfx = pci ? pci->copyProperty("hda-gfx") : nullptr;
+    if (gfx) {
+        setProperty("hda-gfx", gfx);
+        gfx->release();
+    } else {
+        LOG("HDMI audio: the GPU has no hda-gfx (OpenCore DeviceProperties): AppleHDA can't pair with this framebuffer");
+    }
+    const uint32_t hdmi = 0x800;                        // connector-type, as AppleIntelFramebuffer publishes it
+    setProperty("connector-type", (void *)&hdmi, sizeof(hdmi));
+    setProperty("port-number", 0ull, 32);
+    // audio-codec-info: byte 0 codec address (0), byte 1 always 1 in the controller's table, byte 2 the pin widget
+    // (TU117's codec 0x10de0094 has HDMI pins 4-7; the sink shows up on pin 4). Bytes 1 and 2 must be nonzero.
+    const uint32_t codecInfo = 0x00040100;
+    setProperty("audio-codec-info", (void *)&codecInfo, sizeof(codecInfo));
+    publishAudio();
+}
+
+// After each change of the nub's state: av-signal-type HDMI while an HDMI sink with audio is online, else unknown.
+// Before the connect interrupt, so it is in place by the IOFramebuffer notifications AppleHDAController acts on.
+void NVFramebuffer::publishAudio()
+{
+    if (!hdmiAudio_)
+        return;
+    const bool audio = edidHasAudio();
+    const uint32_t sig = online_ && audio ? 0x08u : 0u;     // kIOFBAVSignalTypeHDMI : kIOFBAVSignalTypeUnknown
+    if (sig == avSignal_)
+        return;
+    avSignal_ = sig;
+    setProperty("av-signal-type", (void *)&sig, sizeof(sig));
+    LOG("HDMI audio: av-signal-type %u (online %s, EDID audio %s)", sig, online_ ? "yes" : "no", audio ? "yes" : "no");
+}
+
 bool NVFramebuffer::start(IOService *provider)
 {
     if (!aperture_ && !(aperture_ = IODeviceMemory::withRange(phys_, size_)))
@@ -345,6 +416,7 @@ bool NVFramebuffer::start(IOService *provider)
     if (!cursorBuf_ && !(PE_parse_boot_argn("nvswcursor", &sw, sizeof(sw)) && sw))
         cursorBuf_ = (uint32_t *)IOMallocZero(kCursorBufPx * 4);
     applyNub();                     // no connect interrupt: IOGraphics hasn't registered for it yet
+    publishAudioStatic();           // nvhdmiaudio: hda-gfx, connector-type, audio-codec-info, av-signal-type
     if (!IOFramebuffer::start(provider)) {
         nub_ = nullptr;
         LOG("IOFramebuffer::start failed");
