@@ -74,10 +74,11 @@ on any of them; FWSEC and GSP-RM only run with the boot-arg `nvexperimental=1`. 
 
 ## What it can't do
 
-- **One display mode, no HDMI audio** (optional step 9). The kext lights a TMDS (HDMI/DVI) port on the NVIDIA GPU at
+- **One display mode** (optional step 9). The kext lights a TMDS (HDMI/DVI) port on the NVIDIA GPU at
   the monitor's preferred mode (or the best one the port carries, up to 340 MHz): no mode switching or HiDPI
-  modes, no HDMI 2.0, no audio. The display pipe copies each frame into the scanout rather than scanning out
-  WindowServer's image directly. It relies on private IOAcceleratorFamily2 and AppleGraphicsDeviceControl
+  modes, no HDMI 2.0. The display pipe copies each frame into the scanout unless `nvzerocopy=1` is on and the
+  frame is an NVMetal-rendered surface, which is scanned out in place. HDMI audio needs a Lilu plugin that
+  patches AppleHDAController in memory (step 9). It relies on private IOAcceleratorFamily2 and AppleGraphicsDeviceControl
   interfaces checked only on Sonoma, needs AMFI relaxed for WindowServer, and DisplayPort is untested.
 - **No OpenGL, OpenCL or CUDA.** Metal only with the optional Metal step, and only for apps
   that opt in: macOS itself (WindowServer, system apps) keeps using the Intel GPU. Metal
@@ -329,6 +330,15 @@ monitor connected, so that plugging one in can be noticed. There are two ways to
 3. Allow Screen Recording for `nvvdisplay` when asked (System Settings → Privacy & Security). It retries every 10
    s and then adds the monitor as a display. Its log is `~/Library/Logs/nvvdisplay.log`.
 
+**HDMI audio** (with the display pipe; tested on TU117, macOS 14):
+
+1. Build `hdmiaudio/` (NVHDAPatch.kext, a Lilu plugin; its Makefile needs a Lilu source tree and acidanthera's
+   MacKernelSDK) and add it to `config.plist` → Kernel → Add right after Lilu.kext.
+2. DeviceProperties: `hda-gfx` = `onboard-2` (data, NUL-terminated) on the GPU, `PciRoot(0x0)/Pci(0x1,0x0)/Pci(0x0,0x0)`,
+   and on its audio function `…/Pci(0x0,0x1)`, which also gets `layout-id` = `07000000`.
+3. Add `nvhdmiaudio=3 hdax=1` to the boot-args and reboot. The monitor shows up under Sound → Output.
+   Details and how each piece was found: [docs/display.md](docs/display.md#hdmi-audio-boot-arg-nvhdmiaudio-default-off).
+
 After rebuilding `nvvdisplay`, switch its Screen Recording permission off and on again: the permission is tied to
 the binary's ad-hoc signature. Details are in [display/README.md](display/README.md).
 
@@ -476,6 +486,7 @@ firmware and your Mesa and llama.cpp builds. By hand:
 | `nvunplug=0` | With `nvdisp=2`: detach the output on every unplug and do a full modeset on replug, instead of keeping it running and only taking the display offline. `sudo nvram nvunplug-detach=1` does it for the next unplug only |
 | `nvswcursor=1` | With the display pipe: no hardware cursor; WindowServer draws it |
 | `nvzerocopy=1` | With the display pipe: zero-copy scanout (default off). NVMetal tells the kext which VRAM image holds each IOSurface it rendered; the pipe scans that image out in place of copying the surface, for surfaces still at the registered seed (anything else is copied as before). `nvzerocopy=2` skips the seed check (for diagnosing). `tools/nvframes` shows `ZeroCopyFlips`. See [display.md](docs/display.md#zero-copy-scanout-nvzerocopy1) |
+| `nvhdmiaudio=3` | With the display pipe: HDMI audio. Bit 0: send GSP-RM the ELD and unmute at each HDMI modeset and hot-plug, and have NVFramebuffer publish the properties AppleHDA pairs with (`hda-gfx`, `connector-type`, `audio-codec-info`, `av-signal-type`). Bit 1: probe the codec through the HDA function while no driver owns it. Bit 2: the Linux quirk that unhides the HDA function (0x488 bit 25). Needs NVHDAPatch.kext and `hdax=1` (step 9). NVHDAPatch's own boot-args: `nvhdadid=<hex>` (another HDA device ID, default 10fa), `-nvhdaoff` |
 | `nvfb=1` | Experiment only, don't use: NVBringup publishes `NVDisplayNub` for NVFramebuffer.kext, and WindowServer stops within a minute (see docs/display.md). `sudo nvram nvfb-once=1` does the same for one boot |
 | `-nvoff` | Recovery: NVBringup, NVMetalAccel and NVFramebuffer all decline to start, and the GPU is left as the firmware left it. OpenCore rewrites the boot-args every boot, so add it to config.plist (from another computer if this one hangs) or keep a spare EFI with it |
 | `nvguard=1` | Boot-attempt guard: NVBringup counts boots in NVRAM `nv-boot-try`, and the boot daemon deletes it once WindowServer has run for a minute. After 2 boots in a row that never got there, the next boot is a safe one: `nvdpipe`, `nvdpipe-once`, `nvfb`, `nvfb-once` and `nvzerocopy` are ignored, `NVSafeMode` is published, and the auxiliary kexts stay out. `tools/nvctl boot-ok` clears the counter by hand. Needs the boot daemon from this version (`tools/install_daemon.sh`), or every third boot is a safe one |

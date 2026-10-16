@@ -13,7 +13,7 @@ Installation and everyday use are in the top-level [README](../README.md). Here:
 | [approach.md](approach.md) | Kext plus NVK instead of VMs or CUDA; kext vs DriverKit; loading with OpenCore; how the code is tested |
 | [firmware-and-boot.md](firmware-and-boot.md) | Firmware version, FWSEC-FRTS, GSP-RM boot and teardown, where structure layouts come from, the boot daemon, the per-architecture HAL |
 | [memory-and-mmu.md](memory-and-mmu.md) | Host-owned VRAM, split VA spaces, BAR1, 64 KiB pages, the page-table pool |
-| [gpu-interface.md](gpu-interface.md) | The user-space interface: shape, submission, syncs, interrupts, isolation, access |
+| [gpu-interface.md](gpu-interface.md) | The user-space interface: shape, submission, syncs, interrupts, isolation, access, locks |
 | [bar1-cpu-mappings.md](bar1-cpu-mappings.md) | CPU mappings of VRAM that outlive a free: the kext fix, and where NVK puts CPU-mapped memory (`nvkmapvram`) |
 | [nvk-and-llama.md](nvk-and-llama.md) | The NVK port, the two NAK fixes for Turing, llama.cpp tuning |
 | [power.md](power.md) | Runtime power-off, sleep and wake, shutdown |

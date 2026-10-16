@@ -107,6 +107,22 @@ programs run without sudo; boot-arg `nvgpu_users=1` admits any user. The GSP-RM 
 client (firmware, boot, logs) stays root-only. A third client type answers status and power
 questions without opening the GPU (see [power.md](power.md)).
 
+## Locks: GPU work and the display (`nvlocksplit`)
+
+One lock, `gspLock_`, guards GSP-RM's message queues and everything that talks to them. Under it alone a modeset
+held the lock for seconds (relight retries sleep 200 ms up to five times, plus channel and notifier waits), and
+every EXEC, memory call and the message poller waited behind it. With the boot-arg `nvlocksplit=1` the display
+flows (hot-plug tick, DPMS, flips, the pipe's copy, the cursor image) take a display lock first and give
+`gspLock_` up across their sleeps, so they exclude each other but not GPU work. The queues stay under `gspLock_`,
+one RPC at a time, as in NVIDIA's RM, which also keeps the display lock outside the GPU lock. Order:
+power > display nub > display > GSP (`src/NVLocks.cpp`, NVBringup.hpp "Locks").
+
+`NVLockStats` (`ioreg -l -w0 | grep NVLock`) counts, per lock, takes, waits, the longest wait and hold with their
+call sites, and holds over 10 ms; kdebug 0x30/0x31 trace them. In use on the test laptop (2026-10-16) with the display
+pipe on, the longest wait for `gspLock_` was 37 ms. What remains is the RPCs
+themselves (a full-detect hot-plug RPC takes 20-67 ms with nothing lit) and the pipe copy's 1-2.5 ms wait, both
+still under `gspLock_`.
+
 ## Graphics context
 
 Following r570's GSP-client path: the kernel allocates each context's graphics buffers, maps
