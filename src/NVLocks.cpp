@@ -57,8 +57,12 @@ void NVBringup::lockTake(uint32_t id, const char *site)
     LockState &s = lockState_[id];
     const uint64_t t0 = mach_absolute_time();
     const bool waited = !IOLockTryLock(l);
-    if (waited)
+    const char *holder = waited ? s.site : nullptr;     // racy read; for the statistics only
+    if (waited) {
+        __atomic_add_fetch(&s.waiters, 1, __ATOMIC_RELAXED);
         IOLockLock(l);
+        __atomic_sub_fetch(&s.waiters, 1, __ATOMIC_RELAXED);
+    }
     const uint64_t t1 = mach_absolute_time();
     s.owner = current_thread();
     s.since = t1;
@@ -71,6 +75,7 @@ void NVBringup::lockTake(uint32_t id, const char *site)
         if (w > s.st.maxWaitAbs) {
             s.st.maxWaitAbs = w;
             s.st.maxWaitSite = site;
+            s.st.maxWaitHolder = holder ? holder : "";
         }
         NV_TRACE(NV_TRACE_LOCK_WAIT, DBG_FUNC_NONE, id, w, 0, 0);
     }
@@ -85,8 +90,21 @@ void NVBringup::lockDrop(uint32_t id)
         s.st.maxHoldSite = s.site;
     }
     const uint64_t us = absUs(h);
-    if (us > 10000)
+    if (us > 10000) {
         s.st.slowHolds++;
+        LockStat::Slow *e = nullptr;
+        for (LockStat::Slow &x : s.st.slow)
+            if (!x.site || !strcmp(x.site, s.site)) {
+                e = &x;
+                break;
+            }
+        if (e) {                                // the first eight sites; later ones only in slowHolds
+            e->site = s.site;
+            e->count++;
+            if (h > e->maxAbs)
+                e->maxAbs = h;
+        }
+    }
     if (us > 1000)
         NV_TRACE(NV_TRACE_LOCK_HOLD, DBG_FUNC_NONE, id, h, 0, 0);
     s.owner = nullptr;
@@ -145,19 +163,54 @@ void NVBringup::allUnlock()
 
 // NVLockStats, per lock: acquisitions, how many waited (the longest wait and where, the total), the longest hold
 // and where, and holds over 10 ms. Racy reads of counters the holders update: fine for a monitor.
+// Called after allUnlock at the end of a successful boot, so the boot's own multi-second hold doesn't stay the
+// maximum and hide the steady state. Counts stay cumulative. Unlocked: these are statistics.
+void NVBringup::lockResetPeaks()
+{
+    for (LockState &s : lockState_) {
+        s.st.maxWaitAbs = s.st.maxHoldAbs = s.st.slowHolds = 0;
+        s.st.maxWaitSite = s.st.maxHoldSite = s.st.maxWaitHolder = "";
+        for (LockStat::Slow &x : s.st.slow)
+            x = LockStat::Slow();
+    }
+}
+
+// For a long job done in pieces under gspLock_ (memAlloc's VRAM scrub): when other threads wait, drop the lock,
+// let them take it (up to 1 ms for the first to get it), and take it back behind them. The caller rechecks
+// whatever it relies on afterwards: anything gspLock_ guards may have changed. Not for display flows (dispSleep).
+bool NVBringup::lockYield()
+{
+    LockState &s = lockState_[kLockGsp];
+    const uint32_t w = __atomic_load_n(&s.waiters, __ATOMIC_RELAXED);
+    if (!w)
+        return false;
+    const char *site = s.site;
+    lockDrop(kLockGsp);
+    for (int i = 0; i < 1000 && __atomic_load_n(&s.waiters, __ATOMIC_RELAXED) >= w; i++)
+        IODelay(1);
+    lockTake(kLockGsp, site);
+    return true;
+}
+
 void NVBringup::lockPublish()
 {
-    char m[512];
+    char m[1024];
     int o = snprintf(m, sizeof(m), "%s: ", lockSplit_ ? "split" : "one lock");
     for (uint32_t id = 0; id < kLockCount && o < (int)sizeof(m); id++) {
         if (id != kLockGsp && !lockSplit_)
             break;
         const LockStat &st = lockState_[id].st;
         o += snprintf(m + o, sizeof(m) - (size_t)o,
-                      "%s%s %llu taken, %llu waited (max %llu us in %s, %llu ms in all), held max %llu us in %s, "
-                      "%llu over 10 ms",
+                      "%s%s %llu taken, %llu waited (max %llu us in %s behind %s, %llu ms in all), held max %llu us "
+                      "in %s, %llu over 10 ms",
                       id ? "; " : "", kLockNames[id], st.acquired, st.contended, absUs(st.maxWaitAbs), st.maxWaitSite,
-                      absUs(st.waitAbs) / 1000, absUs(st.maxHoldAbs), st.maxHoldSite, st.slowHolds);
+                      *st.maxWaitHolder ? st.maxWaitHolder : "?", absUs(st.waitAbs) / 1000, absUs(st.maxHoldAbs),
+                      st.maxHoldSite, st.slowHolds);
+        for (uint32_t i = 0; i < 8 && st.slow[i].site && o < (int)sizeof(m); i++)
+            o += snprintf(m + o, sizeof(m) - (size_t)o, "%s%s %ux max %llu ms", i ? ", " : " (", st.slow[i].site,
+                          st.slow[i].count, absUs(st.slow[i].maxAbs) / 1000);
+        if (st.slow[0].site && o < (int)sizeof(m))
+            o += snprintf(m + o, sizeof(m) - (size_t)o, ")");
     }
     setProperty("NVLockStats", m);
 }

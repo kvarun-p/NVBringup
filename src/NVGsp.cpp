@@ -316,6 +316,7 @@ IOReturn NVBringup::bootGsp()
     }
 
     g->booted = true;
+    bootEpoch_++;
     boostLast_ = 0;         // a new GSP-RM holds no boost
     boostLevel_ = 0;
     boostPend_ = ~0u;
@@ -347,6 +348,8 @@ fail:
 
 out:
     allUnlock();
+    if (gsp_ && gsp_->booted)
+        lockResetPeaks();   // NVLockStats: the steady state from here on, not this boot's hold
     dispNubSync();      // createRmObjects may have lit the display: its nub is published outside gspLock_
     return r;
 }

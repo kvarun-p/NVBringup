@@ -206,12 +206,15 @@ public:
     struct LockStat {
         uint64_t acquired = 0, contended = 0, waitAbs = 0, maxWaitAbs = 0, maxHoldAbs = 0, slowHolds = 0;
         const char *maxWaitSite = "", *maxHoldSite = "";
+        const char *maxWaitHolder = "";         // the site holding the lock when the longest wait began
+        struct Slow { const char *site; uint32_t count; uint64_t maxAbs; } slow[8] = {};   // holds > 10 ms by site
     };
     struct LockState {
         thread_t owner = nullptr;
         uint32_t depth = 0;
         uint64_t since = 0;
         const char *site = "";
+        volatile uint32_t waiters = 0;          // threads blocked in lockTake (lockYield hands over to them)
         LockStat st;
     };
     enum { kLockGsp = 0, kLockDisp = 1, kLockCount };
@@ -226,6 +229,11 @@ private:
     void      lockInit();                       // start(): the boot-arg and dispLock_
     void      lockFree();
     void      lockPublish();                    // NVLockStats, from gspPoll once a second
+    void      lockResetPeaks();                 // after a GSP-RM boot: maxima and slow holds start over
+    bool      lockYield();                      // gspLock_ holder: let waiters run; false if there were none
+public:
+    void      gspSite(const char *site) { lockState_[kLockGsp].site = site; }  // name the current hold
+private:
 public:
     void      gspLock(const char *site = __builtin_FUNCTION()) { lockTake(kLockGsp, site); }
     void      gspUnlock() { lockDrop(kLockGsp); }
@@ -412,6 +420,8 @@ private:
     bool     bar1Reuse(uint64_t owner, uint64_t pa, uint64_t size, uint64_t *va, uint64_t *sliceSize);
     bool     bar1ReserveHeld();                               // after a GSP-RM boot: reserve + re-point every held slice
     bool     scrubVram(uint64_t pa, uint64_t size);
+    IOReturn scrubVramYield(GpuConn *c, uint64_t pa, uint64_t size);
+    uint32_t bootEpoch_ = 0;                    // GSP-RM boots so far (a VRAM heap is valid within one)
     bool     testScrub();
     uint64_t vasCreate(uint32_t hVas, const struct nv_mmu_ops *ops);
     bool     rmAllocChannel(uint32_t handle, uint32_t chid, uint32_t engine, uint32_t hVas,

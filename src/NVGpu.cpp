@@ -290,6 +290,27 @@ bool NVBringup::scrubVram(uint64_t pa, uint64_t size)
     return true;
 }
 
+// memAlloc's scrub: in 64 MiB pieces, giving gspLock_ up between them to threads waiting for it (lockYield).
+// A model's weights are gigabytes, and zeroing them in one hold stalled every EXEC and display flow for tens of ms
+// (the longest gspLock_ waits, in gpuCall). Caller holds gspLock_ and hasn't published the block yet.
+// kIOReturnAborted: GSP-RM went down or rebooted meanwhile, so the block's heap is gone; the caller must forget it.
+// kIOReturnNoDevice: the connection died; the heap is still there.
+IOReturn NVBringup::scrubVramYield(GpuConn *c, uint64_t pa, uint64_t size)
+{
+    const uint64_t piece = 64ull << 20;
+    const GspState *g = gsp_;
+    const uint32_t epoch = bootEpoch_;
+    for (uint64_t off = 0; off < size; off += piece) {
+        if (off && lockYield() && (gsp_ != g || !g->booted || bootEpoch_ != epoch))
+            return kIOReturnAborted;
+        if (c->dead)
+            return kIOReturnNoDevice;
+        if (!scrubVram(pa + off, size - off < piece ? size - off : piece))
+            return kIOReturnIOError;
+    }
+    return kIOReturnSuccess;
+}
+
 // Boot-time check (nvtest=1): pattern through PRAMIN, scrub, read back zeros.
 bool NVBringup::testScrub()
 {
@@ -3913,9 +3934,19 @@ IOReturn NVBringup::memAlloc(GpuConn *c, uint64_t size, uint64_t align, uint32_t
         m->vram = nv_vram_alloc(g->vram, size, align);
         if (!m->vram)
             goto fail;
-        r = kIOReturnIOError;
-        if (!scrubVram(m->vram, size))
+        r = scrubVramYield(c, m->vram, size);
+        if (r == kIOReturnAborted) {
+            m->vram = 0;                        // its heap went with GSP-RM: nothing to free
+            r = kIOReturnNoDevice;
             goto fail;
+        }
+        if (r != kIOReturnSuccess)
+            goto fail;
+        sr = memSlot(c, &slot);                 // again: the scrub may have let this connection allocate meanwhile
+        if (sr != kIOReturnSuccess) {
+            r = sr;
+            goto fail;
+        }
         if (flags & NVMAC_MEM_CAN_MAP) {
             r = kIOReturnNoMemory;
             if (bar1Reuse(c->serial, m->vram, size, &m->bar1Va, &m->bar1Size))
@@ -5120,6 +5151,23 @@ void NVBringup::fillInfo(nvmac_info *i)
     strlcpy(i->name, name ? name->getCStringNoCopy() : "NVIDIA GPU", sizeof(i->name));
 }
 
+static const char *gpuCallSite(uint32_t selector)
+{
+    switch (selector) {
+    case NVMAC_MEM_ALLOC:         return "gpuCall MEM_ALLOC";
+    case NVMAC_MEM_FREE:          return "gpuCall MEM_FREE";
+    case NVMAC_MEM_IMPORT:        return "gpuCall MEM_IMPORT";
+    case NVMAC_MEM_MAP:           return "gpuCall MEM_MAP";
+    case NVMAC_MEM_UNMAP:         return "gpuCall MEM_UNMAP";
+    case NVMAC_VM_BIND:           return "gpuCall VM_BIND";
+    case NVMAC_CTX_CREATE:        return "gpuCall CTX_CREATE";
+    case NVMAC_CTX_DESTROY:       return "gpuCall CTX_DESTROY";
+    case NVMAC_EXEC:              return "gpuCall EXEC";
+    case NVMAC_SURFACE_SCANOUT:   return "gpuCall SURFACE_SCANOUT";
+    default:                      return "gpuCall";
+    }
+}
+
 IOReturn NVBringup::gpuCall(GpuConn *c, uint32_t selector, IOExternalMethodArguments *a)
 {
     // Lock-free calls first.
@@ -5159,6 +5207,7 @@ IOReturn NVBringup::gpuCall(GpuConn *c, uint32_t selector, IOExternalMethodArgum
     }
 
     gspLock();
+    gspSite(gpuCallSite(selector));                         // NVLockStats tells the selectors apart
     GspState *g = gsp_;
     IOReturn r = kIOReturnSuccess;
     if (!g || !g->booted || c->dead) {
