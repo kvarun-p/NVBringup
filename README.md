@@ -346,7 +346,10 @@ monitor connected, so that plugging one in can be noticed. There are two ways to
 only does something where processes get CPU mappings of VRAM: where peer-to-peer is allowed (the GPU's `NVP2P`
 property), or with `nvvrammap=1`.
 
-1. `tools/check_pager_hook.sh symbol` must find `_device_pager_last_unmap` in this macOS build's kernel.
+1. `tools/check_pager_hook.sh symbol` must find `_device_pager_last_unmap`, `_device_pager_ops`,
+   `_device_pager_reference` and `_device_pager_deallocate` in this macOS build's kernel. It also checks the kernel is
+   Darwin 23.6 (macOS 14.6 to 14.8), the build the VM object layout was checked on; elsewhere the early release stays
+   off unless NVPagerHook's boot-arg `-nvpgrlayout` is set.
 2. Build `pagerhook/` (NVPagerHook.kext, a Lilu plugin; same Lilu source tree and MacKernelSDK as `hdmiaudio/`) and
    add it to `config.plist` → Kernel → Add after Lilu.kext. Reboot.
 3. `build/bar1_alias_test release` and `tools/check_pager_hook.sh status` must pass. What it does, and what is
@@ -506,7 +509,7 @@ firmware and your Mesa and llama.cpp builds. By hand:
 | `nvguard=1` | Boot-attempt guard: NVBringup counts boots in NVRAM `nv-boot-try`, and the boot daemon deletes it once WindowServer has run for a minute. After 2 boots in a row that never got there, the next boot is a safe one: `nvdpipe`, `nvdpipe-once`, `nvfb`, `nvfb-once` and `nvzerocopy` are ignored, `NVSafeMode` is published, and the auxiliary kexts stay out. `tools/nvctl boot-ok` clears the counter by hand. Needs the boot daemon from this version (`tools/install_daemon.sh`), or every third boot is a safe one |
 | `nvkmapvram=1` | NVK keeps its push buffers and descriptors in CPU-mapped VRAM: faster generation (+15 % on a 0.5B model, +6 % on 3B), but each program run holds ~2.7 MiB of BAR1 until a restart; after ~42 runs it falls back to system memory (default speed). `desc` / `cmd:<n>` select parts; see [docs/bar1-cpu-mappings.md](docs/bar1-cpu-mappings.md) |
 | `nvvrammap=1` | Allow CPU mappings of VRAM (`NVMAC_MEM_MAP` of VRAM, `NVMAC_DISPLAY_MAP`) where peer-to-peer DMA isn't allowed (the GPU's `NVP2P` property). By default they're refused there, because direct I/O on such a mapping makes the disk DMA to BAR1, which hung and panicked a TU117 laptop. Only for testing `nvkmapvram` and the BAR1 hook. `nvvrammap=0` refuses them everywhere |
-| `nvbar1hook=0` | NVBringup ignores NVPagerHook.kext: held BAR1 slices stay held until restart, as without it. NVPagerHook's own boot-arg: `-nvpgroff` (it loads but routes nothing) |
+| `nvbar1hook=0` | NVBringup ignores NVPagerHook.kext: held BAR1 slices stay held until restart, as without it. NVPagerHook's own boot-args: `-nvpgroff` (it loads but routes nothing), `-nvpgrlayout` (trust its VM object layout on a kernel other than Darwin 23.6, leaving only the self-test to catch a wrong one) |
 
 ## Troubleshooting
 

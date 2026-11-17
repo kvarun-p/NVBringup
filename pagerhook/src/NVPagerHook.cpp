@@ -77,8 +77,18 @@ static bool hookRouted()
 // Every io() call checks the pager's ops table is device_pager_ops and that the object points back at the
 // pager, else returns -1; NVBringup's self-test checks that an IOPL on its test page raises the count and
 // committing it lowers it again. On a kernel where any of that doesn't hold, the early release stays off.
+// The offsets are only trusted on Darwin 23.6 (macOS 14.6 to 14.8, xnu-10063.141), the build they were checked
+// on: elsewhere io() returns -1 and the early release stays off, although last_unmap is still routed
+// (Sonoma through Tahoe). Boot-arg -nvpgrlayout trusts them on any kernel, leaving only the checks above and
+// the self-test between a wrong layout and a slice released under a DMA.
 static const size_t kMoPagerOps = 0x8, kMoControl = 0x10;
 static const size_t kVoPager = 0x50, kVoPagingInProgress = 0x74, kVoActivityInProgress = 0x78;
+
+static bool layoutChecked()
+{
+    return (getKernelVersion() == KernelVersion::Sonoma && getKernelMinorVersion() >= 6) ||
+           checkKernelArgument("-nvpgrlayout");
+}
 
 static mach_vm_address_t gDevicePagerOps;
 static void (*gPagerReference)(void *);
@@ -128,7 +138,11 @@ static void patcherLoaded(void *, KernelPatcher &patcher)
     mach_vm_address_t ref = patcher.solveSymbol(KernelPatcher::KernelID, "_device_pager_reference");
     mach_vm_address_t dealloc = patcher.solveSymbol(KernelPatcher::KernelID, "_device_pager_deallocate");
     patcher.clearError();
-    if (!gDevicePagerOps || !ref || !dealloc) {
+    if (!layoutChecked()) {
+        SYSLOG("nvpgr", "VM object layout not checked on Darwin %d.%d (only 23.6; -nvpgrlayout overrides): no I/O "
+               "check, so NVBringup won't release held slices early", getKernelVersion(), getKernelMinorVersion());
+        gDevicePagerOps = 0;
+    } else if (!gDevicePagerOps || !ref || !dealloc) {
         SYSLOG("nvpgr", "device_pager_ops %d, device_pager_reference %d, device_pager_deallocate %d not found: no I/O "
                "check, so NVBringup won't release held slices early", !gDevicePagerOps, !ref, !dealloc);
         gDevicePagerOps = 0;

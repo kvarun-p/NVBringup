@@ -1,8 +1,10 @@
 #!/bin/bash
 # Checks what NVPagerHook.kext (pagerhook/) needs and whether NVBringup is using it. Run on the Mac.
 #   tools/check_pager_hook.sh            symbol, then status
-#   tools/check_pager_hook.sh symbol     is _device_pager_last_unmap in this kernel's symbol table? Lilu resolves
-#                                        it from there; without it the hook can't work on this macOS build.
+#   tools/check_pager_hook.sh symbol     are _device_pager_last_unmap and the I/O check's symbols
+#                                        (_device_pager_ops/_reference/_deallocate) in this kernel's symbol table,
+#                                        and is it the build the VM object offsets were checked on? Lilu resolves
+#                                        them from there; without them the hook can't work on this macOS build.
 #                                        Needs no kext: run it before building anything.
 #   tools/check_pager_hook.sh status     Lilu and NVPagerHook loaded? NVBringup's hook state and counters.
 # Exit status: 0 usable / active, 1 not, 2 could not tell.
@@ -12,20 +14,41 @@ rc=0
 
 symbol() {
     local k=/System/Library/Kernels/kernel
-    echo "kernel: $(uname -v | sed 's/.*\(xnu-[0-9.~]*\).*/\1/')"
+    local ver; ver=$(uname -r)
+    echo "kernel: $(uname -v | sed 's/.*\(xnu-[0-9.~]*\).*/\1/') (Darwin $ver)"
     if [ ! -r "$k" ]; then
         echo "symbol: $k not readable: can't tell"
         return 2
     fi
+    local syms; syms=$(nm "$k" 2>/dev/null)
     local line
-    line=$(nm "$k" 2>/dev/null | grep -E ' _device_pager_last_unmap$')
+    line=$(grep -E ' _device_pager_last_unmap$' <<<"$syms")
     if [ -z "$line" ]; then
         echo "symbol: _device_pager_last_unmap is NOT in $k: NVPagerHook can't route it on this build"
         return 1
     fi
     echo "symbol: $line"
-    # The pager's other entry points, for a look at how the build names them (not needed by the hook).
-    nm "$k" 2>/dev/null | grep -E ' _device_pager_(map|deallocate|setup)$' | sed 's/^/        /'
+    # The I/O check (interface version 2) needs these too; without any of them NVPagerHook routes last_unmap
+    # but NVBringup never releases a slice early.
+    local s miss=0
+    for s in _device_pager_ops _device_pager_reference _device_pager_deallocate; do
+        line=$(grep -E " $s\$" <<<"$syms")
+        if [ -n "$line" ]; then
+            echo "symbol: $line"
+        else
+            echo "symbol: $s is NOT in $k: no I/O check, so no early release on this build"
+            miss=1
+        fi
+    done
+    [ $miss -eq 1 ] && return 1
+    # The VM object offsets were only checked on Darwin 23.6 (NVPagerHook.cpp); elsewhere it needs -nvpgrlayout.
+    case $ver in
+        23.6.*|23.[7-9].*) ;;
+        *) echo "layout: VM object offsets not checked on Darwin $ver: NVPagerHook turns the I/O check off" \
+                "unless booted with -nvpgrlayout (then only the self-test guards it)"
+           return 1 ;;
+    esac
+    echo "layout: Darwin $ver, the build the VM object offsets were checked on"
     return 0
 }
 
@@ -59,6 +82,10 @@ status() {
     local refused; refused=$(get VramMapRefused)
     if [ -n "$refused" ]; then
         echo "VRAM maps refused:  $refused (no peer-to-peer: no process gets a CPU mapping of VRAM; boot-arg nvvrammap=1 allows them)"
+    fi
+    local revoked; revoked=$(get VramMapRevoked)
+    if [ -n "$revoked" ] && [ "$revoked" != 0 ]; then
+        echo "VRAM maps revoked:  $revoked (taken back when a disk without peer-to-peer support came)"
     fi
     local st; st=$(get Bar1Hook)
     case "${st:-}" in

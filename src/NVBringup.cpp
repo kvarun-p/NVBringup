@@ -60,6 +60,16 @@ bool NVBringup::start(IOService *provider)
         return false;
     }
 
+    // A disk that comes later may not support peer-to-peer: CPU mappings of VRAM are rechecked at once
+    // (NVGpu.cpp: vramRevoke). The notification also fires for every disk already there; one recheck runs.
+    p2pCall_ = thread_call_allocate(&NVBringup::p2pRecheckThunk, this);
+    if (OSDictionary *match = p2pCall_ ? serviceMatching("IOMedia") : nullptr) {
+        mediaNotifier_ = addMatchingNotification(gIOPublishNotification, match, &NVBringup::mediaPublished, this);
+        match->release();
+    }
+    if (!mediaNotifier_)
+        LOG("no IOMedia notification: a new disk is checked for peer-to-peer only at the next fillInfo");
+
     // Non-stall interrupts (item 4) come on after GSP-RM boots; boot-arg nvintr=0 keeps SYNC_WAIT polling.
     uint32_t intr = 1;
     PE_parse_boot_argn("nvintr", &intr, sizeof(intr));
@@ -182,6 +192,15 @@ void NVBringup::shutdownHw()
         bootBusyCall_ = nullptr;
     }
     bootBusyRelease("shutdown");
+    if (mediaNotifier_) {
+        mediaNotifier_->remove();                   // waits for a handler in progress
+        mediaNotifier_ = nullptr;
+    }
+    if (p2pCall_) {
+        thread_call_cancel_wait(p2pCall_);
+        thread_call_free(p2pCall_);
+        p2pCall_ = nullptr;
+    }
     pagerHookDetach();                              // no last-unmap listener, no slice release from here on
     powerFree();                                    // no idle power-off from here on
     if (gspLock_) {                                 // before BAR0 and the device go away

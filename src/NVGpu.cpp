@@ -3318,9 +3318,23 @@ void NVBringup::bar1Unmap(uint64_t va, uint64_t size)
 // as it is, and is listed so bar1Map clears it before mapping over it. If the list can't grow
 // the slice is unmapped instead (unlisted dummy PTEs would make bar1Map's nv_mmu_map refuse the
 // range). Doesn't flush the TLB: the caller does, before giving up gspLock_. Caller holds it.
+// Listed neighbours are merged into it, so the list (which every bar1Map walks) holds one entry per
+// run of released slices rather than one per release.
 void NVBringup::bar1ReleaseToZero(uint64_t va, uint64_t size)
 {
     GspState *g = gsp_;
+    const uint64_t slice = va;                      // va and size grow to the merged run below
+    for (uint32_t i = 0; i < bar1ZeroN_;) {
+        const Bar1Range r = bar1Zero_[i];
+        if (r.va + r.size == va)
+            va = r.va;
+        else if (va + size != r.va) {
+            i++;
+            continue;
+        }
+        size += r.size;
+        bar1Zero_[i] = bar1Zero_[--bar1ZeroN_];     // at most one on each side: the list doesn't overlap
+    }
     if (bar1ZeroN_ == bar1ZeroCap_) {
         uint32_t nc = bar1ZeroCap_ ? bar1ZeroCap_ * 2 : 64;
         Bar1Range *nz = (Bar1Range *)IOMalloc(nc * sizeof(Bar1Range));
@@ -3337,9 +3351,9 @@ void NVBringup::bar1ReleaseToZero(uint64_t va, uint64_t size)
         bar1Zero_[bar1ZeroN_++] = { va, size };
     else {
         const nv_mmu_ops ops = { this, bar1MmuAlloc, mmuRd64, mmuWr64, bar1MmuLinked, false };
-        nv_mmu_unmap_4k(&ops, g->bar1Pde, va, size);
+        nv_mmu_unmap_4k(&ops, g->bar1Pde, va, size);    // the merged neighbours too: they leave the list
     }
-    nv_vram_free(g->bar1Heap, va);
+    nv_vram_free(g->bar1Heap, slice);
 }
 
 // [va, va + size) was just allocated from bar1Heap: clears the dummy PTEs of every listed range
@@ -3724,7 +3738,7 @@ bool NVBringup::pagerHookSelfTest()
             why = "still in flight after the I/O page list was committed";
     }
     if (why) {
-        watchDrop(id);                              // unpins it if the test left it pinned
+        watchDrop(id);                              // releaseCall_ unpins it if the test left it pinned
         LOG("GSP: BAR1 hook: self-test failed (%s; I/O count %d idle, %d prepared): held slices stay held", why, n0,
             n1);
         return false;
@@ -3769,6 +3783,8 @@ uint64_t NVBringup::watchAdd(IOMemoryDescriptor *md)
 bool NVBringup::watchRearm(uint64_t id)
 {
     bool was = false;
+    if (!id)
+        return false;
     IOInterruptState st = IOSimpleLockLockDisableInterrupt(watchLock_);
     for (uint32_t i = 0; i < watchN_; i++)
         if (watch_[i].id == id) {
@@ -3798,24 +3814,30 @@ bool NVBringup::watchTake(uint64_t id)
     return taken;
 }
 
-// May be called with gspLock_ held: unpinning can destroy the VM object, which waits for any
-// I/O still on it, but takes no lock of this driver.
+// May be called with gspLock_ held, so a pinned entry isn't unpinned here: dropping the last pin
+// can destroy the VM object, which waits for the I/O still on it. Where a DMA to BAR1 can hang
+// (no peer-to-peer, nvvrammap=1) that would hang with gspLock_ held, and the GPU with it. The
+// entry stays listed with id 0 (nothing finds it by id, and it has fired, so the listener skips
+// it) until watchSettle unpins and removes it on releaseCall_, which holds no lock.
 void NVBringup::watchDrop(uint64_t id)
 {
     if (!id)
         return;
-    void *unpin = nullptr;
+    bool deferred = false;
     IOInterruptState st = IOSimpleLockLockDisableInterrupt(watchLock_);
     for (uint32_t i = 0; i < watchN_; i++)
         if (watch_[i].id == id) {
-            if (watch_[i].io == kIoPinned)
-                unpin = watch_[i].pager;
-            watch_[i] = watch_[--watchN_];
+            if (watch_[i].io == kIoPinned) {
+                watch_[i].id = 0;
+                watch_[i].fired = true;
+                deferred = true;
+            } else
+                watch_[i] = watch_[--watchN_];
             break;
         }
     IOSimpleLockUnlockEnableInterrupt(watchLock_, st);
-    if (unpin)
-        hookOps_->unpin(unpin);
+    if (deferred && releaseCall_)
+        thread_call_enter(releaseCall_);
 }
 
 bool NVBringup::watchState(uint64_t id, bool *fired, uint8_t *io)
@@ -3859,6 +3881,8 @@ uint32_t NVBringup::watchSettle()
             } else
                 w.io = kIoIdle;
             unpin = w.pager;
+            if (!w.id)                              // dropped (watchDrop): nothing waits for it
+                watch_[i] = watch_[--watchN_];
             break;
         }
         IOSimpleLockUnlockEnableInterrupt(watchLock_, st);
@@ -4543,7 +4567,61 @@ bool NVBringup::vramMapAllowed()
     }
     if (vramMapArg_ >= 0)
         return vramMapArg_ == 1;
-    return p2pAllowed();
+    bool ok = p2pAllowed();
+    if (vramMapWas_ && !ok)
+        vramRevoke();
+    vramMapWas_ = ok;
+    return ok;
+}
+
+// vramMapAllowed turned from yes to no: every CPU mapping of VRAM the driver handed out is taken back,
+// so a direct I/O on one from here on fails (EFAULT) instead of making the new disk DMA to BAR1. A
+// process that touches one again faults. The memory itself stays allocated, and its slice is held or
+// released by memFree as before: cpuMapped stays set, and the descriptor, which the pager counts, is
+// still there. Not covered: an I/O the new disk already has in flight, and duplicates the process made
+// itself (mach_vm_remap, fork), which the driver can't see. Caller holds gspLock_.
+void NVBringup::vramRevoke()
+{
+    GspState *g = gsp_;
+    uint32_t n = 0;
+    for (uint32_t i = 0; g && i < kMaxConns; i++) {
+        GpuConn *c = g->conns[i];
+        if (!c)
+            continue;
+        for (uint32_t j = 0; j < c->memCap; j++) {
+            GpuMem *m = c->mems[j];
+            if (m && m->bar1Va && m->userMap) {
+                OSSafeReleaseNULL(m->userMap);
+                n++;
+            }
+        }
+        if (c->dispMap) {
+            OSSafeReleaseNULL(c->dispMap);
+            n++;
+        }
+    }
+    vramMapRevoked_ += n;
+    LOG("GSP: VRAM: peer-to-peer DMA to BAR1 is no longer allowed (NVP2P): %u CPU mapping%s of VRAM taken back",
+        n, n == 1 ? "" : "s");
+}
+
+// An IOMedia was published (a disk came, on any bus): peer-to-peer is checked again at once rather than
+// at the next fillInfo, off the notification thread (p2pAllowed walks the registry).
+bool NVBringup::mediaPublished(void *target, void *, IOService *, IONotifier *)
+{
+    NVBringup *me = (NVBringup *)target;
+    if (me->p2pCall_)
+        thread_call_enter(me->p2pCall_);
+    return true;
+}
+
+void NVBringup::p2pRecheckThunk(thread_call_param_t self, thread_call_param_t)
+{
+    NVBringup *me = (NVBringup *)self;
+    me->gspLock();
+    me->p2pCheckedAt_ = 0;                          // not the cached answer
+    me->vramMapAllowed();                           // revokes if it turned to no
+    me->gspUnlock();
 }
 
 IOReturn NVBringup::memMap(GpuConn *c, GpuMem *m, uint64_t *addr)
@@ -6050,6 +6128,7 @@ void NVBringup::updateStats()
         put("Bar1IoDeferred", bar1IoDeferred_, 32);     // releases that waited for I/O in flight on the pages
         put("Bar1IoUnknown", bar1IoUnknown_, 32);       // reports with no I/O check: those slices stay held
         put("VramMapRefused", vramMapRefused_, 32);     // CPU mappings of VRAM refused (no peer-to-peer)
+        put("VramMapRevoked", vramMapRevoked_, 32);     // taken back when peer-to-peer stopped being allowed
         put("Connections", nConns, 32);
         put("Contexts", nCtxs, 32);
         put("Sequence", ++statSeq_, 32);

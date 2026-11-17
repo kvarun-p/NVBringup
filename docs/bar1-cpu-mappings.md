@@ -221,6 +221,15 @@ maps as always.
 - With no CPU mappings of VRAM, nothing is held, so the hook (`NVPagerHook`) has nothing to release.
   Its self-test runs at the first CPU mapping of VRAM, so it stays `attached`.
 
+**A disk that comes later takes the mappings back.** A disk without peer-to-peer support can arrive
+after mappings were handed out (a Thunderbolt or USB4 NVMe drive). Each new `IOMedia` triggers a
+recheck at once, and `fillInfo`'s once-a-second recheck catches the rest. When the answer turns from
+allowed to not allowed, every CPU mapping of VRAM the driver handed out is removed from its process
+(logged, counted in `NVStats` `VramMapRevoked`). A direct I/O on one from then on fails with `EFAULT`,
+and a process that touches one again faults. The memory stays allocated and is freed as before. Not
+covered: an I/O the new disk already has in flight when it appears, and duplicates a process made
+itself (`mach_vm_remap`, `fork`), which the driver can't see.
+
 Boot-arg `nvvrammap=1` allows the mappings anyway: you accept that a program doing direct I/O on
 one can hang the machine. That's for testing `nvkmapvram`, the hook and the alias cases here.
 `nvvrammap=0` refuses them even where peer-to-peer is allowed.
@@ -243,15 +252,21 @@ one can hang the machine. That's for testing `nvkmapvram`, the hook and the alia
 
 ### What is not known yet
 
-- Shipped kernels other than 14.8.9: run `check_pager_hook.sh symbol` first. The symbol is
-  non-static in every source release checked.
+- Shipped kernels other than 14.8.9: run `check_pager_hook.sh symbol` first. It checks
+  `_device_pager_last_unmap` and the three symbols the I/O check needs (`_device_pager_ops`,
+  `_device_pager_reference`, `_device_pager_deallocate`), and fails when any is missing or the
+  kernel isn't the one the layout was checked on. They're non-static in every source release
+  checked.
 - Direct I/O with real DMA against version 2 hasn't been run anywhere: it needs a machine where
   peer-to-peer is allowed. The self-test covers it without DMA.
 - Another driver that took the physical address another way, not through an I/O page list on
   this object (for example by reading the PTEs of a mapping it was given), isn't covered: the
   count only knows about page lists.
-- The `io` layout was checked only on xnu-10063.141.1 (macOS 14.8.9). On other builds the
-  per-call checks or the self-test switch the release off if it differs.
+- The `io` layout (VM object offsets 0x50, 0x74, 0x78) was checked only on xnu-10063.141.1
+  (macOS 14.8.9). NVPagerHook routes `last_unmap` on Sonoma through Tahoe, but it turns the I/O
+  check (and with it the early release) off on any kernel but Darwin 23.6 (macOS 14.6 to 14.8).
+  `check_pager_hook.sh symbol` says so. Boot-arg `-nvpgrlayout` turns it on anyway, leaving only
+  the per-call checks and the self-test between a wrong layout and a slice released under a DMA.
 - macOS releases after `xnu-12377.121.6`: re-run the symbol check and the release cases after
   each update. The self-test catches a changed layout or count on its own and switches the
   release off.

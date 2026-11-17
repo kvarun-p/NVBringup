@@ -454,6 +454,7 @@ private:
     // and the slice waits on the dummy page until watchSettle sees it idle; kIoUnknown, NVPagerHook couldn't
     // tell, the slice stays held for good, as without the hook. Only fired && kIoIdle entries are taken.
     enum : uint8_t { kIoIdle = 0, kIoPinned, kIoUnknown };
+    // id 0: dropped (watchDrop) while pinned; watchSettle removes it once it unpins, off gspLock_.
     struct Bar1Watch { void *pager; uint64_t id; bool fired; uint8_t io; };
     const struct nv_pager_hook_ops *hookOps_ = nullptr;
     uint8_t   hookState_ = kHookNone;
@@ -474,7 +475,7 @@ private:
     uint64_t watchAdd(IOMemoryDescriptor *md);  // 0: no pager, or no memory
     bool     watchRearm(uint64_t id);           // clears fired; true if it was set
     bool     watchTake(uint64_t id);            // fired and idle: removes the entry, true
-    void     watchDrop(uint64_t id);            // unpins it if pinned
+    void     watchDrop(uint64_t id);            // removes it; if pinned, leaves the unpin to watchSettle
     bool     watchState(uint64_t id, bool *fired, uint8_t *io);
     uint32_t watchSettle();                     // unpins pinned pagers now idle; returns how many stay pinned
     void     bar1ReleaseFired();                // releases every held slice whose pager has fired
@@ -613,6 +614,16 @@ private:
     bool      vramMapAllowed();
     int32_t   vramMapArg_ = -2;             // -2 not read yet, -1 absent, else the boot-arg's value
     uint32_t  vramMapRefused_ = 0;          // mappings refused (NVStats VramMapRefused)
+    // When the answer turns from yes to no (a disk without peer-to-peer support came, e.g. on Thunderbolt), the
+    // mappings already handed out are taken back (vramRevoke). IOMedia's publish notification rechecks at once
+    // (p2pCall_), and fillInfo's once-a-second recheck catches the rest.
+    bool      vramMapWas_ = false;          // vramMapAllowed's last answer
+    uint32_t  vramMapRevoked_ = 0;          // mappings taken back (NVStats VramMapRevoked)
+    void      vramRevoke();
+    IONotifier *mediaNotifier_ = nullptr;
+    thread_call_t p2pCall_ = nullptr;
+    static bool mediaPublished(void *target, void *ref, IOService *media, IONotifier *notifier);
+    static void p2pRecheckThunk(thread_call_param_t self, thread_call_param_t);
     bool      p2pPair(IOPCIDevice *a, IOPCIDevice *b, char *why, size_t n);
     uint64_t  p2pCheckedAt_ = 0;
     bool      p2pOk_ = false, p2pLogged_ = false;
