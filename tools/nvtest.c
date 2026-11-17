@@ -170,6 +170,14 @@ static void test_memory(struct tdev *t)
     CHECK(!bad, "GART 1 MiB written and read back by the CPU");
 
     TRY(nvmac_mem_alloc(t->d, 1 << 20, 0, NVMAC_MEM_VRAM | NVMAC_MEM_CAN_MAP, 0, &v, &size));
+    if (!(nvmac_info(t->d)->features & NVMAC_FEATURE_VRAM_MAP)) {
+        // No peer-to-peer here: the driver refuses CPU mappings of VRAM (boot-arg nvvrammap=1 allows them).
+        CHECK(nvmac_mem_map(t->d, v, (void **)&pv, NULL) == kIOReturnNotPermitted,
+              "CPU mapping of VRAM refused (no NVMAC_FEATURE_VRAM_MAP); BAR1 checks skipped");
+        TRY(nvmac_mem_free(t->d, g));
+        TRY(nvmac_mem_free(t->d, v));
+        return;
+    }
     TRY(nvmac_mem_map(t->d, v, (void **)&pv, NULL));
     uint32_t nz = 0;
     for (uint32_t i = 0; i < (1u << 20); i += 4)
@@ -229,7 +237,8 @@ static void test_bind_rules(struct tdev *t)
 
 // ---- 5b: contexts, submission, syncs ---------------------------------------------------------
 
-// Copy engine: GART -> VRAM -> BAR1-visible VRAM, checked by the CPU. Returns 0 on success.
+// Copy engine: GART -> VRAM -> BAR1-visible VRAM, checked by the CPU. Returns 0 on success. Where CPU
+// mappings of VRAM are refused (no NVMAC_FEATURE_VRAM_MAP) the last hop goes back to GART instead.
 static int copy_roundtrip(struct tdev *t, uint32_t ctx, uint32_t seqSync, uint32_t bytes, int quiet)
 {
     uint32_t src, mid, dst;
@@ -238,7 +247,10 @@ static int copy_roundtrip(struct tdev *t, uint32_t ctx, uint32_t seqSync, uint32
     int r;
     if ((r = nvmac_mem_alloc(t->d, bytes, 0, NVMAC_MEM_GART, 0, &src, &size)) ||
         (r = nvmac_mem_alloc(t->d, bytes, 0, NVMAC_MEM_VRAM, 0, &mid, &size)) ||
-        (r = nvmac_mem_alloc(t->d, bytes, 0, NVMAC_MEM_VRAM | NVMAC_MEM_CAN_MAP, 0, &dst, &size)) ||
+        (r = nvmac_mem_alloc(t->d, bytes, 0,
+                             (nvmac_info(t->d)->features & NVMAC_FEATURE_VRAM_MAP) ? NVMAC_MEM_VRAM | NVMAC_MEM_CAN_MAP
+                                                                                   : NVMAC_MEM_GART,
+                             0, &dst, &size)) ||
         (r = nvmac_mem_map(t->d, src, (void **)&ps, NULL)) || (r = nvmac_mem_map(t->d, dst, (void **)&pd, NULL)))
         return r;
     uint64_t vs = tdev_va(t, bytes), vm = tdev_va(t, bytes), vd = tdev_va(t, bytes);

@@ -6,6 +6,11 @@
 //                                    release cases if NVPagerHook is active
 //   build/bar1_alias_test remap|fork|reuse|cap|remap-gart|fork-gart
 //   build/bar1_alias_test release|release-none|release-remap|release-fork|release-entry
+//   build/bar1_alias_test release-dio|release-dio-reuse [file] [rounds]   NOT run by default (see below)
+//   build/bar1_alias_test refusal          where CPU mappings of VRAM are refused (no NVMAC_FEATURE_VRAM_MAP:
+//                                    no peer-to-peer, or nvvrammap=0): the VRAM map must return
+//                                    kIOReturnNotPermitted and GART must still map. The default run does
+//                                    this instead of the VRAM cases there.
 //
 // remap: this process allocates 64 KiB of CPU-mappable VRAM, maps it, fills it with pattern
 //   A, duplicates the mapping with mach_vm_remap (shared, not copied) and frees the memory. A
@@ -39,6 +44,34 @@
 //   Without NVPagerHook they are skipped (INCONCLUSIVE when asked for by name). They read
 //   bar1_used, so other programs mapping VRAM meanwhile make them INCONCLUSIVE.
 //   "release" runs the four.
+// release-dio: the open risk in docs/bar1-cpu-mappings.md. Direct I/O (F_NOCACHE) from a
+//   physically contiguous device mapping goes through cluster_write_contig: the disk DMAs from
+//   the BAR1 address while the UPL holds no reference on the VM object (vm_map_create_upl drops
+//   it once the page list is built; only activity_in_progress stays raised), and
+//   vm_object_deallocate doesn't wait for activity before device_pager_last_unmap. So freeing
+//   the memory while a pwrite from it is in flight may release the slice under the DMA. This
+//   case starts a 64 MiB pwrite from mapped VRAM (pattern A), frees the memory 1 ms later, and
+//   records when BAR1 comes back relative to the write returning; then it checks the file.
+//   VULNERABLE: released before the write returned, or anything but A and zeroes in the file
+//   (B in reuse mode). PASS: the release came only after the write returned, every round.
+//   INCONCLUSIVE: the write didn't take the DMA path or finished before the free. Zeroes are
+//   expected: from the free on, the slice is on the read-only zero page (held, or released onto
+//   it), so the rest of the DMA reads zeroes.
+//   Safe mode (release-dio, the default) allocates nothing while the write runs. A release the I/O
+//   check misses then leaves the DMA reading the zero page (NVMAC_FEATURE_BAR1_ZERO_RELEASE: released
+//   slices aren't unmapped), so a failure shows as VULNERABLE without the disk ever reading unmapped
+//   BAR1. It refuses to run without that feature. The one remaining risk is another program being
+//   handed the range within the write's few milliseconds; its DMA reads would then see that memory.
+//   release-dio-reuse also allocates and fills 64 MiB of B as soon as BAR1 comes back, to show a
+//   leak of another allocation's data. Mapping B clears the range's zero-page PTEs and then writes
+//   B's, so for that moment the range is unmapped: a DMA reading it then can still fault, as the
+//   disk did when the Mac panicked on 2026-11-17 ("nvme: Controller fatal bit set. Write"), though
+//   it wasn't confirmed this test was running. Run safe mode first. Only the disk's reads touch BAR1 (no
+//   pread variant: the disk would write into whatever the slice went to). Both refuse to run
+//   unless nvmac_info.features has NVMAC_FEATURE_BAR1_IO_CHECK and NVMAC_FEATURE_P2P (the disks and the GPU
+//   share a PCIe switch, the CPU is AMD Zen or newer, or the host bridge is on Linux's p2pdma list), and are
+//   opt-in even then.
+//   file: default $TMPDIR/bar1_dio.bin. rounds: default 5.
 //
 // Probing a duplicate: read it, write X through it, read it again. VRAM: SAFE when it faults
 // or reads only zeroes both times (the driver's read-only dummy page); VULNERABLE when it
@@ -56,6 +89,11 @@
 #include "libnvmac.h"
 
 #include <IOKit/IOReturn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <time.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <setjmp.h>
@@ -683,6 +721,236 @@ static int test_release_all(void)
     return r;
 }
 
+// ---- release-dio ----------------------------------------------------------------------------
+
+#define DIO_SIZE (64ull << 20)
+
+struct dio {
+    int fd;
+    void *buf;
+    _Atomic int started, done;
+    ssize_t got;
+    int err;
+    uint64_t t_start, t_done;           // ns, CLOCK_UPTIME_RAW
+};
+
+static uint64_t now_ns(void)
+{
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+}
+
+static void *dio_writer(void *arg)
+{
+    struct dio *w = arg;
+    w->t_start = now_ns();
+    atomic_store(&w->started, 1);
+    w->got = pwrite(w->fd, w->buf, DIO_SIZE, 0);
+    w->err = w->got < 0 ? errno : 0;
+    w->t_done = now_ns();
+    atomic_store(&w->done, 1);
+    return NULL;
+}
+
+// One round. 0 pass, 1 vulnerable, 2 inconclusive.
+static int dio_round(nvmac_dev *d, const char *path, int round, int reuse)
+{
+    const char *who = reuse ? "release-dio-reuse" : "release-dio";
+    uint64_t base = bar1_used(d);
+    uint32_t mem, memb = 0;
+    void *ptr, *ptrb = NULL;
+    if (base == ~0ull || alloc_map(d, DIO_SIZE, &mem, &ptr, who))
+        return 2;
+    fill(ptr, DIO_SIZE, PAT_A);
+
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0 || fcntl(fd, F_NOCACHE, 1) || ftruncate(fd, DIO_SIZE)) {
+        fprintf(stderr, "%s: %s: %s\n", who, path, strerror(errno));
+        if (fd >= 0)
+            close(fd);
+        nvmac_mem_free(d, mem);
+        return 2;
+    }
+    struct dio w = { .fd = fd, .buf = ptr };
+    pthread_t th;
+    pthread_create(&th, NULL, dio_writer, &w);
+    while (!atomic_load(&w.started))
+        ;
+    usleep(1000);
+    int done_before_free = atomic_load(&w.done);
+    uint64_t t_free = now_ns();
+    int err = nvmac_mem_free(d, mem);
+
+    // When does the slice come back, relative to the write?
+    uint64_t t_rel = 0;
+    while (!err) {
+        if (bar1_used(d) <= base) {
+            t_rel = now_ns();
+            break;
+        }
+        if (atomic_load(&w.done) && now_ns() - w.t_done > 2000000000ull)
+            break;                              // held 2 s past the write: not released by it
+        usleep(200);
+    }
+    int rel_during = t_rel && !atomic_load(&w.done);
+    if (reuse && rel_during && !alloc_map(d, DIO_SIZE, &memb, &ptrb, who))
+        fill(ptrb, DIO_SIZE, PAT_B);            // the DMA still in flight should land on B
+    pthread_join(th, NULL);
+    if (!t_rel && !err && released_within(d, base, 2000))
+        t_rel = now_ns();
+
+    // What went to the file?
+    uint64_t n_a = 0, n_b = 0, n_0 = 0, n_x = 0, bytes = w.got > 0 ? (uint64_t)w.got : 0;
+    uint64_t *chk = malloc(1 << 20);
+    for (uint64_t off = 0; chk && off < bytes; off += 1 << 20) {
+        ssize_t r = pread(fd, chk, 1 << 20, (off_t)off);
+        for (ssize_t i = 0; i < r / 8; i++) {
+            if (off + (uint64_t)i * 8 >= bytes)
+                break;
+            uint64_t v = chk[i];
+            if (v == PAT_A) n_a++;
+            else if (v == PAT_B) n_b++;
+            else if (v == 0) n_0++;
+            else n_x++;
+        }
+    }
+    free(chk);
+    close(fd);
+    unlink(path);
+    if (memb)
+        nvmac_mem_free(d, memb);
+
+    double ms_write = (w.t_done - w.t_start) / 1e6;
+    printf("%s[%d]: pwrite %zd of %llu bytes (%s) in %.2f ms; freed at +%.2f ms; ", who, round, w.got,
+           DIO_SIZE, w.err ? strerror(w.err) : "ok", ms_write, (t_free - w.t_start) / 1e6);
+    if (t_rel)
+        printf("BAR1 back at +%.2f ms (%s the write returned)\n", (t_rel - w.t_start) / 1e6,
+               rel_during ? "BEFORE" : "after");
+    else
+        printf("BAR1 still held 2 s after the write\n");
+    printf("%s[%d]: file: %llu A, %llu B, %llu zero, %llu other qwords\n", who, round,
+           (unsigned long long)n_a, (unsigned long long)n_b, (unsigned long long)n_0, (unsigned long long)n_x);
+
+    if (err) {
+        fprintf(stderr, "%s: free: 0x%x (%s)\n", who, err, nvmac_strerror(err));
+        return 2;
+    }
+    if (rel_during || n_b || n_x)
+        return 1;
+    if (done_before_free || ms_write < 2.0)
+        return 2;                               // the free never overlapped the write
+    return t_rel ? 0 : 2;
+}
+
+static int test_release_dio(const char *path, int rounds, int reuse)
+{
+    const char *who = reuse ? "release-dio-reuse" : "release-dio";
+    printf("== %s\n", who);
+    nvmac_dev *d;
+    int err = nvmac_open(&d);
+    if (err) {
+        fprintf(stderr, "release-dio: open: 0x%x (%s)\n", err, nvmac_strerror(err));
+        return 2;
+    }
+    if (!release_active(d)) {
+        printf("release-dio: NVPagerHook isn't active: SKIPPED\n");
+        nvmac_close(d);
+        return 2;
+    }
+    if (!reuse && !(nvmac_info(d)->features & NVMAC_FEATURE_BAR1_ZERO_RELEASE)) {
+        // Safe mode relies on a missed release leaving the range on the zero page: without it a hit reads
+        // unmapped BAR1.
+        printf("release-dio: this NVBringup unmaps released slices instead of leaving them on the zero page: "
+               "REFUSED, a hit could panic the machine\n");
+        nvmac_close(d);
+        return 2;
+    }
+    if (!(nvmac_info(d)->features & NVMAC_FEATURE_BAR1_IO_CHECK)) {
+        // Without the I/O check the slice is released under the DMA: the disk then reads unmapped or reassigned
+        // BAR1, which can take the disk controller down (an NVMe "controller fatal" panic). Never run it then.
+        printf("release-dio: this NVBringup releases without checking for I/O in flight (NVPagerHook version 1): "
+               "REFUSED, it can panic the machine\n");
+        nvmac_close(d);
+        return 2;
+    }
+    if (!(nvmac_info(d)->features & NVMAC_FEATURE_P2P)) {
+        // The disk DMAs to BAR1: peer-to-peer, which this machine's PCIe topology isn't known to forward. The
+        // driver logs why (ioreg -l | grep NVP2P).
+        printf("release-dio: peer-to-peer DMA between the disks and the GPU isn't allowed here (no shared PCIe "
+               "switch, no AMD Zen CPU, host bridge not listed; see the GPU's NVP2P property): REFUSED, a disk "
+               "DMA to BAR1 can panic the machine\n");
+        nvmac_close(d);
+        return 2;
+    }
+    char def[1024];
+    if (!path) {
+        const char *t = getenv("TMPDIR");
+        snprintf(def, sizeof def, "%s/bar1_dio.bin", t ? t : "/tmp");
+        path = def;
+    }
+    int r = 0, any_pass = 0;
+    for (int i = 0; i < rounds && r != 1; i++) {
+        int k = dio_round(d, path, i, reuse);
+        any_pass |= k == 0;
+        r = k == 1 ? 1 : r;
+    }
+    if (r != 1)
+        r = any_pass ? 0 : 2;
+    printf("%s: %s\n", who, r == 0 ? "PASS" : r == 1 ? "VULNERABLE" : "INCONCLUSIVE");
+    nvmac_close(d);
+    return r;
+}
+
+// ---- refused VRAM mappings -----------------------------------------------------------------
+
+// NVMAC_FEATURE_VRAM_MAP: may this process have a CPU mapping of VRAM? Without it (no peer-to-peer, or
+// boot-arg nvvrammap=0) every VRAM case here can only fail to map, so they are skipped and "refusal" checks
+// that the driver really refuses: mapping CPU-mappable VRAM must return kIOReturnNotPermitted, and GART still maps.
+static int vram_map_allowed(void)
+{
+    nvmac_dev *d;
+    if (nvmac_open(&d))
+        return 1;                       // can't tell: let the cases report their own errors
+    int on = !nvmac_refresh_info(d) && (nvmac_info(d)->features & NVMAC_FEATURE_VRAM_MAP);
+    nvmac_close(d);
+    return on;
+}
+
+static int test_refusal(void)
+{
+    printf("== refusal: CPU mappings of VRAM are refused here (no NVMAC_FEATURE_VRAM_MAP)\n");
+    nvmac_dev *d;
+    int err = nvmac_open(&d);
+    if (err) {
+        fprintf(stderr, "refusal: open: 0x%x (%s)\n", err, nvmac_strerror(err));
+        return 2;
+    }
+    int r = 0;
+    uint32_t mem;
+    uint64_t got;
+    void *ptr = NULL;
+    if ((err = nvmac_mem_alloc(d, SIZE, 0x10000, FLAGS, 0, &mem, &got))) {
+        fprintf(stderr, "refusal: VRAM alloc: 0x%x (%s)\n", err, nvmac_strerror(err));
+        r = 2;
+    } else {
+        err = nvmac_mem_map(d, mem, &ptr, NULL);
+        printf("refusal: map of CPU-mappable VRAM: 0x%x (%s)\n", err, err ? nvmac_strerror(err) : "mapped");
+        if (err != kIOReturnNotPermitted)
+            r = 1;                      // mapped (or failed some other way): the refusal doesn't hold
+        nvmac_mem_free(d, mem);
+    }
+    if ((err = nvmac_mem_alloc(d, SIZE, 0x10000, NVMAC_MEM_GART, 0, &mem, &got)) ||
+        (err = nvmac_mem_map(d, mem, &ptr, NULL))) {
+        printf("refusal: GART alloc/map: 0x%x (%s): system memory must still map\n", err, nvmac_strerror(err));
+        r = worst(r, 1);
+    } else {
+        printf("refusal: GART still maps\n");
+        nvmac_mem_free(d, mem);
+    }
+    printf("refusal: %s\n", r == 0 ? "PASS" : r == 1 ? "FAIL" : "INCONCLUSIVE");
+    nvmac_close(d);
+    return r;
+}
+
 // For the default run: are the release cases worth running?
 static int release_available(void)
 {
@@ -702,6 +970,9 @@ int main(int argc, char **argv)
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
 
+    if (argc >= 2 && argc <= 4 && (!strcmp(argv[1], "release-dio") || !strcmp(argv[1], "release-dio-reuse")))
+        return test_release_dio(argc >= 3 ? argv[2] : NULL, argc >= 4 ? atoi(argv[3]) : 5,
+                                !strcmp(argv[1], "release-dio-reuse"));
     if (argc == 2) {
         if (!strcmp(argv[1], "remap"))
             return test_remap(argv[0]);
@@ -713,6 +984,8 @@ int main(int argc, char **argv)
             return test_cap();
         if (!strcmp(argv[1], "release"))
             return test_release_all();
+        if (!strcmp(argv[1], "refusal"))
+            return test_refusal();
         for (int k = REL_NONE; k <= REL_ENTRY; k++)
             if (!strcmp(argv[1], rel_names[k]))
                 return test_release(k);
@@ -723,20 +996,27 @@ int main(int argc, char **argv)
             return test_fork();
     }
     if (argc != 1) {
-        fprintf(stderr, "usage: %s [remap|fork|reuse|cap|remap-gart|fork-gart|release|release-none|"
+        fprintf(stderr, "usage: %s [remap|fork|reuse|cap|remap-gart|fork-gart|refusal|release|release-none|"
                 "release-remap|release-fork|release-entry]\n", argv[0]);
         return 2;
     }
-    int r = test_remap(argv[0]);
-    r = worst(r, test_fork());
-    r = worst(r, test_reuse());
+    int vram = vram_map_allowed(), r = 0;
+    if (vram) {
+        r = test_remap(argv[0]);
+        r = worst(r, test_fork());
+        r = worst(r, test_reuse());
+    } else {
+        printf("== remap, fork, reuse, release: CPU mappings of VRAM are refused here (no peer-to-peer; boot-arg "
+               "nvvrammap=1 allows them): skipped, checking the refusal instead\n");
+        r = test_refusal();
+    }
     gart = 1;
     r = worst(r, test_remap(argv[0]));
     r = worst(r, test_fork());
     gart = 0;
-    if (release_available())
+    if (vram && release_available())
         r = worst(r, test_release_all());
-    else
+    else if (vram)
         printf("== release: NVPagerHook isn't active: skipped\n");
     printf("overall: %s\n", r == 0 ? "SAFE / PASS" : r == 1 ? "VULNERABLE / FAIL" : "INCONCLUSIVE");
     return r;

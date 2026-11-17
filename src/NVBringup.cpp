@@ -268,6 +268,8 @@ void NVBringup::free()
     OSSafeReleaseNULL(dispWant_);                   // shutdownHw has taken the nub down
     if (bar1Held_)
         IOFree(bar1Held_, bar1HeldCap_ * sizeof(Bar1Held));
+    if (bar1Zero_)
+        IOFree(bar1Zero_, bar1ZeroCap_ * sizeof(Bar1Range));
     if (watch_)                                     // shutdownHw has detached the hook
         IOFree(watch_, watchCap_ * sizeof(Bar1Watch));
     if (watchLock_) {

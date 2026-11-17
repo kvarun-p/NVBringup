@@ -54,9 +54,13 @@ With apps allowed to map VRAM, one llama.cpp run held about 49 MiB, so the cap w
 
 ## Releasing held slices early (NVPagerHook)
 
-**Status: written, not yet built or run on a Mac.** Everything below is from reading XNU
-(`xnu-10002.1.13` to `xnu-12377.121.6`, Sonoma 14.0 to Tahoe 26); the tests at the end are what
-proves it.
+**Status: built and run on a TU117 laptop (macOS 14.8.9, xnu-10063.141.1) with `nvvrammap=1`,
+2026-11-17/18.** The self-test passed, including its in-kernel direct-I/O case. The four release
+cases and the alias suite passed, and 53 llama-bench runs with CPU-mapped VRAM left nothing held.
+The design comes from reading XNU (`xnu-10002.1.13` to `xnu-12377.121.6`, Sonoma 14.0 to Tahoe
+26). On that laptop, peer-to-peer isn't allowed (below), so by default no process gets a CPU
+mapping of VRAM and the hook has nothing to release. It matters where peer-to-peer is allowed,
+or with `nvvrammap=1`.
 
 The kernel does know when the last copy of a mapping goes; it just tells no driver.
 
@@ -77,16 +81,46 @@ and passes each call to NVBringup (`src/nv_pager_hook.h`). NVBringup then:
 2. at `memFree`, gives the slice straight back to the allocator if the pager reported during
    the release (no copy existed), and nothing is held;
 3. otherwise holds the slice on the dummy page as before, and releases it from a kernel
-   thread when the pager reports.
+   thread when the pager reports;
+4. in either case, only once no I/O is in flight on the pages (below).
 
 A watched slice is never reused by its owner meanwhile, so a copy only ever reads zeroes.
 Slices held without a watch (before the hook was active, or reused ones) stay held until restart.
+
+**No mapping left doesn't mean nobody is using the pages.** Direct I/O (`F_NOCACHE`) on a mapping
+of VRAM goes through `cluster_write_contig` / `cluster_read_contig`, and the disk DMAs straight to
+or from the BAR1 address. Its I/O page list (UPL) holds no reference on the VM object, only the
+object's `activity_in_progress` count, and the kernel doesn't wait for that before reporting the
+last unmap. So a process that frees the memory during such an I/O gets the report with the DMA
+still running. NVPagerHook version 1 released the slice then. On 2026-11-17 the Mac panicked with
+"nvme: Controller fatal bit set. Write" on its internal SSD, which is what a disk DMA from released
+or unmapped BAR1 does, though it was never confirmed that `release-dio` caused it. Version 2 asks
+before treating a report as final:
+
+- the listener reads the object's in-flight count (`io`) while the object is still alive. With
+  I/O in flight it takes a device pager reference (`pin`), which keeps the object from being
+  destroyed, and the slice waits on the dummy page;
+- the release thread polls the pinned pagers (2 ms, backing off to 100 ms) and releases the
+  slice, dropping the pin, once the count is 0;
+- if the object doesn't look as expected (`io` returns -1), the slice stays held for good, as it
+  would without the hook.
+
+There is no race with an I/O just starting: `vm_map_create_upl` raises the count before it drops
+its temporary object reference, so the report then comes from that drop, with the count already
+raised. After the report, no new I/O can start: that needs a mapping or a memory entry.
+`io` reads two private `vm_object` fields (layout in `pagerhook/src/NVPagerHook.cpp`, checked
+against xnu-10063.141.1's source and its shipped code). Each call checks the pager and object
+point at each other, and the self-test checks the count itself.
 
 **It fails closed.** Without Lilu, without the kext, with `-nvpgroff` or `nvbar1hook=0`, if
 the symbol can't be resolved, or if the self-test fails, the driver behaves exactly as described
 above. The self-test runs at the first CPU mapping of VRAM, on a private kernel mapping of one
 BAR1 page: the pager read from the descriptor must be the one the kernel reports, it must not
-report while the descriptor is alive, and it must report when the descriptor is released.
+report while the descriptor is alive, and it must report when the descriptor is released. It
+also replays the direct-I/O case without any DMA: `io` must read 0, then at least 1 while an
+`IOMemoryDescriptor::prepare()` page list is held on the mapping. The report that comes while it
+is held must be deferred (pinned), and after `complete()` the entry must settle and be released.
+NVBringup refuses NVPagerHook version 1, so a mixed install keeps everything held.
 
 ### Install and check
 
@@ -116,16 +150,108 @@ tools/bar1_release_soak.sh 100          # 100 llama-bench runs with CPU-mapped V
 
 `NVStats` gains `Bar1Hook` (0 none, 1 attached, 2 active, 3 failed, 4 off), `Bar1Released` and
 `Bar1ReleasedSlices` (given back early), and `Bar1HookEarly` (a pager that reported before its
-memory was freed; must stay 0, anything else means the kernel doesn't count as described here).
+memory was freed; must stay 0, anything else means the kernel doesn't count as described here),
+`Bar1IoDeferred` (releases that waited for I/O in flight) and `Bar1IoUnknown` (reports that
+couldn't be checked for I/O, whose slices stay held; must stay 0).
 `nvmac_info.features` has `NVMAC_FEATURE_BAR1_RELEASE` while the hook is active.
+
+**Released slices stay on the zero page.** A released CPU-mapped slice goes back to the
+allocator with its PTEs still on the read-only dummy page, not unmapped. `bar1Map` clears them
+only where a new allocation overlaps (the driver lists those ranges). So a device still reading a
+released range, a DMA the I/O check missed, reads zeroes instead of hitting unmapped BAR1. That
+fault, not the data, is what can take a disk controller down. Writes to the dummy page are
+dropped, as for held slices. While `bar1Map` maps a new allocation over such a range, the range
+is unmapped for a moment between clearing the dummy PTEs and writing the new ones.
+`nvmac_info.features` has `NVMAC_FEATURE_BAR1_ZERO_RELEASE` for this.
+
+`build/bar1_alias_test release-dio` frees VRAM while a 64 MiB `F_NOCACHE` `pwrite` from it is in
+flight. It must show BAR1 coming back only after the write returns, and nothing in the file but
+pattern A and zeroes. Zeroes are expected: from the free on, the slice is on the zero page.
+
+- `release-dio` (safe mode) allocates nothing during the write, so a release the I/O check
+  misses leaves the DMA reading the zero page. That shows as VULNERABLE without the disk reading
+  unmapped BAR1. It needs `NVMAC_FEATURE_BAR1_IO_CHECK`, `NVMAC_FEATURE_BAR1_ZERO_RELEASE` and
+  `NVMAC_FEATURE_P2P` (below).
+  The remaining risk is another program being handed the range within the write's milliseconds.
+- `release-dio-reuse` also maps 64 MiB of pattern B over the released range, to show another
+  allocation's data leaking. While that mapping is written, the range is briefly unmapped, so
+  run safe mode first.
+
+**Don't run either against a version 1 install, or a build without the zero page**: a disk DMA
+into unmapped BAR1 panicked the Mac on 2026-11-17, though it wasn't confirmed the test was running
+then. Both refuse to run without the feature bits.
+
+**Peer-to-peer has to be allowed too.** A disk DMAing to BAR1 is a peer-to-peer transfer, and a
+root complex that doesn't forward those may drop it, which a disk controller can take as fatal.
+NVBringup follows Linux's `p2pdma` policy (`src/NVP2p.cpp`) and sets `NVMAC_FEATURE_P2P` only if,
+for every PCI device with a disk under it (NVMe, AHCI, the USB controller of a USB disk; the GPU's
+own functions aside), one of these holds:
+
+1. it shares an upstream bridge with the GPU (a PCIe switch) and no port on the path between them
+   has ACS P2P redirect (RR, CR or EC) on;
+2. the CPU is AMD family 17h (Zen) or newer;
+3. the host bridge device (00.0 on the root bus, or the first root port) is on Linux's list
+   (some Xeon, Haswell client, Skylake-E and later Intel server parts, Google, NVIDIA, Zhaoxin and
+   Alibaba CPUs; some entries only for two devices under the same host bridge).
+
+The peer of a direct I/O is whichever disk the file is on, which the driver can't know when it
+maps VRAM, so every disk controller has to pass. The check reruns at most once a second, as disks
+come and go. The answer and the reason are logged (`P2P:`) and in the GPU's `NVP2P` property
+(`ioreg -r -c NVBringup -d 1 | grep NVP2P`). Both `release-dio` cases refuse to run without the
+bit.
+
+This Mac (i5-9300H, host bridge 8086:3e10, the GPU on root port PEG0 and the disks on other
+root ports) passes none of the three, so `release-dio` refuses here.
+
+**Without peer-to-peer, no process gets a CPU mapping of VRAM.** The driver can't see a direct I/O
+on a mapping it handed out, so the only way to keep one from reaching BAR1 is not to hand out the
+mapping. Where `NVMAC_FEATURE_P2P` is clear, `NVMAC_MEM_MAP` of CPU-mappable VRAM and
+`NVMAC_DISPLAY_MAP` return `kIOReturnNotPermitted` (logged once, counted in `NVStats`
+`VramMapRefused`), and `nvmac_info.features` lacks `NVMAC_FEATURE_VRAM_MAP`. System memory (GART)
+maps as always.
+
+- NVK needs no change: it offers no host-visible VRAM anyway, and the buffers `nvkmapvram` would put
+  in CPU-mapped VRAM fall back to system memory when the map fails. So on such a machine
+  `nvkmapvram` has no effect, and runs go at the default speed.
+- `nvvdisplay` loses its CPU-copy fallback into the scanout buffer (`NVMAC_DISPLAY_MAP`); its
+  GPU-copy path is unaffected.
+- `bar1_alias_test` skips its VRAM cases and checks the refusal instead (`refusal`: the map must
+  return `kIOReturnNotPermitted` and GART must still map). `nvtest` does the same in its memory
+  test, and its copy round trip ends in GART instead of CPU-visible VRAM.
+- With no CPU mappings of VRAM, nothing is held, so the hook (`NVPagerHook`) has nothing to release.
+  Its self-test runs at the first CPU mapping of VRAM, so it stays `attached`.
+
+Boot-arg `nvvrammap=1` allows the mappings anyway: you accept that a program doing direct I/O on
+one can hang the machine. That's for testing `nvkmapvram`, the hook and the alias cases here.
+`nvvrammap=0` refuses them even where peer-to-peer is allowed.
+
+### What was seen on the TU117 laptop
+
+- `_device_pager_last_unmap` is in macOS 14.8.9's kernel symbol table
+  (`check_pager_hook.sh symbol`), and so are `device_pager_ops`, `device_pager_reference` and
+  `device_pager_deallocate`. The `io` offsets match that kernel's shipped code.
+- Direct I/O from CPU-mapped VRAM to the internal NVMe SSD can take the machine down:
+  - 2026-11-17: a kernel panic, "nvme: Controller fatal bit set. Write" (it wasn't confirmed
+    what was running);
+  - 2026-11-18: a hard hang during a plain 64 MiB `F_NOCACHE` `pwrite` from mapped VRAM, with no
+    free at all;
+  - one `release-dio` safe-mode round got `EFAULT` (the free came before the I/O was set up), so
+    no DMA happened.
+
+  So the SSD DMAing from the GPU's BAR1 fails on this machine in itself, release or not. That's
+  why peer-to-peer is checked and CPU mappings of VRAM are refused (above).
 
 ### What is not known yet
 
-- Whether `_device_pager_last_unmap` is in the shipped kernels' symbol tables
-  (`check_pager_hook.sh symbol`). It is a non-static function in every source release checked.
-- Whether something can keep using the pages by physical address after the last mapping is gone
-  without referencing the object (a UPL from direct I/O on the mapping, another driver that wired
-  it). Not checked in XNU. If it can, it could reach a released slice.
+- Shipped kernels other than 14.8.9: run `check_pager_hook.sh symbol` first. The symbol is
+  non-static in every source release checked.
+- Direct I/O with real DMA against version 2 hasn't been run anywhere: it needs a machine where
+  peer-to-peer is allowed. The self-test covers it without DMA.
+- Another driver that took the physical address another way, not through an I/O page list on
+  this object (for example by reading the PTEs of a mapping it was given), isn't covered: the
+  count only knows about page lists.
+- The `io` layout was checked only on xnu-10063.141.1 (macOS 14.8.9). On other builds the
+  per-call checks or the self-test switch the release off if it differs.
 - macOS releases after `xnu-12377.121.6`: re-run the symbol check and the release cases after
   each update. The self-test catches a changed layout or count on its own and switches the
   release off.
@@ -149,6 +275,11 @@ The kext fix makes CPU-mapped VRAM a limited resource, so NVK uses it sparingly:
   once the kext's cap is reached they come from system memory instead of failing: programs
   slow down to option A speed instead of crashing. `NVK_MACOS_MAPVRAM` overrides the boot-arg
   for one process (for measuring; the kext's cap applies either way).
+- **Where peer-to-peer isn't allowed** (no `NVMAC_FEATURE_VRAM_MAP`), the kext refuses every CPU
+  mapping of VRAM, so `nvkmapvram` falls back to system memory for all of it and has no effect:
+  option A speed. On the TU117 laptop, a llama-bench run with `NVK_MACOS_MAPVRAM=1` had 63 maps
+  refused and ran at 93 t/s. Add `nvvrammap=1` as well to measure option B there, accepting the
+  direct-I/O risk.
 
 ### Turn on `nvkmapvram`
 
@@ -229,6 +360,10 @@ What the numbers show:
   matters.
 - If `IOMemoryMap::redirect` turns out to revoke copies, the hold and the cap go away, and B can
   become the default.
-- If NVPagerHook passes its tests on the Mac, `nvkmapvram=1` no longer runs into the cap for
-  ordinary programs, and B can become the default wherever the hook is active. The cap stays
-  for processes that keep copies alive.
+- NVPagerHook passed its tests on the TU117 laptop (with `nvvrammap=1`). Wherever peer-to-peer is
+  allowed and the hook is active, `nvkmapvram=1` no longer runs into the cap for ordinary programs,
+  so B could become the default there. The cap stays for processes that keep copies alive.
+- **Without peer-to-peer, no CPU mappings of VRAM at all** (2026-11-18). Direct I/O on such a
+  mapping hung the TU117 laptop, and the driver can't see that I/O to stop it. So where Linux's
+  `p2pdma` rules don't allow peer-to-peer (most Intel client machines), the kext refuses the
+  mappings and option A is the only mode, unless `nvvrammap=1` overrides it.

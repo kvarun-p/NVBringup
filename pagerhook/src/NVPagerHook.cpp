@@ -12,6 +12,8 @@
 //
 // The hook runs on every last unmap of device memory in the system (framebuffers, other PCI drivers' BARs), on
 // the thread that dropped the reference. It does nothing but call the listener, which doesn't block.
+// It also gives NVBringup io/pin/unpin: whether I/O is still in flight on a pager's VM object (a last unmap
+// doesn't mean the DMA is done), and a pager reference that keeps the object alive until it is.
 // A routed kernel function can't be unrouted safely, so this kext doesn't unload (Lilu refuses plugin unloads).
 // Disabled by -nvpgroff.
 
@@ -63,10 +65,78 @@ static bool hookRouted()
     return gRouted;
 }
 
-static const nv_pager_hook_ops kOps = { NV_PAGER_HOOK_VERSION, sizeof(nv_pager_hook_ops), hookSet, hookRouted };
+// ---- In-flight I/O on a device pager's VM object (nv_pager_hook.h: io, pin, unpin) ----------
+//
+// Private layouts, x86_64, checked against xnu-10063.141.1 (macOS 14.8.9) source and its shipped kernel code:
+// - struct memory_object (osfmk/mach/memory_object_types.h): mo_ikot and mo_ref (4 bytes each), then
+//   mo_pager_ops at 0x8 (memory_object_deallocate: movq 0x8(%rdi)) and mo_control at 0x10
+//   (device_pager_deallocate and device_pager_populate_object use 0x10). A memory_object_control_t is the
+//   vm_object_t itself (memory_object_control_to_vm_object returns it).
+// - struct vm_object (osfmk/vm/vm_object.h): pager at 0x50; paging_in_progress, 16 bits, at 0x74 and
+//   activity_in_progress, 32 bits, at 0x78 (vm_object_iopl_request: incw 0x74(obj), incl 0x78(obj)).
+// Every io() call checks the pager's ops table is device_pager_ops and that the object points back at the
+// pager, else returns -1; NVBringup's self-test checks that an IOPL on its test page raises the count and
+// committing it lowers it again. On a kernel where any of that doesn't hold, the early release stays off.
+static const size_t kMoPagerOps = 0x8, kMoControl = 0x10;
+static const size_t kVoPager = 0x50, kVoPagingInProgress = 0x74, kVoActivityInProgress = 0x78;
+
+static mach_vm_address_t gDevicePagerOps;
+static void (*gPagerReference)(void *);
+static void (*gPagerDeallocate)(void *);
+
+static bool kernelPtr(const void *p)
+{
+    return (uintptr_t)p >= 0xffffff8000000000ull;
+}
+
+static int32_t hookIo(void *pager)
+{
+    if (!gDevicePagerOps || !kernelPtr(pager))
+        return -1;
+    const uint8_t *mo = (const uint8_t *)pager;
+    if (*(void *const *)(mo + kMoPagerOps) != (void *)gDevicePagerOps)
+        return -1;                      // not a device pager
+    const uint8_t *obj = *(const uint8_t *const *)(mo + kMoControl);
+    if (!kernelPtr(obj) || *(void *const *)(obj + kVoPager) != pager)
+        return -1;                      // no object yet, or not the layout above
+    uint32_t act = __atomic_load_n((const uint32_t *)(obj + kVoActivityInProgress), __ATOMIC_ACQUIRE);
+    uint16_t pip = __atomic_load_n((const uint16_t *)(obj + kVoPagingInProgress), __ATOMIC_ACQUIRE);
+    uint64_t n = (uint64_t)act + pip;
+    return n > 0x7fffffffull ? 0x7fffffff : (int32_t)n;
+}
+
+static void hookPin(void *pager)
+{
+    if (gPagerReference && kernelPtr(pager))
+        gPagerReference(pager);
+}
+
+static void hookUnpin(void *pager)
+{
+    if (gPagerDeallocate && kernelPtr(pager))
+        gPagerDeallocate(pager);
+}
+
+static const nv_pager_hook_ops kOps = { NV_PAGER_HOOK_VERSION, sizeof(nv_pager_hook_ops), hookSet, hookRouted,
+                                        hookIo, hookPin, hookUnpin };
 
 static void patcherLoaded(void *, KernelPatcher &patcher)
 {
+    // io/pin/unpin first: without them NVBringup's self-test fails and nothing is released early, so routing
+    // last_unmap without them is harmless but useless. Each missing one is logged.
+    gDevicePagerOps = patcher.solveSymbol(KernelPatcher::KernelID, "_device_pager_ops");
+    mach_vm_address_t ref = patcher.solveSymbol(KernelPatcher::KernelID, "_device_pager_reference");
+    mach_vm_address_t dealloc = patcher.solveSymbol(KernelPatcher::KernelID, "_device_pager_deallocate");
+    patcher.clearError();
+    if (!gDevicePagerOps || !ref || !dealloc) {
+        SYSLOG("nvpgr", "device_pager_ops %d, device_pager_reference %d, device_pager_deallocate %d not found: no I/O "
+               "check, so NVBringup won't release held slices early", !gDevicePagerOps, !ref, !dealloc);
+        gDevicePagerOps = 0;
+    } else {
+        gPagerReference = (void (*)(void *))ref;
+        gPagerDeallocate = (void (*)(void *))dealloc;
+    }
+
     KernelPatcher::RouteRequest req("_device_pager_last_unmap", wrapLastUnmap, orgLastUnmap);
     if (!patcher.routeMultiple(KernelPatcher::KernelID, &req, 1)) {
         SYSLOG("nvpgr", "device_pager_last_unmap not routed (%d): NVBringup keeps held BAR1 slices until it reloads",

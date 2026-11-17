@@ -8,6 +8,7 @@ authoritative text.
 |---|---|---|
 | [NVIDIA open-gpu-kernel-modules](https://github.com/NVIDIA/open-gpu-kernel-modules) (tag 570.144) | Register definitions, GSP-RM structure layouts and sequences in `src/` follow its headers and code; names are kept so each structure traces back to its source | MIT (the repository is dual MIT/GPL; only the MIT-licensed parts are used) |
 | [nouveau](https://nouveau.freedesktop.org/) and nova-core (Linux kernel) | Reference for Turing boot sequences and firmware parsing. Behaviour was cross-checked; GPL-licensed code (including nova-core's generated bindings) is not copied | GPL-2.0 (reference only) |
+| Linux kernel `drivers/pci/p2pdma.c` | `src/NVP2p.cpp` makes the same peer-to-peer decision (shared upstream bridge without ACS redirect, AMD Zen, or a listed host bridge) and uses the host bridge vendor and device IDs from its list. The code is written for this driver, not copied | GPL-2.0 (reference only) |
 | [linux-firmware](https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git) | Source of NVIDIA's GSP-RM firmware and booters. **Not included in this repository**; the user downloads it | NVIDIA's firmware license (`LICENCE.nvidia` in linux-firmware) |
 | [Mesa](https://mesa3d.org) (NVK, NAK) | Patched by the separate `nvbringup-mesa` repository, not by this one | MIT |
 | [Khronos Vulkan loader and headers](https://github.com/KhronosGroup/Vulkan-Loader) | Built and installed by the user | Apache-2.0 |

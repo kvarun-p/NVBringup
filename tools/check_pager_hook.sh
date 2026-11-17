@@ -54,6 +54,12 @@ status() {
         return 2
     fi
     get() { echo "$stats" | grep -oE "\"$1\"=[0-9]+" | cut -d= -f2; }
+    local p2p; p2p=$(ioreg -r -c NVBringup -d 1 2>/dev/null | grep -oE '"NVP2P" = "[^"]*"' | cut -d'"' -f4)
+    echo "P2P:                ${p2p:-no NVP2P property (built before the peer-to-peer check)}: release-dio needs it allowed"
+    local refused; refused=$(get VramMapRefused)
+    if [ -n "$refused" ]; then
+        echo "VRAM maps refused:  $refused (no peer-to-peer: no process gets a CPU mapping of VRAM; boot-arg nvvrammap=1 allows them)"
+    fi
     local st; st=$(get Bar1Hook)
     case "${st:-}" in
         0) echo "hook: none (NVBringup never got NVPagerHook's ops)"; r=1 ;;
@@ -67,6 +73,15 @@ status() {
     held=$(get Bar1Held); rel=$(get Bar1Released); n=$(get Bar1ReleasedSlices)
     echo "Bar1Held:           $(( ${held:-0} >> 10 )) KiB held or promised to live CPU mappings"
     echo "Bar1Released:       $(( ${rel:-0} >> 10 )) KiB in ${n:-0} slices given back early"
+    local def unk; def=$(get Bar1IoDeferred); unk=$(get Bar1IoUnknown)
+    if [ -n "$def" ]; then
+        echo "Bar1IoDeferred:     ${def:-0} releases waited for I/O in flight on the pages"
+    else
+        echo "Bar1IoDeferred:     missing: this NVBringup has no I/O check (NVPagerHook version 1): don't run release-dio"; r=1
+    fi
+    if [ "${unk:-0}" != 0 ]; then
+        echo "Bar1IoUnknown:      $unk reports couldn't be checked for I/O: those slices stay held (see: log show --last boot | grep 'BAR1 hook')"; r=1
+    fi
     local early; early=$(get Bar1HookEarly)
     if [ "${early:-0}" != 0 ]; then
         echo "Bar1HookEarly:      $early: a pager reported before its memory was freed. The kernel doesn't count references the way nv_pager_hook.h says: report this, with the macOS build"; r=1

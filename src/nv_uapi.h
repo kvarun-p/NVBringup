@@ -143,6 +143,26 @@ enum {
     // test runs at the first NVMAC_MEM_MAP of VRAM). Freed CPU-mapped VRAM then gives its BAR1 back as soon
     // as no duplicate of the mapping is left, instead of holding it until the driver reloads.
     NVMAC_FEATURE_BAR1_RELEASE = 1u << 6,
+    // With BAR1_RELEASE: the release also waits for I/O in flight on the pages (direct I/O DMAs to and from
+    // BAR1 after the last mapping is gone; NVPagerHook version 2). A kext with BAR1_RELEASE alone releases under
+    // in-flight DMA: tools/bar1_alias_test release-dio refuses to run against it.
+    NVMAC_FEATURE_BAR1_IO_CHECK = 1u << 7,
+    // A released CPU-mapped slice stays on the read-only dummy page until its range is mapped again, so a device
+    // still reading it reads zeroes instead of unmapped BAR1. release-dio's safe mode needs it.
+    NVMAC_FEATURE_BAR1_ZERO_RELEASE = 1u << 8,
+    // A disk may DMA to and from BAR1 (peer-to-peer, as direct I/O on a CPU mapping of VRAM does): every PCI device
+    // with a disk under it shares a PCIe switch with the GPU (no ACS redirect on the path), or the CPU is AMD Zen
+    // or newer, or the root complex is one Linux's p2pdma lists. Rechecked as disks come and go; the reason is the
+    // GPU's NVP2P property. Without it a disk DMA to BAR1 may never arrive and take the disk controller down (an
+    // NVMe "controller fatal" panic, 2026-11-17). The driver can't stop a process doing direct I/O on its own
+    // mapping: tools check this bit first.
+    NVMAC_FEATURE_P2P = 1u << 9,
+    // NVMAC_MEM_MAP of VRAM (NVMAC_MEM_VRAM | NVMAC_MEM_CAN_MAP) and NVMAC_DISPLAY_MAP give a CPU mapping. Without
+    // this bit both return kIOReturnNotPermitted: peer-to-peer isn't allowed (no NVMAC_FEATURE_P2P), so direct I/O
+    // on such a mapping could hang the machine, and the driver can't see it to stop it. Clients then keep
+    // CPU-visible memory in system memory (NVMAC_MEM_GART), as NVK does when a map fails. Boot-arg nvvrammap=1
+    // allows the mappings anyway; nvvrammap=0 refuses them even with peer-to-peer.
+    NVMAC_FEATURE_VRAM_MAP = 1u << 10,
 };
 #define NVMAC_FEATURES (NVMAC_FEATURE_IMPORT | NVMAC_FEATURE_DISPLAY_MAP | NVMAC_FEATURE_DISPLAY_MEM | \
                         NVMAC_FEATURE_DISPLAY_FLIP | NVMAC_FEATURE_PERF | NVMAC_FEATURE_SCANOUT)

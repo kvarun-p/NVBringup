@@ -95,7 +95,10 @@ on any of them; FWSEC and GSP-RM only run with the boot-arg `nvexperimental=1`. 
 - **No CPU-visible VRAM for apps.** Memory a program maps for the CPU comes from system memory,
   because macOS gives the driver no way to revoke a CPU mapping of VRAM once a program has copied
   it. This costs about 6–15 % generation speed in llama.cpp. Boot-arg `nvkmapvram=1` wins it back
-  for about 42 program runs per boot; later runs go at the default speed until a restart. See [docs/bar1-cpu-mappings.md](docs/bar1-cpu-mappings.md).
+  for about 42 program runs per boot; later runs go at the default speed until a restart. Where the
+  PCIe topology doesn't support peer-to-peer DMA (most Intel laptops and desktops), the driver
+  refuses CPU mappings of VRAM entirely, because direct I/O on one can hang the machine, so
+  `nvkmapvram` has no effect there unless you also add `nvvrammap=1`. See [docs/bar1-cpu-mappings.md](docs/bar1-cpu-mappings.md).
 - **One GPU**, the first Turing chip found. No multi-GPU.
 - **Runtime power-off needs ACPI `_OFF` plus `_ON` or `_PS0`** on the GPU's ACPI node. Desktop
   cards usually have neither; they stay powered, and the power switch is disabled.
@@ -339,7 +342,9 @@ monitor connected, so that plugging one in can be noticed. There are two ways to
 3. Add `nvhdmiaudio=3 hdax=1` to the boot-args and reboot. The monitor shows up under Sound → Output.
    Details and how each piece was found: [docs/display.md](docs/display.md#hdmi-audio-boot-arg-nvhdmiaudio-default-off).
 
-**Releasing held BAR1 early** (optional, with `nvkmapvram`; written but not yet run on a Mac):
+**Releasing held BAR1 early** (optional, with `nvkmapvram`; tested on a TU117 laptop with `nvvrammap=1`). It
+only does something where processes get CPU mappings of VRAM: where peer-to-peer is allowed (the GPU's `NVP2P`
+property), or with `nvvrammap=1`.
 
 1. `tools/check_pager_hook.sh symbol` must find `_device_pager_last_unmap` in this macOS build's kernel.
 2. Build `pagerhook/` (NVPagerHook.kext, a Lilu plugin; same Lilu source tree and MacKernelSDK as `hdmiaudio/`) and
@@ -500,6 +505,7 @@ firmware and your Mesa and llama.cpp builds. By hand:
 | `-nvoff` | Recovery: NVBringup, NVMetalAccel and NVFramebuffer all decline to start, and the GPU is left as the firmware left it. OpenCore rewrites the boot-args every boot, so add it to config.plist (from another computer if this one hangs) or keep a spare EFI with it |
 | `nvguard=1` | Boot-attempt guard: NVBringup counts boots in NVRAM `nv-boot-try`, and the boot daemon deletes it once WindowServer has run for a minute. After 2 boots in a row that never got there, the next boot is a safe one: `nvdpipe`, `nvdpipe-once`, `nvfb`, `nvfb-once` and `nvzerocopy` are ignored, `NVSafeMode` is published, and the auxiliary kexts stay out. `tools/nvctl boot-ok` clears the counter by hand. Needs the boot daemon from this version (`tools/install_daemon.sh`), or every third boot is a safe one |
 | `nvkmapvram=1` | NVK keeps its push buffers and descriptors in CPU-mapped VRAM: faster generation (+15 % on a 0.5B model, +6 % on 3B), but each program run holds ~2.7 MiB of BAR1 until a restart; after ~42 runs it falls back to system memory (default speed). `desc` / `cmd:<n>` select parts; see [docs/bar1-cpu-mappings.md](docs/bar1-cpu-mappings.md) |
+| `nvvrammap=1` | Allow CPU mappings of VRAM (`NVMAC_MEM_MAP` of VRAM, `NVMAC_DISPLAY_MAP`) where peer-to-peer DMA isn't allowed (the GPU's `NVP2P` property). By default they're refused there, because direct I/O on such a mapping makes the disk DMA to BAR1, which hung and panicked a TU117 laptop. Only for testing `nvkmapvram` and the BAR1 hook. `nvvrammap=0` refuses them everywhere |
 | `nvbar1hook=0` | NVBringup ignores NVPagerHook.kext: held BAR1 slices stay held until restart, as without it. NVPagerHook's own boot-arg: `-nvpgroff` (it loads but routes nothing) |
 
 ## Troubleshooting

@@ -423,6 +423,16 @@ private:
     void     bar1Hold(uint64_t va, uint64_t size, uint64_t owner, uint64_t watch);    // dummy PTEs, tracks the slice
     bool     bar1Reuse(uint64_t owner, uint64_t pa, uint64_t size, uint64_t *va, uint64_t *sliceSize);
     bool     bar1ReserveHeld();                               // after a GSP-RM boot: reserve + re-point every held slice
+    // Released CPU-mapped slices go back to bar1Heap still pointing at the read-only dummy page, not unmapped:
+    // a device still reading the range (a DMA the I/O check missed) then reads zeroes instead of hitting
+    // unmapped BAR1, which can make it fail (an NVMe "controller fatal" panic, 2026-11-17). Writes to the dummy
+    // page are dropped, as for held slices. nv_mmu_map refuses valid PTEs, so bar1Map clears the part of a new
+    // range that is still on the dummy page: the free ranges in that state are listed here (gspLock_).
+    struct Bar1Range { uint64_t va, size; };
+    Bar1Range *bar1Zero_ = nullptr;
+    uint32_t  bar1ZeroN_ = 0, bar1ZeroCap_ = 0;
+    void     bar1ReleaseToZero(uint64_t va, uint64_t size);   // PTEs already on the dummy page; frees + lists it
+    void     bar1ClearZero(uint64_t va, uint64_t size);       // before mapping [va, va+size): clears listed parts
     bool      bar1Live_ = false;        // between initBar1 and bar1Cleanup: bar1Heap and the BAR1 tables are usable
 
     // Releasing held slices early (nv_pager_hook.h). NVPagerHook.kext, when present, calls lastUnmapThunk for
@@ -439,7 +449,12 @@ private:
                      kHookActive,       // self-test passed: slices are released early
                      kHookFailed,       // not routed, or the self-test failed: slices stay held as without it
                      kHookOff };        // boot-arg nvbar1hook=0
-    struct Bar1Watch { void *pager; uint64_t id; bool fired; };
+    // A report doesn't mean the pages are idle: direct I/O may still be DMAing to or from them (nv_pager_hook.h).
+    // io says what the listener found: kIoIdle, a final report; kIoPinned, I/O in flight, the pager is pinned
+    // and the slice waits on the dummy page until watchSettle sees it idle; kIoUnknown, NVPagerHook couldn't
+    // tell, the slice stays held for good, as without the hook. Only fired && kIoIdle entries are taken.
+    enum : uint8_t { kIoIdle = 0, kIoPinned, kIoUnknown };
+    struct Bar1Watch { void *pager; uint64_t id; bool fired; uint8_t io; };
     const struct nv_pager_hook_ops *hookOps_ = nullptr;
     uint8_t   hookState_ = kHookNone;
     IOSimpleLock *watchLock_ = nullptr;
@@ -449,14 +464,19 @@ private:
     thread_call_t releaseCall_ = nullptr;
     uint64_t  bar1ReleasedBytes_ = 0;   // BAR1 that would have stayed held
     uint32_t  bar1Released_ = 0, bar1HookEarly_ = 0;   // slices released; pagers that fired before their free
+    uint32_t  bar1IoDeferred_ = 0;      // reports that came with I/O in flight: released only once it was done
+    uint32_t  bar1IoUnknown_ = 0;       // reports NVPagerHook couldn't check for I/O: those slices stay held
+    uint32_t  settleDelayMs_ = 0;       // watchSettle's poll interval while pagers stay pinned (backs off)
     IOReturn pagerHookAttach(const struct nv_pager_hook_ops *ops);
     void     pagerHookDetach();                 // shutdownHw; no gspLock_ held
     bool     pagerHookReady();                  // active, running the self-test first if it hasn't
     bool     pagerHookSelfTest();
     uint64_t watchAdd(IOMemoryDescriptor *md);  // 0: no pager, or no memory
     bool     watchRearm(uint64_t id);           // clears fired; true if it was set
-    bool     watchTake(uint64_t id);            // fired: removes the entry, true
-    void     watchDrop(uint64_t id);
+    bool     watchTake(uint64_t id);            // fired and idle: removes the entry, true
+    void     watchDrop(uint64_t id);            // unpins it if pinned
+    bool     watchState(uint64_t id, bool *fired, uint8_t *io);
+    uint32_t watchSettle();                     // unpins pinned pagers now idle; returns how many stay pinned
     void     bar1ReleaseFired();                // releases every held slice whose pager has fired
     static void lastUnmapThunk(void *self, void *pager);
     static void bar1ReleaseThunk(thread_call_param_t self, thread_call_param_t);
@@ -582,6 +602,21 @@ private:
     nvmac_info infoCache_ = {};             // device info from the last GSP-RM boot (NVMAC_POWER_INFO)
     bool      infoCached_ = false;
     void      fillInfo(nvmac_info *i);       // gspLock_ held, GPU interface ready
+    // Peer-to-peer DMA to BAR1 (NVP2p.cpp): allowed only if every disk controller shares a PCIe switch with the
+    // GPU, or the CPU is AMD Zen or newer, or the root complex is on Linux's p2pdma list. NVMAC_FEATURE_P2P.
+    bool      p2pAllowed();                 // cached for a second; no spinlock held
+    // CPU mappings of VRAM into a process (memMap of BAR1-backed memory, NVMAC_DISPLAY_MAP). A process can do
+    // direct I/O on such a mapping, which makes a disk DMA to BAR1: without peer-to-peer support that can hang
+    // the machine or take the disk controller down, and the driver can't see the I/O. So without p2pAllowed()
+    // they are refused (kIOReturnNotPermitted) and NVK keeps those buffers in system memory. Boot-arg
+    // nvvrammap=1 allows them anyway, nvvrammap=0 refuses them everywhere. NVMAC_FEATURE_VRAM_MAP. gspLock_.
+    bool      vramMapAllowed();
+    int32_t   vramMapArg_ = -2;             // -2 not read yet, -1 absent, else the boot-arg's value
+    uint32_t  vramMapRefused_ = 0;          // mappings refused (NVStats VramMapRefused)
+    bool      p2pPair(IOPCIDevice *a, IOPCIDevice *b, char *why, size_t n);
+    uint64_t  p2pCheckedAt_ = 0;
+    bool      p2pOk_ = false, p2pLogged_ = false;
+    char      p2pWhy_[160] = {};
     void      powerInit();
     void      powerProbe();                 // after findAcpiNode: can ACPI cut the GPU off?
     bool      pwrCapable_ = false;          // ACPI _OFF plus _ON or _PS0 on the GPU's node
