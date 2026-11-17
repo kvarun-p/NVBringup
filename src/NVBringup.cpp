@@ -52,6 +52,8 @@ bool NVBringup::start(IOService *provider)
     waitLock_ = IOLockAlloc();
     dispNubLock_ = IOLockAlloc();
     cursLock_ = IOSimpleLockAlloc();
+    watchLock_ = IOSimpleLockAlloc();               // NVPagerHook's listener (pagerHookAttach), if it ever comes
+    releaseCall_ = thread_call_allocate(&NVBringup::bar1ReleaseThunk, this);
     powerInit();
     if (!gspLock_ || !waitLock_ || !dispNubLock_ || !powerLock_) {
         stop(provider);
@@ -180,6 +182,7 @@ void NVBringup::shutdownHw()
         bootBusyCall_ = nullptr;
     }
     bootBusyRelease("shutdown");
+    pagerHookDetach();                              // no last-unmap listener, no slice release from here on
     powerFree();                                    // no idle power-off from here on
     if (gspLock_) {                                 // before BAR0 and the device go away
         gspLock();
@@ -265,6 +268,12 @@ void NVBringup::free()
     OSSafeReleaseNULL(dispWant_);                   // shutdownHw has taken the nub down
     if (bar1Held_)
         IOFree(bar1Held_, bar1HeldCap_ * sizeof(Bar1Held));
+    if (watch_)                                     // shutdownHw has detached the hook
+        IOFree(watch_, watchCap_ * sizeof(Bar1Watch));
+    if (watchLock_) {
+        IOSimpleLockFree(watchLock_);
+        watchLock_ = nullptr;
+    }
     super::free();
 }
 

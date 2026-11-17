@@ -27,7 +27,8 @@ When VRAM that was ever CPU-mapped is freed:
 
 Held BAR1 is capped at half the aperture (about 110 MiB); past that, new CPU mappings of VRAM
 fail. Held slices are kept across GSP-RM reboots (sleep, runtime power-off) and released only
-when the kext reloads, i.e. at restart. `NVStats.Bar1Held` shows the total. With the fix,
+when the kext reloads, i.e. at restart, unless NVPagerHook is installed
+([below](#releasing-held-slices-early-nvpagerhook)). `NVStats.Bar1Held` shows the total. With the fix,
 `bar1_alias_test` passes: copies read zeroes and their writes are dropped:
 
 ```bash
@@ -50,6 +51,85 @@ With apps allowed to map VRAM, one llama.cpp run held about 49 MiB, so the cap w
 |---|---|
 | Revoke with `IOMemoryMap::redirect` and `kIOMapUnique` | `kIOMapUnique` only makes IOKit create its own map object; it doesn't make the VM system report copies. Whether `redirect` also reaches copies of the mapping isn't known yet. The test is `bar1_alias_test` against a kext that revokes with `redirect` and frees the slice at once, instead of holding it. If the copies read zeroes or fault, the hold and the cap can go |
 | Never let the CPU map VRAM | Removes the problem entirely; NVK does this by default (next section). The kext still allows CPU mappings of VRAM, for three users: NVK with `nvkmapvram`, the tests (`nvtest`, `bar1_alias_test`), and NVK builds from nvbringup-mesa patches before 0007, which gave apps host-visible VRAM |
+
+## Releasing held slices early (NVPagerHook)
+
+**Status: written, not yet built or run on a Mac.** Everything below is from reading XNU
+(`xnu-10002.1.13` to `xnu-12377.121.6`, Sonoma 14.0 to Tahoe 26); the tests at the end are what
+proves it.
+
+The kernel does know when the last copy of a mapping goes; it just tells no driver.
+
+- Behind a `withPhysicalAddress` mapping sits one VM object with a device pager. Every copy
+  (remap, shared fork, memory entry) references that same object.
+- The object's reference count is 1 for itself, 1 for the kext's descriptor, and 1 for each
+  mapping, copy or memory entry.
+- When the count is about to drop from 2 to 1, the kernel calls `device_pager_last_unmap`.
+  A mapping's page-table entries are removed and the TLB flushed before its reference is dropped.
+- `memFree` releases the kext's own mapping and descriptor. After that, the call comes exactly
+  when the last copy is gone: inside `memFree` if there was none, otherwise when the process
+  holding it unmaps it, exits, or drops its memory entry.
+
+`pagerhook/` builds **NVPagerHook.kext**, a Lilu plugin that routes `device_pager_last_unmap`
+and passes each call to NVBringup (`src/nv_pager_hook.h`). NVBringup then:
+
+1. puts the pager of each fresh CPU mapping of VRAM on a watch list (`memMap`);
+2. at `memFree`, gives the slice straight back to the allocator if the pager reported during
+   the release (no copy existed), and nothing is held;
+3. otherwise holds the slice on the dummy page as before, and releases it from a kernel
+   thread when the pager reports.
+
+A watched slice is never reused by its owner meanwhile, so a copy only ever reads zeroes.
+Slices held without a watch (before the hook was active, or reused ones) stay held until restart.
+
+**It fails closed.** Without Lilu, without the kext, with `-nvpgroff` or `nvbar1hook=0`, if
+the symbol can't be resolved, or if the self-test fails, the driver behaves exactly as described
+above. The self-test runs at the first CPU mapping of VRAM, on a private kernel mapping of one
+BAR1 page: the pager read from the descriptor must be the one the kernel reports, it must not
+report while the descriptor is alive, and it must report when the descriptor is released.
+
+### Install and check
+
+```bash
+tools/check_pager_hook.sh symbol        # before anything else: is the symbol in this kernel?
+make -C pagerhook LILU=<Lilu checkout>/Lilu KSDK=<MacKernelSDK checkout>
+make -C pagerhook check
+```
+
+Copy `pagerhook/build/NVPagerHook.kext` to `EFI/OC/Kexts`, add it to `config.plist` → Kernel →
+Add after Lilu.kext, and reboot. It and NVBringup load in either order. Then:
+
+```bash
+make build/bar1_alias_test
+build/bar1_alias_test release           # the four release cases; exit status 0 = pass
+tools/check_pager_hook.sh status        # hook: active; Bar1Released grows, Bar1HookEarly stays 0
+build/bar1_alias_test                   # the whole suite must still be SAFE / PASS
+tools/bar1_release_soak.sh 100          # 100 llama-bench runs with CPU-mapped VRAM: nothing stays held
+```
+
+| case | must show |
+|---|---|
+| `release-none` | no copy: BAR1 in use is back right after the free |
+| `release-remap` | a `mach_vm_remap` copy: still held 0.5 s after the free, released when the copy is deallocated |
+| `release-fork` | a child sharing the mapping: held until the child exits |
+| `release-entry` | a memory entry never mapped: held until its port is deallocated |
+
+`NVStats` gains `Bar1Hook` (0 none, 1 attached, 2 active, 3 failed, 4 off), `Bar1Released` and
+`Bar1ReleasedSlices` (given back early), and `Bar1HookEarly` (a pager that reported before its
+memory was freed; must stay 0, anything else means the kernel doesn't count as described here).
+`nvmac_info.features` has `NVMAC_FEATURE_BAR1_RELEASE` while the hook is active.
+
+### What is not known yet
+
+- Whether `_device_pager_last_unmap` is in the shipped kernels' symbol tables
+  (`check_pager_hook.sh symbol`). It is a non-static function in every source release checked.
+- Whether something can keep using the pages by physical address after the last mapping is gone
+  without referencing the object (a UPL from direct I/O on the mapping, another driver that wired
+  it). Not checked in XNU. If it can, it could reach a released slice.
+- macOS releases after `xnu-12377.121.6`: re-run the symbol check and the release cases after
+  each update. The self-test catches a changed layout or count on its own and switches the
+  release off.
+- A routed kernel function can't be unrouted, so NVPagerHook never unloads.
 
 ## Where NVK puts CPU-mapped memory
 
@@ -149,3 +229,6 @@ What the numbers show:
   matters.
 - If `IOMemoryMap::redirect` turns out to revoke copies, the hold and the cap go away, and B can
   become the default.
+- If NVPagerHook passes its tests on the Mac, `nvkmapvram=1` no longer runs into the cap for
+  ordinary programs, and B can become the default wherever the hook is active. The cap stays
+  for processes that keep copies alive.

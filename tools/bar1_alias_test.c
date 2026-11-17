@@ -2,8 +2,10 @@
 // duplicated it? And do the driver's defences (held BAR1 slices, per-connection reuse, the
 // hold cap) behave?
 //
-//   build/bar1_alias_test            remap, fork, reuse, remap-gart and fork-gart
+//   build/bar1_alias_test            remap, fork, reuse, remap-gart and fork-gart; then the
+//                                    release cases if NVPagerHook is active
 //   build/bar1_alias_test remap|fork|reuse|cap|remap-gart|fork-gart
+//   build/bar1_alias_test release|release-none|release-remap|release-fork|release-entry
 //
 // remap: this process allocates 64 KiB of CPU-mappable VRAM, maps it, fills it with pattern
 //   A, duplicates the mapping with mach_vm_remap (shared, not copied) and frees the memory. A
@@ -24,6 +26,19 @@
 // remap-gart, fork-gart: remap and fork with system memory (NVMAC_MEM_GART) instead of
 //   VRAM. The other side allocates 256 buffers (16 MiB) of B, so freed pages likely come
 //   back to it if the kernel releases them while a duplicate still maps them.
+//
+// release-*: with NVPagerHook.kext active (nvmac_info.features has NVMAC_FEATURE_BAR1_RELEASE),
+//   the BAR1 slice of freed CPU-mapped VRAM must come back (GET_INFO bar1_used) exactly when
+//   the last duplicate of its mapping is gone, and not before:
+//   release-none:  no duplicate: back right after MEM_FREE.
+//   release-remap: a mach_vm_remap duplicate: still held 0.5 s after MEM_FREE, back once the
+//     duplicate is deallocated.
+//   release-fork:  a forked child sharing the mapping: held until the child exits.
+//   release-entry: a memory entry made from the mapping and never mapped: held until its port
+//     is deallocated. Released earlier would be VULNERABLE: the port can still be mapped.
+//   Without NVPagerHook they are skipped (INCONCLUSIVE when asked for by name). They read
+//   bar1_used, so other programs mapping VRAM meanwhile make them INCONCLUSIVE.
+//   "release" runs the four.
 //
 // Probing a duplicate: read it, write X through it, read it again. VRAM: SAFE when it faults
 // or reads only zeroes both times (the driver's read-only dummy page); VULNERABLE when it
@@ -504,6 +519,181 @@ static int test_cap(void)
     return result;
 }
 
+// ---- release ------------------------------------------------------------------------------
+
+static uint64_t bar1_used(nvmac_dev *d)
+{
+    return nvmac_refresh_info(d) ? ~0ull : nvmac_info(d)->bar1_used;
+}
+
+// Polls bar1_used until it is back at `base` (the release runs on a kernel thread). 1 if it got there.
+static int released_within(nvmac_dev *d, uint64_t base, int ms)
+{
+    for (int t = 0; t <= ms; t += 10) {
+        if (bar1_used(d) <= base)
+            return 1;
+        usleep(10000);
+    }
+    return 0;
+}
+
+// The kext's self-test of the hook runs at the first MEM_MAP of VRAM, so map once before asking.
+static int release_active(nvmac_dev *d)
+{
+    uint32_t mem;
+    void *ptr;
+    if (alloc_map(d, SIZE, &mem, &ptr, "release"))
+        return 0;
+    nvmac_mem_free(d, mem);
+    return !nvmac_refresh_info(d) && (nvmac_info(d)->features & NVMAC_FEATURE_BAR1_RELEASE);
+}
+
+enum { REL_NONE, REL_REMAP, REL_FORK, REL_ENTRY };
+static const char *const rel_names[] = { "release-none", "release-remap", "release-fork", "release-entry" };
+
+// 0 pass, 1 fail (released while a duplicate existed), 2 inconclusive or not released.
+static int test_release(int kind)
+{
+    const char *who = rel_names[kind];
+    printf("== %s\n", who);
+    nvmac_dev *d;
+    int err = nvmac_open(&d);
+    if (err) {
+        fprintf(stderr, "%s: open: 0x%x (%s)\n", who, err, nvmac_strerror(err));
+        return 2;
+    }
+    if (!release_active(d)) {
+        printf("%s: NVPagerHook isn't active (ioreg: NVStats Bar1Hook; 2 = active): SKIPPED\n", who);
+        nvmac_close(d);
+        return 2;
+    }
+    int result = 2;
+    uint32_t mem;
+    void *ptr;
+    uint64_t base = bar1_used(d);
+    if (base == ~0ull || alloc_map(d, SIZE, &mem, &ptr, who)) {
+        nvmac_close(d);
+        return 2;
+    }
+    fill(ptr, SIZE, PAT_A);
+
+    mach_vm_address_t alias = 0;
+    mach_port_t entry = MACH_PORT_NULL;
+    pid_t pid = -1;
+    int to[2] = { -1, -1 };
+    kern_return_t kr = KERN_SUCCESS;
+    if (kind == REL_REMAP) {
+        vm_prot_t cur, max;
+        kr = mach_vm_remap(mach_task_self(), &alias, SIZE, 0, VM_FLAGS_ANYWHERE, mach_task_self(),
+                           (mach_vm_address_t)ptr, FALSE, &cur, &max, VM_INHERIT_NONE);
+    } else if (kind == REL_ENTRY) {
+        memory_object_size_t size = SIZE;
+        kr = mach_make_memory_entry_64(mach_task_self(), &size, (memory_object_offset_t)(uintptr_t)ptr,
+                                       VM_PROT_READ | VM_PROT_WRITE | MAP_MEM_VM_SHARE, &entry, MACH_PORT_NULL);
+    } else if (kind == REL_FORK) {
+        kr = vm_inherit(mach_task_self(), (vm_address_t)ptr, SIZE, VM_INHERIT_SHARE);
+        if (kr == KERN_SUCCESS) {
+            if (pipe(to)) {
+                nvmac_mem_free(d, mem);
+                nvmac_close(d);
+                return 2;
+            }
+            fflush(NULL);
+            pid = fork();
+            if (pid == 0) {                     // holds the inherited mapping until the parent says so
+                char c;
+                close(to[1]);
+                (void)!read(to[0], &c, 1);
+                _exit(0);
+            }
+            close(to[0]);
+            if (pid < 0)
+                kr = KERN_FAILURE;
+        }
+    }
+    if (kr != KERN_SUCCESS) {
+        printf("%s: the duplicate was refused (%s): nothing to test\n", who, mach_error_string(kr));
+        nvmac_mem_free(d, mem);
+        nvmac_close(d);
+        return 2;
+    }
+
+    uint64_t mapped = bar1_used(d);
+    if ((err = nvmac_mem_free(d, mem))) {
+        fprintf(stderr, "%s: free: 0x%x (%s)\n", who, err, nvmac_strerror(err));
+        goto out;
+    }
+    if (kind == REL_NONE) {
+        result = released_within(d, base, 2000) ? 0 : 2;
+        printf("%s: BAR1 in use %llu KiB before, %llu mapped, %llu after the free: %s\n", who,
+               (unsigned long long)(base >> 10), (unsigned long long)(mapped >> 10),
+               (unsigned long long)(bar1_used(d) >> 10), result ? "still held" : "released");
+        goto out;
+    }
+
+    usleep(500000);
+    uint64_t held = bar1_used(d);
+    printf("%s: BAR1 in use %llu KiB before, %llu mapped, %llu 0.5 s after the free with the duplicate alive\n",
+           who, (unsigned long long)(base >> 10), (unsigned long long)(mapped >> 10),
+           (unsigned long long)(held >> 10));
+    if (held < base + SIZE) {
+        printf("%s: the slice went back to the allocator while a duplicate of its mapping existed\n", who);
+        result = held <= base ? 1 : 2;          // in between: someone else freed BAR1 meanwhile?
+    }
+
+    // The duplicate goes.
+    if (kind == REL_REMAP) {
+        mach_vm_deallocate(mach_task_self(), alias, SIZE);
+        alias = 0;
+    } else if (kind == REL_ENTRY) {
+        mach_port_deallocate(mach_task_self(), entry);
+        entry = MACH_PORT_NULL;
+    } else {
+        close(to[1]);
+        to[1] = -1;
+        waitpid(pid, NULL, 0);
+        pid = -1;
+    }
+    if (result != 1) {
+        int back = released_within(d, base, 2000);
+        printf("%s: %llu KiB in use after the duplicate went: %s\n", who,
+               (unsigned long long)(bar1_used(d) >> 10), back ? "released" : "still held");
+        if (held >= base + SIZE)
+            result = back ? 0 : 2;
+    }
+out:
+    if (alias)
+        mach_vm_deallocate(mach_task_self(), alias, SIZE);
+    if (entry != MACH_PORT_NULL)
+        mach_port_deallocate(mach_task_self(), entry);
+    if (to[1] >= 0)
+        close(to[1]);
+    if (pid > 0)
+        waitpid(pid, NULL, 0);
+    printf("%s: %s\n", who, result == 0 ? "PASS" : result == 1 ? "VULNERABLE" : "INCONCLUSIVE");
+    nvmac_close(d);
+    return result;
+}
+
+static int test_release_all(void)
+{
+    int r = 0;
+    for (int k = REL_NONE; k <= REL_ENTRY; k++)
+        r = worst(r, test_release(k));
+    return r;
+}
+
+// For the default run: are the release cases worth running?
+static int release_available(void)
+{
+    nvmac_dev *d;
+    if (nvmac_open(&d))
+        return 0;
+    int on = release_active(d);
+    nvmac_close(d);
+    return on;
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 4 && !strncmp(argv[1], "victim", 6)) {
@@ -521,6 +711,11 @@ int main(int argc, char **argv)
             return test_reuse();
         if (!strcmp(argv[1], "cap"))
             return test_cap();
+        if (!strcmp(argv[1], "release"))
+            return test_release_all();
+        for (int k = REL_NONE; k <= REL_ENTRY; k++)
+            if (!strcmp(argv[1], rel_names[k]))
+                return test_release(k);
         gart = 1;
         if (!strcmp(argv[1], "remap-gart"))
             return test_remap(argv[0]);
@@ -528,7 +723,8 @@ int main(int argc, char **argv)
             return test_fork();
     }
     if (argc != 1) {
-        fprintf(stderr, "usage: %s [remap|fork|reuse|cap|remap-gart|fork-gart]\n", argv[0]);
+        fprintf(stderr, "usage: %s [remap|fork|reuse|cap|remap-gart|fork-gart|release|release-none|"
+                "release-remap|release-fork|release-entry]\n", argv[0]);
         return 2;
     }
     int r = test_remap(argv[0]);
@@ -537,6 +733,11 @@ int main(int argc, char **argv)
     gart = 1;
     r = worst(r, test_remap(argv[0]));
     r = worst(r, test_fork());
+    gart = 0;
+    if (release_available())
+        r = worst(r, test_release_all());
+    else
+        printf("== release: NVPagerHook isn't active: skipped\n");
     printf("overall: %s\n", r == 0 ? "SAFE / PASS" : r == 1 ? "VULNERABLE / FAIL" : "INCONCLUSIVE");
     return r;
 }

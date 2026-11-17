@@ -139,6 +139,10 @@ enum {
     NVMAC_FEATURE_DISPLAY_FLIP = 1u << 3,   // NVMAC_DISPLAY_FLIP
     NVMAC_FEATURE_PERF         = 1u << 4,   // control client NVMAC_PERF, NVMAC_PERF_POLICY
     NVMAC_FEATURE_SCANOUT      = 1u << 5,   // NVMAC_SURFACE_SCANOUT
+    // Not part of NVMAC_FEATURES: set while NVPagerHook.kext is attached and its self-test has passed (the
+    // test runs at the first NVMAC_MEM_MAP of VRAM). Freed CPU-mapped VRAM then gives its BAR1 back as soon
+    // as no duplicate of the mapping is left, instead of holding it until the driver reloads.
+    NVMAC_FEATURE_BAR1_RELEASE = 1u << 6,
 };
 #define NVMAC_FEATURES (NVMAC_FEATURE_IMPORT | NVMAC_FEATURE_DISPLAY_MAP | NVMAC_FEATURE_DISPLAY_MEM | \
                         NVMAC_FEATURE_DISPLAY_FLIP | NVMAC_FEATURE_PERF | NVMAC_FEATURE_SCANOUT)

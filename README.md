@@ -339,6 +339,14 @@ monitor connected, so that plugging one in can be noticed. There are two ways to
 3. Add `nvhdmiaudio=3 hdax=1` to the boot-args and reboot. The monitor shows up under Sound → Output.
    Details and how each piece was found: [docs/display.md](docs/display.md#hdmi-audio-boot-arg-nvhdmiaudio-default-off).
 
+**Releasing held BAR1 early** (optional, with `nvkmapvram`; written but not yet run on a Mac):
+
+1. `tools/check_pager_hook.sh symbol` must find `_device_pager_last_unmap` in this macOS build's kernel.
+2. Build `pagerhook/` (NVPagerHook.kext, a Lilu plugin; same Lilu source tree and MacKernelSDK as `hdmiaudio/`) and
+   add it to `config.plist` → Kernel → Add after Lilu.kext. Reboot.
+3. `build/bar1_alias_test release` and `tools/check_pager_hook.sh status` must pass. What it does, and what is
+   still unknown: [docs/bar1-cpu-mappings.md](docs/bar1-cpu-mappings.md#releasing-held-slices-early-nvpagerhook).
+
 After rebuilding `nvvdisplay`, switch its Screen Recording permission off and on again: the permission is tied to
 the binary's ad-hoc signature. Details are in [display/README.md](display/README.md).
 
@@ -492,6 +500,7 @@ firmware and your Mesa and llama.cpp builds. By hand:
 | `-nvoff` | Recovery: NVBringup, NVMetalAccel and NVFramebuffer all decline to start, and the GPU is left as the firmware left it. OpenCore rewrites the boot-args every boot, so add it to config.plist (from another computer if this one hangs) or keep a spare EFI with it |
 | `nvguard=1` | Boot-attempt guard: NVBringup counts boots in NVRAM `nv-boot-try`, and the boot daemon deletes it once WindowServer has run for a minute. After 2 boots in a row that never got there, the next boot is a safe one: `nvdpipe`, `nvdpipe-once`, `nvfb`, `nvfb-once` and `nvzerocopy` are ignored, `NVSafeMode` is published, and the auxiliary kexts stay out. `tools/nvctl boot-ok` clears the counter by hand. Needs the boot daemon from this version (`tools/install_daemon.sh`), or every third boot is a safe one |
 | `nvkmapvram=1` | NVK keeps its push buffers and descriptors in CPU-mapped VRAM: faster generation (+15 % on a 0.5B model, +6 % on 3B), but each program run holds ~2.7 MiB of BAR1 until a restart; after ~42 runs it falls back to system memory (default speed). `desc` / `cmd:<n>` select parts; see [docs/bar1-cpu-mappings.md](docs/bar1-cpu-mappings.md) |
+| `nvbar1hook=0` | NVBringup ignores NVPagerHook.kext: held BAR1 slices stay held until restart, as without it. NVPagerHook's own boot-arg: `-nvpgroff` (it loads but routes nothing) |
 
 ## Troubleshooting
 

@@ -20,6 +20,7 @@
 #include "nv_hal.h"
 
 struct nv_sink_caps;    // nv_edid.h
+struct nv_pager_hook_ops;   // nv_pager_hook.h
 
 // A VRAM block of the display engine's, CPU-mapped (uncached) through BAR1 (nvdisp=2).
 struct NVDispMem { uint64_t pa = 0, bar1 = 0, size = 0; IOMemoryMap *map = nullptr; volatile uint8_t *cpu = nullptr; };
@@ -34,6 +35,7 @@ public:
     void stop(IOService *provider) override;
     void free() override;
     // NV_PIPE_COPY_FN (nv_pipe_copy.h): NVMetalAccel's display pipe has the copy engine copy its frames.
+    // NV_PAGER_HOOK_FN (nv_pager_hook.h): NVPagerHook.kext hands over its ops.
     IOReturn callPlatformFunction(const OSSymbol *functionName, bool waitForFunction,
                                   void *param1, void *param2, void *param3, void *param4) override;
     // NVPipeFlip (boolean): the display pipe presents with flips (default) or copies into the scanned-out
@@ -407,7 +409,9 @@ private:
     // connection that held a slice may reuse it (bar1Reuse): whoever has a duplicate got it
     // from that process. Kept on NVBringup itself, not GspState, so a slice stays held across
     // a GSP-RM unload and reboot.
-    struct Bar1Held { uint64_t va = 0, size = 0, owner = 0; };     // owner: GpuConn::serial
+    // watch: the slice's entry in the watch list below, 0 if none. Such a slice is released as soon as its
+    // last duplicate is gone, and is never reused meanwhile.
+    struct Bar1Held { uint64_t va = 0, size = 0, owner = 0, watch = 0; };  // owner: GpuConn::serial
     Bar1Held *bar1Held_ = nullptr;
     uint32_t  bar1HeldN_ = 0, bar1HeldCap_ = 0;
     uint32_t  bar1HeldRes_ = 0;         // entries promised to CPU-mapped memory not yet freed
@@ -416,9 +420,46 @@ private:
     uint64_t  connSerial_ = 0;          // last GpuConn::serial handed out
     IOReturn bar1HoldCommit(uint64_t size);                   // promises an entry + bytes (memMap)
     void     bar1HoldUncommit(uint64_t size);                 // takes back an unused promise
-    void     bar1Hold(uint64_t va, uint64_t size, uint64_t owner);    // dummy PTEs, tracks the slice
+    void     bar1Hold(uint64_t va, uint64_t size, uint64_t owner, uint64_t watch);    // dummy PTEs, tracks the slice
     bool     bar1Reuse(uint64_t owner, uint64_t pa, uint64_t size, uint64_t *va, uint64_t *sliceSize);
     bool     bar1ReserveHeld();                               // after a GSP-RM boot: reserve + re-point every held slice
+    bool      bar1Live_ = false;        // between initBar1 and bar1Cleanup: bar1Heap and the BAR1 tables are usable
+
+    // Releasing held slices early (nv_pager_hook.h). NVPagerHook.kext, when present, calls lastUnmapThunk for
+    // every device pager whose last mapping goes. memMap puts the pager of each fresh CPU mapping of VRAM on
+    // the watch list; once memFree has released the driver's own mapping and descriptor, the pager's call means
+    // no duplicate is left anywhere, and the slice goes back to bar1Heap: in memFree itself when there was
+    // none, else from bar1ReleaseFired (a thread call, since the hook can't take gspLock_).
+    // Only slices fresh from bar1Heap are watched: a reused held slice may still have duplicates from its
+    // earlier, unwatched life.
+    // hookState_, hookOps_, the ids and the counters are under gspLock_; watch_ and its counts are under
+    // watchLock_ (a spinlock: the hook runs on any thread, possibly one holding gspLock_).
+    enum : uint8_t { kHookNone = 0,     // no NVPagerHook.kext
+                     kHookAttached,     // ops received; the self-test runs at the first CPU mapping of VRAM
+                     kHookActive,       // self-test passed: slices are released early
+                     kHookFailed,       // not routed, or the self-test failed: slices stay held as without it
+                     kHookOff };        // boot-arg nvbar1hook=0
+    struct Bar1Watch { void *pager; uint64_t id; bool fired; };
+    const struct nv_pager_hook_ops *hookOps_ = nullptr;
+    uint8_t   hookState_ = kHookNone;
+    IOSimpleLock *watchLock_ = nullptr;
+    Bar1Watch *watch_ = nullptr;
+    uint32_t  watchN_ = 0, watchCap_ = 0;
+    uint64_t  watchSerial_ = 0;         // last watch id handed out
+    thread_call_t releaseCall_ = nullptr;
+    uint64_t  bar1ReleasedBytes_ = 0;   // BAR1 that would have stayed held
+    uint32_t  bar1Released_ = 0, bar1HookEarly_ = 0;   // slices released; pagers that fired before their free
+    IOReturn pagerHookAttach(const struct nv_pager_hook_ops *ops);
+    void     pagerHookDetach();                 // shutdownHw; no gspLock_ held
+    bool     pagerHookReady();                  // active, running the self-test first if it hasn't
+    bool     pagerHookSelfTest();
+    uint64_t watchAdd(IOMemoryDescriptor *md);  // 0: no pager, or no memory
+    bool     watchRearm(uint64_t id);           // clears fired; true if it was set
+    bool     watchTake(uint64_t id);            // fired: removes the entry, true
+    void     watchDrop(uint64_t id);
+    void     bar1ReleaseFired();                // releases every held slice whose pager has fired
+    static void lastUnmapThunk(void *self, void *pager);
+    static void bar1ReleaseThunk(thread_call_param_t self, thread_call_param_t);
     bool     scrubVram(uint64_t pa, uint64_t size);
     IOReturn scrubVramYield(GpuConn *c, uint64_t pa, uint64_t size);
     uint32_t bootEpoch_ = 0;                    // GSP-RM boots so far (a VRAM heap is valid within one)

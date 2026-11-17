@@ -22,6 +22,7 @@
 #include "nv_regs.h"
 #include "nv_uapi.h"
 #include "nv_pipe_copy.h"
+#include "nv_pager_hook.h"
 #include "nv_stack.h"
 #include "nv_trace.h"
 #include "NVGpuUserClient.hpp"
@@ -89,6 +90,7 @@ struct NVBringup::GpuMem {
     bool     borrowed = false;          // NVMAC_DISPLAY_MEM: the display's VRAM, not freed with the handle
     bool     cpuMapped = false;         // bar1Va may have a CPU duplicate (memMap'd, or a reused held
                                         // slice): memFree holds it, with an entry already promised
+    uint64_t watch = 0;                 // cpuMd's pager is on the watch list under this id (watchAdd), 0 if not
 };
 
 struct NVBringup::GpuCtx {
@@ -2407,6 +2409,8 @@ IOReturn NVBringup::callPlatformFunction(const OSSymbol *functionName, bool wait
         return cursorMove((int32_t)(intptr_t)param1, (int32_t)(intptr_t)param2, param3 != nullptr);
     if (functionName && functionName->isEqualTo(NV_DISPLAY_POWER_FN))
         return dispPower(param1 != nullptr);
+    if (functionName && functionName->isEqualTo(NV_PAGER_HOOK_FN))
+        return pagerHookAttach((const nv_pager_hook_ops *)param1);
     return IOService::callPlatformFunction(functionName, waitForFunction, param1, param2, param3, param4);
 }
 
@@ -3160,6 +3164,7 @@ bool NVBringup::initBar1()
         LOG("GSP: BAR1: not every held slice could be reserved; BAR1 stays off until the driver reloads");
         return false;
     }
+    bar1Live_ = true;
 
     if (!ptPoolInit())
         LOG("GSP: page-table pool unavailable; page tables go through PRAMIN");
@@ -3312,6 +3317,7 @@ void NVBringup::bar1Unmap(uint64_t va, uint64_t size)
 void NVBringup::bar1Cleanup()
 {
     GspState *g = gsp_;
+    bar1Live_ = false;                  // a slice released from here on only leaves the held list
     ptPoolFini();
     if (!g || (!g->bar1Links.n && !g->bar1Tables.n))
         return;
@@ -3392,8 +3398,9 @@ void NVBringup::bar1HoldUncommit(uint64_t size)
 // live in some task the driver doesn't know about, so its range must never map real VRAM
 // again. Re-points its PTEs at the dummy page (a leftover duplicate reads only zeroes and
 // its writes are dropped), flushes the BAR1 TLB, and keeps the range out of bar1Heap for as
-// long as the driver is loaded, except for reuse by `owner` (bar1Reuse). Caller holds gspLock_.
-void NVBringup::bar1Hold(uint64_t va, uint64_t size, uint64_t owner)
+// long as the driver is loaded, except for reuse by `owner` (bar1Reuse), or, with `watch`, until
+// its pager reports that the last duplicate is gone (bar1ReleaseFired). Caller holds gspLock_.
+void NVBringup::bar1Hold(uint64_t va, uint64_t size, uint64_t owner, uint64_t watch)
 {
     GspState *g = gsp_;
     const nv_mmu_ops ops = { this, bar1MmuAlloc, mmuRd64, mmuWr64, bar1MmuLinked, false };
@@ -3405,9 +3412,11 @@ void NVBringup::bar1Hold(uint64_t va, uint64_t size, uint64_t owner)
         LOG("GSP: BAR1: TLB invalidate did not complete holding slice 0x%llx", (unsigned long long)va);
     if (bar1HeldRes_ && bar1HeldN_ < bar1HeldCap_) {    // always: promised (bar1HoldCommit)
         bar1HeldRes_--;
-        bar1Held_[bar1HeldN_++] = { va, size, owner };
-    } else                                    // still allocated in bar1Heap: safe until the next boot
+        bar1Held_[bar1HeldN_++] = { va, size, owner, watch };
+    } else {                                  // still allocated in bar1Heap: safe until the next boot
         LOG("GSP: BAR1: held slice 0x%llx not tracked", (unsigned long long)va);
+        watchDrop(watch);                     // nothing left to release for it
+    }
 }
 
 // New CPU-mappable memory of connection `owner` at VRAM `pa`: takes the smallest of its held
@@ -3415,7 +3424,9 @@ void NVBringup::bar1Hold(uint64_t va, uint64_t size, uint64_t owner)
 // small buffer) and maps its first `size` bytes to `pa`; the rest stays on the dummy page.
 // A duplicate of the slice's old mapping came from this connection's process, so all it can
 // see is more of that process's memory. The slice's entry and bytes stay promised: the new
-// memory counts as CPU-mapped and goes back through bar1Hold. Caller holds gspLock_.
+// memory counts as CPU-mapped and goes back through bar1Hold. A watched slice is left alone: it
+// goes back to bar1Heap by itself, and reusing it would show the owner's new memory to
+// duplicates it gave away. Caller holds gspLock_.
 bool NVBringup::bar1Reuse(uint64_t owner, uint64_t pa, uint64_t size, uint64_t *va, uint64_t *sliceSize)
 {
     GspState *g = gsp_;
@@ -3424,7 +3435,7 @@ bool NVBringup::bar1Reuse(uint64_t owner, uint64_t pa, uint64_t size, uint64_t *
     uint32_t best = bar1HeldN_;
     for (uint32_t i = 0; i < bar1HeldN_; i++) {
         const Bar1Held &s = bar1Held_[i];
-        if (s.owner == owner && s.size >= size && s.size / 2 <= size &&
+        if (!s.watch && s.owner == owner && s.size >= size && s.size / 2 <= size &&
             (best == bar1HeldN_ || s.size < bar1Held_[best].size))
             best = i;
     }
@@ -3477,6 +3488,260 @@ bool NVBringup::bar1ReserveHeld()
     if (!ok)
         g->bar1Off = true;
     return ok;
+}
+
+// ---- Releasing held slices early (nv_pager_hook.h) -----------------------------------------
+
+// IOMemoryDescriptor::reserved is protected and its type private to IOKit (IOKitKernelInternal.h:
+// IOMemoryDescriptorReserved starts with IOMemoryDescriptorDevicePager, whose first field is
+// `void *devicePager`; the same in every XNU from 10002.1.13 to 12377.121.6). It is allocated
+// with the descriptor's memory reference, i.e. at the first mapping. The self-test checks that
+// what is read here really is the pager the kernel reports.
+namespace {
+struct MdPeek : IOMemoryDescriptor {
+    static void *pager(IOMemoryDescriptor *md)
+    {
+        void *r = (void *)(md->*&MdPeek::reserved);
+        return r ? *(void *const *)r : nullptr;
+    }
+};
+}
+
+// From NVPagerHook's publish notification, on its thread. The listener is set at once (it only
+// looks at an empty list until memMap adds to it); the self-test waits for BAR1.
+IOReturn NVBringup::pagerHookAttach(const nv_pager_hook_ops *ops)
+{
+    if (!ops || ops->version != NV_PAGER_HOOK_VERSION || ops->size < sizeof(nv_pager_hook_ops) || !ops->set ||
+        !ops->routed) {
+        LOG("GSP: BAR1 hook: NVPagerHook's interface isn't version %u: not used", NV_PAGER_HOOK_VERSION);
+        return kIOReturnUnsupported;
+    }
+    if (!gspLock_ || !watchLock_ || !releaseCall_)
+        return kIOReturnNotReady;
+    uint32_t arg = 1;
+    PE_parse_boot_argn("nvbar1hook", &arg, sizeof(arg));
+    gspLock();
+    IOReturn r = kIOReturnSuccess;
+    if (hookState_ != kHookNone)
+        r = kIOReturnExclusiveAccess;               // one NVPagerHook
+    else if (!arg) {
+        hookState_ = kHookOff;
+        LOG("GSP: BAR1 hook: boot-arg nvbar1hook=0: NVPagerHook not used, held slices stay held");
+    } else {
+        hookOps_ = ops;
+        hookState_ = kHookAttached;
+        ops->set(&NVBringup::lastUnmapThunk, this);
+        LOG("GSP: BAR1 hook: NVPagerHook attached (%s); self-test at the first CPU mapping of VRAM",
+            ops->routed() ? "routed" : "not routed yet");
+    }
+    gspUnlock();
+    return r;
+}
+
+// shutdownHw, before gspLock_ and watchLock_ go: no call into this object after set() returns.
+void NVBringup::pagerHookDetach()
+{
+    if (hookOps_) {
+        hookOps_->set(nullptr, nullptr);
+        hookOps_ = nullptr;
+    }
+    if (releaseCall_) {
+        thread_call_cancel_wait(releaseCall_);
+        thread_call_free(releaseCall_);
+        releaseCall_ = nullptr;
+    }
+    hookState_ = kHookNone;
+}
+
+// Caller holds gspLock_, BAR1 is up.
+bool NVBringup::pagerHookReady()
+{
+    if (hookState_ == kHookAttached)
+        hookState_ = pagerHookSelfTest() ? kHookActive : kHookFailed;
+    return hookState_ == kHookActive;
+}
+
+// Everything the early release depends on, tried on a mapping nobody else can see: one BAR1 page
+// mapped into the kernel (never accessed).
+// 1. The pager read from the descriptor is the one the kernel reports (the private layout).
+// 2. Releasing the mapping while the descriptor lives reports nothing: something that still
+//    references the memory, as a duplicate would, keeps the report back.
+// 3. Releasing the descriptor reports it (the symbol is routed, and the count is the one in
+//    nv_pager_hook.h).
+// Any miss leaves the driver as it is without NVPagerHook. The duplicates themselves
+// (mach_vm_remap, fork, memory entries) are tools/bar1_alias_test's release cases.
+// Caller holds gspLock_.
+bool NVBringup::pagerHookSelfTest()
+{
+    GspState *g = gsp_;
+    if (!hookOps_->routed()) {
+        LOG("GSP: BAR1 hook: device_pager_last_unmap isn't routed (Lilu missing or too old, -nvpgroff, or the "
+            "symbol isn't in this kernel): held slices stay held");
+        return false;
+    }
+    IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress)g->bar1Phys, 0x1000,
+                                                                     kIODirectionInOut);
+    IOMemoryMap *map = md ? md->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapInhibitCache, 0, 0x1000)
+                          : nullptr;
+    uint64_t id = map ? watchAdd(md) : 0;
+    const char *why = nullptr;
+    if (!id)
+        why = !md || !map ? "no test mapping" : "no pager behind the descriptor";
+    OSSafeReleaseNULL(map);
+    if (id && watchRearm(id))
+        why = "the pager reported while the descriptor still referenced its memory";
+    OSSafeReleaseNULL(md);
+    bool fired = false;
+    for (int i = 0; id && !why && i < 50 && !(fired = watchTake(id)); i++)
+        IOSleep(1);                                 // the report comes from inside the release; in case it doesn't
+    if (id && !why && !fired)
+        why = "no report after the descriptor was released";
+    if (why) {
+        watchDrop(id);
+        LOG("GSP: BAR1 hook: self-test failed (%s): held slices stay held", why);
+        return false;
+    }
+    LOG("GSP: BAR1 hook: self-test passed: held slices are released when their last duplicate is gone");
+    return true;
+}
+
+// The pager behind `md`, which has been mapped, goes on the watch list. Caller holds gspLock_
+// (the only writers of the list's size hold it; the hook only marks entries).
+uint64_t NVBringup::watchAdd(IOMemoryDescriptor *md)
+{
+    void *pager = MdPeek::pager(md);
+    if (!pager || (uintptr_t)pager < 0xffffff8000000000ull)        // not a kernel pointer: not the layout we know
+        return 0;
+    Bar1Watch *old = nullptr;
+    uint32_t oldCap = 0;
+    if (watchN_ == watchCap_) {
+        uint32_t nc = watchCap_ ? watchCap_ * 2 : 64;
+        Bar1Watch *nw = (Bar1Watch *)IOMalloc(nc * sizeof(Bar1Watch));
+        if (!nw)
+            return 0;
+        IOInterruptState st = IOSimpleLockLockDisableInterrupt(watchLock_);
+        if (watchN_)
+            memcpy(nw, watch_, watchN_ * sizeof(Bar1Watch));
+        old = watch_;
+        oldCap = watchCap_;
+        watch_ = nw;
+        watchCap_ = nc;
+        IOSimpleLockUnlockEnableInterrupt(watchLock_, st);
+    }
+    uint64_t id = ++watchSerial_;
+    IOInterruptState st = IOSimpleLockLockDisableInterrupt(watchLock_);
+    watch_[watchN_++] = { pager, id, false };
+    IOSimpleLockUnlockEnableInterrupt(watchLock_, st);
+    if (old)
+        IOFree(old, oldCap * sizeof(Bar1Watch));
+    return id;
+}
+
+bool NVBringup::watchRearm(uint64_t id)
+{
+    bool was = false;
+    IOInterruptState st = IOSimpleLockLockDisableInterrupt(watchLock_);
+    for (uint32_t i = 0; i < watchN_; i++)
+        if (watch_[i].id == id) {
+            was = watch_[i].fired;
+            watch_[i].fired = false;
+            break;
+        }
+    IOSimpleLockUnlockEnableInterrupt(watchLock_, st);
+    return was;
+}
+
+bool NVBringup::watchTake(uint64_t id)
+{
+    bool fired = false;
+    if (!id)
+        return false;
+    IOInterruptState st = IOSimpleLockLockDisableInterrupt(watchLock_);
+    for (uint32_t i = 0; i < watchN_; i++)
+        if (watch_[i].id == id) {
+            if ((fired = watch_[i].fired))
+                watch_[i] = watch_[--watchN_];
+            break;
+        }
+    IOSimpleLockUnlockEnableInterrupt(watchLock_, st);
+    return fired;
+}
+
+void NVBringup::watchDrop(uint64_t id)
+{
+    if (!id)
+        return;
+    IOInterruptState st = IOSimpleLockLockDisableInterrupt(watchLock_);
+    for (uint32_t i = 0; i < watchN_; i++)
+        if (watch_[i].id == id) {
+            watch_[i] = watch_[--watchN_];
+            break;
+        }
+    IOSimpleLockUnlockEnableInterrupt(watchLock_, st);
+}
+
+// nv_pager_last_unmap_fn: any thread, possibly inside memFree with gspLock_ held, and for every
+// device pager in the system. A pager that has fired is dead and its address may come back for a
+// new one, so only entries that haven't fired are compared.
+void NVBringup::lastUnmapThunk(void *self, void *pager)
+{
+    NVBringup *me = (NVBringup *)self;
+    bool hit = false;
+    IOInterruptState st = IOSimpleLockLockDisableInterrupt(me->watchLock_);
+    for (uint32_t i = 0; i < me->watchN_; i++)
+        if (me->watch_[i].pager == pager && !me->watch_[i].fired) {
+            me->watch_[i].fired = hit = true;
+            break;
+        }
+    IOSimpleLockUnlockEnableInterrupt(me->watchLock_, st);
+    if (hit)
+        thread_call_enter(me->releaseCall_);        // memFree picks its own up itself; then this finds nothing
+}
+
+void NVBringup::bar1ReleaseThunk(thread_call_param_t self, thread_call_param_t)
+{
+    ((NVBringup *)self)->bar1ReleaseFired();
+}
+
+// Every held slice whose pager has reported: no mapping of it is left in any task, so its range
+// goes back to bar1Heap. With BAR1 down (GSP-RM unloaded) the slice only leaves the list: the
+// next boot's bar1ReserveHeld then doesn't reserve it.
+void NVBringup::bar1ReleaseFired()
+{
+    if (!gspLock_)
+        return;
+    gspLock();
+    GspState *g = gsp_;
+    const bool live = bar1Live_ && g && g->booted && g->bar1Heap;
+    const nv_mmu_ops ops = { this, bar1MmuAlloc, mmuRd64, mmuWr64, bar1MmuLinked, false };
+    uint32_t n = 0;
+    uint64_t bytes = 0;
+    for (uint32_t i = 0; i < bar1HeldN_;) {
+        const Bar1Held s = bar1Held_[i];
+        if (!watchTake(s.watch)) {
+            i++;
+            continue;
+        }
+        if (live) {
+            nv_mmu_unmap_4k(&ops, g->bar1Pde, s.va, s.size);       // off the dummy page
+            nv_vram_free(g->bar1Heap, s.va);
+        }
+        bar1Held_[i] = bar1Held_[--bar1HeldN_];
+        bar1HoldBytes_ -= s.size;
+        n++;
+        bytes += s.size;
+    }
+    if (n) {
+        if (live) {                                 // before gspLock_ is given up: nobody has mapped the ranges yet
+            praminRestore();
+            if (!tlbFlush(g->bar1Pde, true))
+                LOG("GSP: BAR1: TLB invalidate did not complete releasing held slices");
+        }
+        bar1Released_ += n;
+        bar1ReleasedBytes_ += bytes;
+        bar1CapLogged_ = false;
+    }
+    gspUnlock();
 }
 
 // PD3/PD2/PD1 above GSP-RM's range, FERMI_VASPACE_A, then GSP-RM's reserved PDEs
@@ -3974,7 +4239,7 @@ IOReturn NVBringup::memAlloc(GpuConn *c, uint64_t size, uint64_t align, uint32_t
 fail:
     OSSafeReleaseNULL(m->cpuMd);
     if (m->bar1Va && m->cpuMapped)
-        bar1Hold(m->bar1Va, m->bar1Size, c->serial);
+        bar1Hold(m->bar1Va, m->bar1Size, c->serial, 0);
     else if (m->bar1Va)
         bar1Unmap(m->bar1Va, m->bar1Size);
     if (m->vram)
@@ -3989,7 +4254,9 @@ fail:
 // (e.g. mach_vm_remap into another task), so its BAR1 slice is held rather than freed: its PTEs
 // are pointed at the shared read-only dummy page first, so a leftover duplicate reads only
 // zeroes, and only then is the VRAM itself freed for reuse. Memory that was never CPU-mapped
-// can't have been duplicated and keeps the immediate bar1Unmap path.
+// can't have been duplicated and keeps the immediate bar1Unmap path. So does watched memory
+// whose pager reports its last mapping gone while the driver's own are released here, i.e.
+// there was no duplicate; with one, the slice is held until the pager reports (nv_pager_hook.h).
 void NVBringup::memFree(GpuConn *c, GpuMem *m, bool unbind)
 {
     GspState *g = gsp_;
@@ -4012,13 +4279,24 @@ void NVBringup::memFree(GpuConn *c, GpuMem *m, bool unbind)
     }
     m->cpuMapped = false;               // no hold: the slice goes straight back to bar1Heap
 #endif
+    // The pager can't have reported yet: the descriptor still references its memory. If it has,
+    // the kernel doesn't count as nv_pager_hook.h says, and only a report from here on is used.
+    if (m->watch && watchRearm(m->watch) && !bar1HookEarly_++)
+        LOG("GSP: BAR1: a pager reported its last unmap before its memory was freed");
     OSSafeReleaseNULL(m->userMap);
-    OSSafeReleaseNULL(m->cpuMd);
+    OSSafeReleaseNULL(m->cpuMd);        // no duplicate: the pager reports from inside this release
     if (m->bar1Va) {
-        if (m->cpuMapped)
-            bar1Hold(m->bar1Va, m->bar1Size, c->serial);
-        else
+        if (m->cpuMapped && m->watch && watchTake(m->watch)) {
+            bar1HoldUncommit(m->bar1Size);          // memMap's promise: nothing to hold
             bar1Unmap(m->bar1Va, m->bar1Size);
+            bar1Released_++;
+            bar1ReleasedBytes_ += m->bar1Size;
+        } else if (m->cpuMapped)
+            bar1Hold(m->bar1Va, m->bar1Size, c->serial, m->watch);
+        else {
+            watchDrop(m->watch);
+            bar1Unmap(m->bar1Va, m->bar1Size);
+        }
     }
     if (m->vram && !m->borrowed && !(zeroCopy_ && scanHold(m)))     // held: freed once the display has left it
         nv_vram_free(g->vram, m->vram);
@@ -4052,6 +4330,10 @@ IOReturn NVBringup::memMap(GpuConn *c, GpuMem *m, uint64_t *addr)
                 bar1HoldUncommit(m->bar1Size);
             return kIOReturnVMError;
         }
+        // A slice fresh from bar1Heap, mapped for the first time: its pager exists from here on. Not a
+        // reused slice (cpuMapped from the start), nor memory first mapped before the hook was active.
+        if (promised && pagerHookReady())
+            m->watch = watchAdd(m->cpuMd);
     }
     if (m->bar1Va)
         m->cpuMapped = true;            // only such memory can have a CPU-side duplicate
@@ -5118,6 +5400,8 @@ void NVBringup::fillInfo(nvmac_info *i)
     *i = {};
     i->version = NVMAC_ABI_VERSION;
     i->features = zeroCopy_ ? NVMAC_FEATURES : NVMAC_FEATURES & ~NVMAC_FEATURE_SCANOUT;
+    if (hookState_ == kHookActive)
+        i->features |= NVMAC_FEATURE_BAR1_RELEASE;
     i->device_id = pci_->configRead16(kIOPCIConfigDeviceID);
     i->chipset = (uint16_t)chipset_;
     i->pci_bus = pci_->getBusNumber();
@@ -5501,6 +5785,10 @@ void NVBringup::updateStats()
         put("Bar1Total", g->bar1Heap ? g->bar1Heap->limit - g->bar1Heap->base + 1 - g->ptPoolSize : 0, 64);
         put("Bar1Used", g->bar1Heap ? nv_vram_used(g->bar1Heap) - g->ptPoolSize : 0, 64);
         put("Bar1Held", bar1HoldBytes_, 64);
+        put("Bar1Hook", hookState_, 32);                // 0 none, 1 attached, 2 active, 3 failed, 4 off
+        put("Bar1Released", bar1ReleasedBytes_, 64);    // BAR1 given back early instead of held
+        put("Bar1ReleasedSlices", bar1Released_, 32);
+        put("Bar1HookEarly", bar1HookEarly_, 32);       // must stay 0
         put("Connections", nConns, 32);
         put("Contexts", nCtxs, 32);
         put("Sequence", ++statSeq_, 32);
